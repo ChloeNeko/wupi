@@ -5,6 +5,7 @@ pub mod kv_buffer;
 pub mod llm;
 pub mod memory;
 pub mod memory_embedder;
+pub mod memory_embedder_llama;
 pub mod memory_rrf;
 pub mod prompts;
 pub mod session;
