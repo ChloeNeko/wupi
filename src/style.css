@@ -104,6 +104,50 @@ body {
   margin-bottom: 4px;
 }
 
+/* ── Reasoning (thought channel) panel ───────────────────── */
+/* Collapsible <details> rendered above the reply body inside a Wupi bubble.
+   Native toggle — no JS, keyboard-accessible. Visually muted so it reads as
+   internal monologue, not reply content. Empty reasoning renders nothing. */
+.reasoning {
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  border-left: 2px solid var(--border);
+  background: rgba(157, 78, 221, 0.06);
+  border-radius: 0 6px 6px 0;
+}
+
+.reasoning > summary {
+  cursor: pointer;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  user-select: none;
+  list-style: none; /* drop the default disclosure triangle */
+}
+
+.reasoning > summary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 6px;
+  transition: transform 0.15s ease;
+  color: var(--text-dim);
+}
+
+.reasoning[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.reasoning-body {
+  margin-top: 6px;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  font-style: italic;
+}
+
 .msg.system {
   align-self: center;
   background: transparent;

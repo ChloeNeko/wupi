@@ -2,12 +2,20 @@ import "./style.css";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
+// The events the backend actually emits today (chat_send in lib.rs):
+//   chunk  — streamed reply text, token-by-token
+//   done   — generation complete; carries final_text + the parsed thought
+//            channel (`reasoning`), which the UI renders as a collapsible
+//            "thinking" panel above the reply.
+//   error  — generation failed; the orphaned user message is rolled back.
+//
+// The agent-loop events (`tool`, `tool_result`, `round_done`) are intentionally
+// ABSENT here: agent.rs is a stub (bails with "not wired"), so the backend
+// never emits them. Re-add these union members when the agent loop lands —
+// same principle as Bug #13 (don't ship UI for features that don't exist).
 type StreamEvent =
   | { type: "chunk"; text: string }
-  | { type: "round_done"; text: string; had_tool_calls: boolean }
-  | { type: "tool"; name: string; input_summary: string }
-  | { type: "tool_result"; name: string; ok: boolean; summary: string }
-  | { type: "done"; final_text: string }
+  | { type: "done"; final_text: string; reasoning?: string }
   | { type: "error"; message: string };
 
 const chatEl = document.getElementById("chat") as HTMLDivElement;
@@ -37,6 +45,39 @@ function addMessage(role: "user" | "wupi" | "system", text: string): HTMLDivElem
   chatEl.appendChild(el);
   scrollToBottom();
   return el;
+}
+
+/**
+ * Render the model's parsed thought channel (`reasoning`) as a collapsible
+ * panel ABOVE the reply body inside a Wupi bubble. Uses native <details> so
+ * the toggle is free (no JS, keyboard-accessible, respects prefers-reduced-motion).
+ *
+ * The backend holds thought content until the `done` event (ThoughtGate
+ * buffers it during generation — see chat_format.rs), so this is called once
+ * per completed turn, not streamed. If `reasoning` is empty (direct reply,
+ * no thought channel) we render nothing — no empty clutter.
+ */
+function attachReasoning(bubble: HTMLDivElement, reasoning: string): void {
+  if (!reasoning.trim()) return;
+
+  const body = bubble.querySelector(".body") as HTMLDivElement | null;
+  if (!body) return;
+
+  const details = document.createElement("details");
+  details.className = "reasoning";
+
+  const summary = document.createElement("summary");
+  summary.textContent = "thinking";
+  details.appendChild(summary);
+
+  const thought = document.createElement("div");
+  thought.className = "reasoning-body";
+  thought.textContent = reasoning;
+  details.appendChild(thought);
+
+  // Insert ABOVE the reply body (thought channel precedes reply in the
+  // Gemma 4 protocol, and reading-order should match).
+  bubble.insertBefore(details, body);
 }
 
 let streamingBubble: HTMLDivElement | null = null;
@@ -71,15 +112,6 @@ function setStatus(state: "ready" | "busy" | "error" | string, text: string): vo
   statusEl.className = `status ${state}`;
 }
 
-function flashSystem(text: string): void {
-  const el = addMessage("system", text);
-  setTimeout(() => {
-    el.style.transition = "opacity 0.6s";
-    el.style.opacity = "0";
-    setTimeout(() => el.remove(), 700);
-  }, 3500);
-}
-
 async function send(): Promise<void> {
   const text = inputEl.value.trim();
   if (!text || sending) return;
@@ -111,22 +143,12 @@ function handleStreamEvent(event: StreamEvent): void {
     case "chunk":
       appendStreamText(event.text);
       break;
-    case "tool":
-      flashSystem(`🔧 ${event.name}(${event.input_summary})`);
-      setStatus("busy", `calling ${event.name}…`);
-      break;
-    case "tool_result":
-      flashSystem(
-        `${event.ok ? "✓" : "✗"} ${event.name}: ${event.summary}`,
-      );
-      setStatus("busy", "Wupi is thinking…");
-      break;
-    case "round_done":
-      if (!event.had_tool_calls) {
-        finalizeStream(event.text);
-      }
-      break;
     case "done":
+      // Attach the parsed thought channel (if any) BEFORE finalizing, so the
+      // panel is in place when the streaming class is removed.
+      if (event.reasoning && streamingBubble) {
+        attachReasoning(streamingBubble, event.reasoning);
+      }
       finalizeStream(event.final_text);
       setStatus("ready", "ready");
       setSending(false);
