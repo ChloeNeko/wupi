@@ -210,12 +210,17 @@ fn gen_id() -> String {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let mut bytes = [0u8; 6];
-    getrandom_fill(&mut bytes);
+    prng_fill(&mut bytes);
     let rand: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
     format!("m_{:x}_{}", ts, &rand[..6])
 }
 
-fn getrandom_fill(buf: &mut [u8]) {
+/// Fill `buf` with pseudo-random bytes via a xorshift64 seeded from wall-clock
+/// nanos. NOT cryptographic — used only for message-ID uniqueness in local
+/// chat (see `gen_id`). The name reflects what it is: a PRNG, not the OS
+/// CSPRNG (the old name `getrandom_fill` falsely implied the `getrandom`
+/// syscall / crate). Renamed 2026-07-13 (Gemini review).
+fn prng_fill(buf: &mut [u8]) {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

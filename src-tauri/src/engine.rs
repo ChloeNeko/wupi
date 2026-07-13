@@ -41,6 +41,42 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
+// ─── Cache-space budgeting constants ─────────────────────────────────────
+// All the magic numbers that carve up `n_ctx` between resident history and
+// generation room. Centralized here so they're greppable, documented, and
+// reviewable in one place — rather than scattered as bare literals (Gemini
+// review, 2026-07-13). These are SAFETY FLOORS, not user-tunable quality
+// knobs: making them settings would be a foot-gun (set to 0 → every long
+// conversation hard-fails). Internal constants stay internal.
+
+/// Fraction of `n_ctx` reserved against prompt growth + generation when
+/// deciding whether to truncate the prompt before prefill (engine.rs
+/// `generate`). With the floor below, this yields a ~1000-token reserve at
+/// the default 4000-token context — enough headroom for a long reply plus
+/// the next turn's user message without NoKvCacheSlot.
+const GENERATION_RESERVE_FLOOR_TOKENS: usize = 512;
+
+/// Minimum tokens we insist on being able to generate after prefilling. Below
+/// this we cold-reset + re-prefill the (already-truncated) prompt rather than
+/// risk a degenerate 5-token reply or an n_ctx overflow. Bug #1 Part A.
+const MIN_GENERATION_WINDOW: i32 = 128;
+
+/// Safety margin subtracted from remaining cache space before clamping
+/// `max_tokens`, so the final decode never overshoots `n_ctx`.
+const MAX_TOKENS_SAFETY_MARGIN: i32 = 64;
+
+/// Floor + hard cap for `max_tokens` per turn. The floor (64) guarantees a
+/// nearly-full cache still yields a short reply instead of bailing empty; the
+/// cap (2048) guards against runaway generation eating the whole reserve.
+const MAX_TOKENS_FLOOR: usize = 64;
+const MAX_TOKENS_CAP: usize = 2048;
+
+/// Tokens decoded per prefill batch. MUST match the `with_n_batch` value in
+/// `init_runtime` — llama.cpp allocates the context's batch buffer to this
+/// size, and prefill batches larger than it silently fail. Bigger = fewer
+/// decode calls but more peak memory; 512 is the llama.cpp default sweet spot.
+const PREFILL_BATCH_TOKENS: i32 = 512;
+
 /// A request posted to the engine thread by `chat_send`.
 pub struct EngineRequest {
     pub messages: Vec<ApiMessage>,
@@ -232,7 +268,10 @@ impl ChatEngine {
         let n_ctx = context_size.max(1024);
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(n_ctx))
-            .with_n_batch(512)
+            // MUST stay in sync with PREFILL_BATCH_TOKENS — see the consts block
+            // at the top of this file. `with_n_batch` allocates the context's
+            // batch buffer; prefill() batches into it.
+            .with_n_batch(PREFILL_BATCH_TOKENS as u32)
             .with_embeddings(false)
             // Asymmetric-ish KV quantization: Q8_0 on both K and V is the
             // community-standard "free win" — ~50% VRAM cut vs F16, near-zero
@@ -331,7 +370,7 @@ impl EngineRuntime {
         // truncate the PROMPT to fit the cache, instead of rebuilding the
         // cache to match an ever-growing prompt. After this, full_tokens is
         // guaranteed to fit within (n_ctx - generation_reserve). ---
-        let generation_reserve = (self.n_ctx / 4).max(512) as usize;
+        let generation_reserve = (self.n_ctx as usize / 4).max(GENERATION_RESERVE_FLOOR_TOKENS);
         let max_prompt_len = (self.n_ctx as usize).saturating_sub(generation_reserve);
         let full_tokens = if full_tokens.len() > max_prompt_len {
             if self.turn_marker.is_empty() {
@@ -390,7 +429,7 @@ impl EngineRuntime {
         // because truncation guarantees `full_tokens.len() <= max_prompt_len`,
         // so a cold re-prefill always fits. The OLD reconstruct-based eviction
         // is gone — it was the source of the self-defeating-eviction bug. ---
-        let min_gen_window = 128i32;
+        let min_gen_window = MIN_GENERATION_WINDOW;
         let remaining = self.n_ctx as i32 - self.buffer.committed_len() as i32;
         if remaining < min_gen_window && !self.buffer.is_cold() {
             tracing::info!(
@@ -494,7 +533,9 @@ impl EngineRuntime {
         // Floor at 64 so a nearly-full cache still gets a short reply rather
         // than bailing with nothing.
         let remaining = self.n_ctx as i32 - n_cur;
-        let max_tokens = remaining.saturating_sub(64).clamp(64, 2048) as usize;
+        let max_tokens = remaining
+            .saturating_sub(MAX_TOKENS_SAFETY_MARGIN)
+            .clamp(MAX_TOKENS_FLOOR as i32, MAX_TOKENS_CAP as i32) as usize;
         let mut tokens_generated: Vec<LlamaToken> = Vec::with_capacity(256);
 
         // Bug #2: allocate the step batch ONCE outside the loop and reuse it
@@ -609,8 +650,8 @@ impl EngineRuntime {
         if tokens.is_empty() {
             return Ok(());
         }
-        let n_batch = 512i32;
-        let mut batch = LlamaBatch::new(512, 1);
+        let n_batch = PREFILL_BATCH_TOKENS;
+        let mut batch = LlamaBatch::new(PREFILL_BATCH_TOKENS as usize, 1);
         let mut consumed = 0usize;
         while consumed < tokens.len() {
             let take = std::cmp::min(n_batch as usize, tokens.len() - consumed);
