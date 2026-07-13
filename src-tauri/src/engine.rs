@@ -408,7 +408,7 @@ impl EngineRuntime {
         }
 
         // Micro-decode each closer token into the cache. Same shape as the
-        // per-token step in the main decode loop (engine.rs:918-924).
+        // per-token step in the main decode loop (`decode_loop`'s inner block).
         for tok in &closer_tokens {
             step_batch.clear();
             step_batch
@@ -527,9 +527,7 @@ impl EngineRuntime {
         let prefill_start = std::time::Instant::now();
         let (cached_tokens, prefilled_tokens) = if self.buffer.is_cold() {
             // Cold start — nothing was cached. Prefill everything.
-            self.prefill(&full_tokens, 0)?;
-            let system_prefix_len = self.estimate_system_prefix_len(&full_tokens);
-            self.buffer.commit_cold(&full_tokens, system_prefix_len);
+            self.reset_and_prefill(&full_tokens)?;
             (0usize, full_tokens.len())
         } else {
             let common = self.buffer.common_prefix_len(&full_tokens);
@@ -564,11 +562,7 @@ impl EngineRuntime {
                     committed,
                     "prompt diverged from cache mid-residency; cold-resetting before prefill"
                 );
-                self.ctx.clear_kv_cache();
-                self.buffer.reset();
-                self.prefill(&full_tokens, 0)?;
-                let sys_len = self.estimate_system_prefix_len(&full_tokens);
-                self.buffer.commit_cold(&full_tokens, sys_len);
+                self.reset_and_prefill(&full_tokens)?;
                 (0usize, full_tokens.len())
             } else {
                 // common == committed_len (it cannot exceed it): the new
@@ -589,19 +583,17 @@ impl EngineRuntime {
         // re-prefill the truncated prompt from scratch. This is safe now
         // because truncation guarantees `full_tokens.len() <= max_prompt_len`,
         // so a cold re-prefill always fits. The OLD reconstruct-based eviction
-        // is gone — it was the source of the self-defeating-eviction bug. ---
+        // is gone — it was the source of the self-defeating-eviction bug.
+        // (Reaching here with a cold buffer is impossible — the cold branch
+        // above already prefilled — so reset_and_prefill's clear is safe.) ---
         let min_gen_window = MIN_GENERATION_WINDOW;
         let remaining = self.n_ctx as i32 - self.buffer.committed_len() as i32;
-        if remaining < min_gen_window && !self.buffer.is_cold() {
+        if remaining < min_gen_window {
             tracing::info!(
                 remaining,
                 "cache too tight after prefill; cold-resetting and re-prefilling truncated prompt"
             );
-            self.ctx.clear_kv_cache();
-            self.buffer.reset();
-            self.prefill(&full_tokens, 0)?;
-            let system_prefix_len = self.estimate_system_prefix_len(&full_tokens);
-            self.buffer.commit_cold(&full_tokens, system_prefix_len);
+            self.reset_and_prefill(&full_tokens)?;
         }
         let remaining_after = self.n_ctx as i32 - self.buffer.committed_len() as i32;
         if remaining_after < min_gen_window {
@@ -616,7 +608,11 @@ impl EngineRuntime {
         // generation speed for telemetry. Checks `cancel` each token. ---
         let gen_result = self.decode_loop(on_chunk, cancel)?;
 
-        // --- Structured telemetry block to stdout/terminal ---
+        // --- Structured telemetry block: live to stdout/terminal (so the user
+        // can watch the engine run in the debugger) AND to the tracing log
+        // (for grep + structured queries). The two are deliberately separate
+        // channels: stdout is for "is the model alive right now," the log is
+        // for "what did the engine do across this session." ---
         let prefill_ms = prefill_elapsed.as_secs_f64() * 1000.0;
         let ttft_ms = gen_result
             .time_to_first_token
@@ -646,7 +642,7 @@ impl EngineRuntime {
         eprintln!("[DEBUG] Generation Speed:              {gen_speed:.1} tokens/sec");
         eprintln!("[DEBUG] ──────────────────────────────────────────");
 
-        tracing::info!(
+        tracing::debug!(
             cached_tokens,
             prefilled_tokens,
             prefill_ms,
@@ -654,8 +650,9 @@ impl EngineRuntime {
             gen_speed,
             generated_tokens = gen_result.tokens_generated,
             cancelled = gen_result.cancelled,
+            closer_appended = gen_result.closer_appended,
             cache_total = self.buffer.committed_len(),
-            "telemetry"
+            "engine telemetry"
         );
 
         Ok(gen_result.parsed)
@@ -853,6 +850,15 @@ impl EngineRuntime {
             cancelled,
             closer_appended,
         })
+    }
+
+    fn reset_and_prefill(&mut self, tokens: &[LlamaToken]) -> anyhow::Result<()> {
+        self.ctx.clear_kv_cache();
+        self.buffer.reset();
+        self.prefill(tokens, 0)?;
+        let system_prefix_len = self.estimate_system_prefix_len(tokens);
+        self.buffer.commit_cold(tokens, system_prefix_len);
+        Ok(())
     }
 
     /// Decode `tokens` into the context starting at absolute position

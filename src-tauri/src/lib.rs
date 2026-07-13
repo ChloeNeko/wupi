@@ -1,4 +1,3 @@
-pub mod agent;
 pub mod chat_format;
 pub mod engine;
 pub mod kv_buffer;
@@ -10,7 +9,6 @@ pub mod memory_rrf;
 pub mod prompts;
 pub mod session;
 pub mod stream_filter;
-pub mod tools;
 
 use std::sync::Arc;
 use tauri::{Emitter, Manager};

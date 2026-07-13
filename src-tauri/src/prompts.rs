@@ -1,5 +1,3 @@
-use serde::{Deserialize, Serialize};
-
 pub const DEFAULT_SYSTEM_PROMPT: &str = "\
 You are Wupi, the heart of WUPI OS — the user's (Chloe's) native AI assistant. \
 You manage and optimize the whole system: settings, conversation, and (later) \
@@ -12,46 +10,6 @@ need approval; the system validates your changes.
 
 You are an out-of-character assistant, not part of any roleplay. Speak to the \
 user, not to characters.";
-
-#[allow(dead_code)]
-pub const TOOL_CALL_FORMAT: &str = "\
-```tool_call
-{\"name\": \"tool_name\", \"input\": { ...parameters... }}
-```";
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolDef {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub schema: serde_json::Value,
-}
-
-#[allow(dead_code)]
-pub fn tool_definitions() -> Vec<ToolDef> {
-    vec![
-        ToolDef {
-            name: "get_settings",
-            description: "Read WUPI OS's current settings (context size, conversation budget, \
-                          message count, etc.). Call this before changing anything so you work \
-                          from the real current values.",
-            schema: serde_json::json!({ "type": "object", "properties": {}, "required": [] }),
-        },
-        ToolDef {
-            name: "ask_user",
-            description: "Ask the user a clarifying question and wait for their typed answer. \
-                          Use this when you lack information needed to proceed.",
-            schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "question": { "type": "string", "description": "The question to show the user" },
-                    "context": { "type": "string", "description": "Optional extra context shown under the question" }
-                },
-                "required": ["question"],
-            }),
-        },
-    ]
-}
 
 pub fn build_system_content(settings: &WupiSettings) -> String {
     let mut sections = Vec::new();
@@ -87,5 +45,23 @@ impl Default for WupiSettings {
             context_size: 4000,
             conversation_budget: 16000,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_system_content_includes_live_settings() {
+        let settings = WupiSettings {
+            context_size: 2048,
+            conversation_budget: 8192,
+        };
+
+        let content = build_system_content(&settings);
+        assert!(content.contains("<assistant_identity>"));
+        assert!(content.contains("context_size: 2048"));
+        assert!(content.contains("conversation_budget: 8192"));
     }
 }

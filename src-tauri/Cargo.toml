@@ -18,7 +18,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 # Typed errors without boilerplate.
 anyhow = "1"
-# Regex for tool-call block parsing (ported from tools.js).
+# Regex for the StreamFilter's combined marker-stripping pattern.
 regex = "1"
 # Logging — written to a file in app data; visible only in Debug mode.
 tracing = "0.1"

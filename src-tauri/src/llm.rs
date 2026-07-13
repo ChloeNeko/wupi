@@ -1,28 +1,34 @@
-//! LLM backend façade.
+//! LLM backend façade + the process-wide llama.cpp backend singleton.
 //!
 //! The heavy generation logic now lives in [`crate::engine`] — a dedicated
 //! thread owning a persistent `LlamaContext` with Q8_0 KV cache and a
 //! [`KvBuffer`] that tracks the token IDs resident in the cache so each turn
 //! only prefills the **delta** since the last turn.
 //!
-//! This module is now a thin façade: it loads the model off-thread, leaks it
+//! This module is a thin façade: it loads the model off-thread, leaks it
 //! to `&'static` (so the engine can hold a `LlamaContext<'static>`), spawns
 //! the engine, and exposes a [`GenerationClient`] impl that posts requests to
 //! the engine thread.
 //!
 //! # Why `Box::leak`
 //!
-//! `LlamaContext<'a>` borrows `&'a LlamaModel` (see `context.rs:28` in the
-//! crate). Storing model + context together is self-referential and rejected
-//! by the borrow checker. Leaking the model to `&'static LlamaModel` dissolves
-//! the borrow — `new_context(&'static self)` yields `LlamaContext<'static>`,
-//! which the engine thread can own freely.
+//! `LlamaContext<'a>` borrows `&'a LlamaModel`. Storing model + context together
+//! is self-referential and rejected by the borrow checker. Leaking the model to
+//! `&'static LlamaModel` dissolves the borrow — `new_context(&'static self)`
+//! yields `LlamaContext<'static>`, which the engine thread can own freely.
 //!
 //! This is the idiomatic choice for a **process-lifetime singleton**: the
 //! model is loaded once and lives until the OS exits. The memory is never
 //! reclaimed, which is exactly what we want (we don't want to unload the
 //! model mid-session). If hot-swap lands later (a P-phase settings feature),
 //! reclaim via `Box::from_raw(ptr)` + `drop` before loading the replacement.
+//!
+//! # The shared backend
+//!
+//! [`shared_backend`] is the single chokepoint for `LlamaBackend::init()`,
+//! which the crate documents as panic-on-double-init. Both the chat loader
+//! (here) and the Memory embedder ([`crate::memory_embedder_llama`]) call it
+//! — the `OnceLock` makes the race safe even if both load concurrently.
 
 use crate::chat_format::ParsedOutput;
 use crate::chat_format::ModelFamily;
@@ -31,9 +37,10 @@ use crate::session::ApiMessage;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::LlamaModel;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 pub type StreamFuture = Pin<Box<dyn Future<Output = anyhow::Result<ParsedOutput>> + Send>>;
 pub type ChunkFn = Arc<dyn Fn(&str) + Send + Sync>;
@@ -53,6 +60,31 @@ pub trait GenerationClient: Send + Sync {
     fn is_ready(&self) -> bool {
         false
     }
+}
+
+/// The process-wide shared llama.cpp backend, leaked to `&'static`.
+///
+/// `LlamaBackend::init()` must be called exactly once per process — a second
+/// call returns `Err(BackendAlreadyInitialized)` (the crate guards itself with
+/// an internal `AtomicBool`). The chat engine (`load_blocking`) and the Memory
+/// embedder both need the backend, so this function is the single chokepoint
+/// that serializes them: the first caller runs `init()` and leaks the backend,
+/// every later caller reuses the same `&'static` ref. The `OnceLock` makes the
+/// race safe even if both threads load concurrently at startup.
+///
+/// The backend is a ZST (`pub struct LlamaBackend {}`) with no raw fields, so
+/// `&'static LlamaBackend` is `Send + Sync` and safe to share across the
+/// `wupi-engine` and `wupi-embedder` threads. Leaking is correct for a
+/// process-lifetime singleton — it lives until the OS exits, matching the
+/// model leak in `LlamaModelHandle::into_static`.
+static SHARED_BACKEND: OnceLock<&'static LlamaBackend> = OnceLock::new();
+
+pub fn shared_backend() -> &'static LlamaBackend {
+    SHARED_BACKEND.get_or_init(|| {
+        let backend = LlamaBackend::init()
+            .expect("LlamaBackend::init failed — cannot start llama.cpp");
+        Box::leak(Box::new(backend))
+    })
 }
 
 /// Echo fallback used when no model file is found. Unchanged from Layer 1.
@@ -78,11 +110,11 @@ impl GenerationClient for EchoBackend {
     }
 }
 
-/// The loaded model + backend, as loaded from disk. This is an intermediate
-/// value — it exists only between `load_blocking` and `into_static`, after
-/// which the backend + model are leaked to `&'static` and handed to the engine.
+/// The loaded model, as loaded from disk. This is an intermediate value — it
+/// exists only between `load_blocking` and `into_static`, after which the model
+/// is leaked to `&'static` and handed to the engine. The backend is NOT owned
+/// here; it's the process-wide singleton from `shared_backend`.
 pub struct LlamaModelHandle {
-    backend: LlamaBackend,
     model: LlamaModel,
     family: ModelFamily,
 }
@@ -91,13 +123,14 @@ unsafe impl Send for LlamaModelHandle {}
 unsafe impl Sync for LlamaModelHandle {}
 
 impl LlamaModelHandle {
-    /// Leak the backend + model to `&'static` references so the engine can
-    /// own a `LlamaContext<'static>`. See the module docs for the rationale.
+    /// Leak the model to a `&'static` reference so the engine can own a
+    /// `LlamaContext<'static>`. See the module docs for the rationale.
+    /// The shared backend ref is returned alongside it (already `&'static`).
     ///
     /// The family is returned by value (it's `Copy`).
     #[must_use]
     fn into_static(self) -> (&'static LlamaBackend, &'static LlamaModel, ModelFamily) {
-        let backend_ref: &'static LlamaBackend = Box::leak(Box::new(self.backend));
+        let backend_ref: &'static LlamaBackend = shared_backend();
         let model_ref: &'static LlamaModel = Box::leak(Box::new(self.model));
         (backend_ref, model_ref, self.family)
     }
@@ -137,8 +170,9 @@ impl LlamaCppBackend {
                     .unwrap_or("model")
                     .to_string();
 
-                // Leak the model + backend to &'static. The engine thread
-                // will own them for the process lifetime.
+                // Leak the model to &'static (the backend is already the
+                // process-wide &'static from shared_backend). The engine thread
+                // owns both for the process lifetime.
                 let (backend_ref, model_ref, family) = handle.into_static();
 
                 // Spawn the persistent engine with Q8_0 KV cache + delta prefill.
@@ -180,13 +214,12 @@ impl LlamaCppBackend {
         })
     }
 
-    fn load_blocking(path: &PathBuf, n_gpu_layers: u32) -> anyhow::Result<LlamaModelHandle> {
+    fn load_blocking(path: &Path, n_gpu_layers: u32) -> anyhow::Result<LlamaModelHandle> {
         use llama_cpp_2::model::params::LlamaModelParams;
-        let backend = LlamaBackend::init()
-            .map_err(|e| anyhow::anyhow!("backend init: {e:?}"))?;
+        let backend: &'static LlamaBackend = shared_backend();
 
         let params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
-        let model = LlamaModel::load_from_file(&backend, path, &params)
+        let model = LlamaModel::load_from_file(backend, path, &params)
             .map_err(|e| anyhow::anyhow!("model load: {e:?}"))?;
 
         let filename = path
@@ -197,7 +230,6 @@ impl LlamaCppBackend {
         tracing::info!(family = ?family, filename, "detected model family");
 
         Ok(LlamaModelHandle {
-            backend,
             model,
             family,
         })

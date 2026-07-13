@@ -40,14 +40,13 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::Once;
 
 use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 
+use crate::llm::shared_backend;
 use crate::memory_embedder::{EmbedFuture, Embedder, EMBED_DIM};
 
 /// BERT context length (hard input limit). Inputs longer than this are
@@ -62,48 +61,6 @@ const BERT_N_BATCH: u32 = 512;
 /// Post-tokenization truncation. 511 not 512: leaves headroom in case the
 /// tokenizer didn't auto-add [CLS]/[SEP] — defensive, costs nothing.
 const BERT_TRUNCATE_TOKENS: usize = 511;
-
-// ---------------------------------------------------------------------------
-// Backend init (process-wide, shared with the chat engine)
-// ---------------------------------------------------------------------------
-
-/// `LlamaBackend::init()` must be called exactly once per process — calling
-/// it again panics (AGENTS.md §2 known issue). The chat engine calls it inside
-/// `load_blocking`; if we called it here too we'd crash. Guard with a `Once`
-/// so whichever loads first (chat or embedder) wins, and the other reuses the
-/// already-initialized backend.
-///
-/// SAFETY: `LlamaBackend::init()` is documented as safe to call once. The
-/// `Once` enforces that contract. The leaked backend lives for the process —
-/// correct for a singleton, matching `LlamaModelHandle::into_static`.
-static BACKEND_INIT: Once = Once::new();
-
-/// The process-wide leaked backend, set on first call. `None` until init.
-/// Subsequent callers (chat or embedder) reuse the same `&'static LlamaBackend`.
-// SAFETY: written once via `Once`, then only read. `&'static` is Sync.
-static mut LEAKED_BACKEND: Option<&'static LlamaBackend> = None;
-
-/// Idempotently init + leak the llama.cpp backend. Safe to call from any
-/// thread. Returns the shared `&'static LlamaBackend`.
-///
-/// # Panics
-/// Panics if `LlamaBackend::init()` fails (CUDA context alloc error, OOM).
-/// Not recoverable at runtime — surfaces as a startup failure.
-fn shared_backend() -> &'static LlamaBackend {
-    BACKEND_INIT.call_once(|| {
-        let backend = LlamaBackend::init()
-            .expect("LlamaBackend::init failed — cannot start llama.cpp");
-        // SAFETY: written exactly once, inside the Once closure, before any
-        // reader can observe it. Other threads reaching this fn block on the
-        // Once until the write completes.
-        unsafe {
-            LEAKED_BACKEND = Some(Box::leak(Box::new(backend)));
-        }
-    });
-    // SAFETY: by the time we read, the Once has completed and LEAKED_BACKEND
-    // is Some. The reference is &'static (Box::leak), safe to hand out.
-    unsafe { LEAKED_BACKEND.expect("BACKEND_INIT completed but backend is None") }
-}
 
 // ---------------------------------------------------------------------------
 // Control plane — channel types
@@ -192,7 +149,8 @@ impl LlamaCppEmbedder {
                     match rx.recv() {
                         Ok(EmbedMsg::Request(req)) => {
                             // Self-healing: isolate each embed so one panic
-                            // doesn't kill the thread. Mirrors engine.rs:177.
+                            // doesn't kill the thread. Mirrors the chat
+                            // engine's `catch_unwind` in `ChatEngine::spawn`.
                             let outcome = std::panic::catch_unwind(
                                 std::panic::AssertUnwindSafe(|| {
                                     runtime.embed_one(&req.text)
@@ -324,7 +282,8 @@ impl Embedder for LlamaCppEmbedder {
         // `request()` so the channel-send error mapping lives in one place.
         let this_tx = self.tx.clone();
         Box::pin(async move {
-            // Fresh oneshot per request — exactly llm.rs:217-238 shape.
+            // Fresh oneshot per request — exactly the shape
+            // `LlamaCppBackend::stream` uses to await an engine reply.
             let (reply_tx, reply_rx) = mpsc::channel::<EmbedReply>();
             let req = EmbedRequest {
                 text,
@@ -379,8 +338,8 @@ impl EmbedderRuntime {
     fn embed_one(&mut self, text: &str) -> anyhow::Result<Vec<f32>> {
         // Tokenize WITHOUT BOS. BERT's [CLS]/[SEP] are inserted by the C++
         // tokenizer; a forced BOS prepends an unrelated token that pollutes
-        // the embedding. Precedent: engine.rs:293 uses AddBos::Never for
-        // literal-only tokenization.
+        // the embedding. Precedent: the chat engine uses AddBos::Never for
+        // literal-only marker tokenization in `ChatEngine::init_runtime`.
         let mut tokens = self
             .model
             .str_to_token(text, AddBos::Never)
