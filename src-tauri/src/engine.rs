@@ -413,12 +413,53 @@ impl EngineRuntime {
             (0usize, full_tokens.len())
         } else {
             let common = self.buffer.common_prefix_len(&full_tokens);
-            let delta = &full_tokens[common..];
-            if !delta.is_empty() {
-                self.prefill(delta, common as i32)?;
+            let committed = self.buffer.committed_len();
+
+            // ── Structural-divergence guard (Bug §2F, 2026-07-13) ──────────
+            // Delta-prefill decodes `full_tokens[common..]` at `start_pos =
+            // common`, APPENDING to the cache. That is only valid when the new
+            // prompt is a pure extension of what's resident — i.e.
+            // `common == committed_len`. The cache then ends exactly where the
+            // delta begins, so appending is safe.
+            //
+            // When `common < committed_len`, the new prompt diverged from the
+            // cache BEFORE the end of what's resident. The cache still holds
+            // tokens at positions `[common .. committed_len)` that the new
+            // prompt does NOT share. Prefilling the delta at `start_pos =
+            // common` would OVERWRITE those live, divergent tokens at invalid
+            // positions → llama.cpp rejects the batch with `NTokensZero`.
+            //
+            // This fires after truncation: both turns truncate, but at
+            // different cut points (the conversation grew between them), so
+            // the resident layout and the new layout diverge right after the
+            // system prefix → `common` is small, `committed_len` is large →
+            // guard fires → cold-reset → clean prefill.
+            //
+            // Cost: one full prefill (paid rarely — only when truncation
+            // changes the cut point between turns). Normal turns have
+            // `common == committed_len` → fast delta path preserved.
+            if common < committed {
+                tracing::info!(
+                    common,
+                    committed,
+                    "prompt diverged from cache mid-residency; cold-resetting before prefill"
+                );
+                self.ctx.clear_kv_cache();
+                self.buffer.reset();
+                self.prefill(&full_tokens, 0)?;
+                let sys_len = self.estimate_system_prefix_len(&full_tokens);
+                self.buffer.commit_cold(&full_tokens, sys_len);
+                (0usize, full_tokens.len())
+            } else {
+                // common == committed_len (it cannot exceed it): the new
+                // prompt extends the cache. Delta is the genuinely new tail.
+                let delta = &full_tokens[common..];
+                if !delta.is_empty() {
+                    self.prefill(delta, common as i32)?;
+                }
+                self.buffer.commit_delta(common, delta);
+                (common, delta.len())
             }
-            self.buffer.commit_delta(common, delta);
-            (common, delta.len())
         };
         let prefill_elapsed = prefill_start.elapsed();
 
@@ -665,7 +706,12 @@ impl EngineRuntime {
             }
             self.ctx
                 .decode(&mut batch)
-                .map_err(|e| anyhow::anyhow!("prefill decode: {e:?}"))?;
+                .map_err(|e| anyhow::anyhow!(
+                    "prefill decode: {e:?} | tokens={total} consumed={consumed} take={take} start_pos={start_pos} n_ctx={n_ctx} committed={committed}",
+                    total = tokens.len(),
+                    n_ctx = self.n_ctx,
+                    committed = self.buffer.committed_len(),
+                ))?;
             consumed += take;
         }
         Ok(())
