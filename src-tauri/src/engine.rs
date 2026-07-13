@@ -328,9 +328,114 @@ struct DecodeTelemetry {
     generation_elapsed: Duration,
     /// True if the loop broke because the `cancel` flag was set.
     cancelled: bool,
+    /// True if the channel closer was appended via micro-decode after cancel.
+    /// Only meaningful when `cancelled` is true. False on non-cancelled runs.
+    closer_appended: bool,
 }
 
 impl EngineRuntime {
+    /// Coherence-preserving cancel: micro-decode the channel closer into the
+    /// KV cache so the resident state ends at a clean turn boundary.
+    ///
+    /// When `chat_stop` fires mid-generation, the model's output is left with
+    /// an open `<|channel>...` block and no closing `<channel|>`. Persisting
+    /// that raw verbatim (the original cancel bug) injects a malformed turn
+    /// protocol into the next prompt → the model emits degenerate markers →
+    /// StreamFilter strips them → `content_len=0` empty-line spam. Dropping
+    /// raw_output (Option 1b) avoids the corruption but breaks cache coherence
+    /// — every post-cancel turn cold-resets. Unacceptable for roleplay.
+    ///
+    /// This fix takes the third path: **actually decode the closer tokens into
+    /// the KV cache**, so the cache and `raw_out` agree byte-for-byte that the
+    /// turn ended cleanly. Next turn's `common_prefix_len` hits the full prefix
+    /// — delta-prefill fast path preserved, zero stutter. The cost is 1-3 extra
+    /// forward passes at cancel time — microseconds, paid once.
+    ///
+    /// # The closer is always `<channel|>`
+    ///
+    /// The Gemma4 protocol is sequential, not nested — exactly one channel is
+    /// open at a time (thought, then reply). The closer for ANY open channel
+    /// is `<channel|>`. No state machine needed to detect which channel; just
+    /// detect whether ANY channel is still open.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(true)` — closer was appended (micro-decode ran).
+    /// - `Ok(false)` — skipped: raw_out empty, already cleanly closed, or the
+    ///   literal couldn't be tokenized (defensive — caller should fall back
+    ///   to dropping raw_output, accepting the cold-reset).
+    fn append_channel_closer(
+        &mut self,
+        raw_out: &mut String,
+        tokens_generated: &mut Vec<LlamaToken>,
+        n_cur: &mut i32,
+        step_batch: &mut LlamaBatch,
+    ) -> anyhow::Result<bool> {
+        // Edge case 1: nothing generated. No closer needed.
+        if raw_out.is_empty() {
+            return Ok(false);
+        }
+
+        // Detect whether any channel is still open. Scan for the last
+        // `<|channel>` opener; if a `<channel|>` follows it, the channel is
+        // already closed (edge case 2: cancel landed at a clean boundary).
+        let last_open = raw_out.rfind("<|channel>");
+        match last_open {
+            None => {
+                // No opener at all — the model replied without using the
+                // channel protocol (some Plain-family turns do this). Nothing
+                // to close.
+                return Ok(false);
+            }
+            Some(open_idx) => {
+                let after_open = &raw_out[open_idx..];
+                if after_open.contains("<channel|>") {
+                    // The last opened channel is already closed. Clean boundary.
+                    return Ok(false);
+                }
+                // Fall through: channel is open, we need to close it.
+            }
+        }
+
+        // Tokenize the closer. AddBos::Never — we're appending, not starting.
+        let closer_tokens = self
+            .model
+            .str_to_token("<channel|>", AddBos::Never)
+            .map_err(|e| anyhow::anyhow!("tokenize closer: {e:?}"))?;
+        if closer_tokens.is_empty() {
+            tracing::warn!("str_to_token(\"<channel|>\") returned empty — skipping closer");
+            return Ok(false);
+        }
+
+        // Micro-decode each closer token into the cache. Same shape as the
+        // per-token step in the main decode loop (engine.rs:918-924).
+        for tok in &closer_tokens {
+            step_batch.clear();
+            step_batch
+                .add(*tok, *n_cur, &[0], true)
+                .map_err(|e| anyhow::anyhow!("closer batch add: {e:?}"))?;
+            self.ctx
+                .decode(step_batch)
+                .map_err(|e| anyhow::anyhow!("closer decode: {e:?}"))?;
+
+            tokens_generated.push(*tok);
+            *n_cur += 1;
+        }
+
+        // Append the literal closer string to raw_out. Always the literal —
+        // `token_to_piece` can return empty for special-control tokens, which
+        // would desync raw_out from the cache. The literal is what the model's
+        // protocol expects and what render_prompt will re-emit next turn.
+        raw_out.push_str("<channel|>");
+
+        tracing::info!(
+            closer_tokens = closer_tokens.len(),
+            new_n_cur = *n_cur,
+            "appended channel closer via micro-decode (coherence-preserving cancel)"
+        );
+        Ok(true)
+    }
+
     /// Run one generation: render → tokenize → delta-prefill → decode loop →
     /// append generated tokens to the log. Captures telemetry for the
     /// structured performance block emitted at the end.
@@ -367,9 +472,24 @@ impl EngineRuntime {
         // rendered prompt still contained the FULL history → common_prefix_len
         // diverged right after the system prefix → the delta was ~the entire
         // conversation → NoKvCacheSlot. The fix inverts the relationship:
-        // truncate the PROMPT to fit the cache, instead of rebuilding the
-        // cache to match an ever-growing prompt. After this, full_tokens is
-        // guaranteed to fit within (n_ctx - generation_reserve). ---
+        // truncate the PROMPT to fit the cache. After truncation, the §2F
+        // structural-divergence guard (below) handles the cache/prompt
+        // mismatch by cold-resetting — slower than surgical eviction, but
+        // correct and safe.
+        //
+        // Why not surgical eviction on truncation: attempted in three
+        // iterations (token-slice matching → turn-count matching →
+        // diagnostics), all bailed. The root cause is token-boundary drift:
+        // the resident cache holds the previous turn's tokenization, but the
+        // current prompt is freshly re-tokenized, and BPE merge boundaries
+        // differ for older turns (only the last assistant turn is preserved
+        // verbatim via raw_output per §2C Bug #3). So resident and the
+        // truncated prompt share only the system prefix at the token level,
+        // and no mapping can align them. Storing raw token IDs alongside
+        // messages would fix the drift but hard-locks history to one model's
+        // tokenizer — rejected (model-swap would corrupt saved chats).
+        // Truncation cold-reset is the accepted cost until the Memory engine
+        // keeps visible history short enough that truncation rarely fires.
         let generation_reserve = (self.n_ctx as usize / 4).max(GENERATION_RESERVE_FLOOR_TOKENS);
         let max_prompt_len = (self.n_ctx as usize).saturating_sub(generation_reserve);
         let full_tokens = if full_tokens.len() > max_prompt_len {
@@ -388,7 +508,7 @@ impl EngineRuntime {
                         before = full_tokens.len(),
                         after = truncated.len(),
                         max = max_prompt_len,
-                        dropped_turns = full_tokens.len().saturating_sub(truncated.len()),
+                        dropped_tokens = full_tokens.len().saturating_sub(truncated.len()),
                         "truncated prompt to fit context window"
                     );
                     truncated
@@ -507,7 +627,15 @@ impl EngineRuntime {
             .as_secs_f64()
             .max(0.0001); // avoid divide-by-zero on sub-token runs
         let gen_speed = gen_result.tokens_generated as f64 / gen_elapsed_s;
-        let cancelled_note = if gen_result.cancelled { " [CANCELLED]" } else { "" };
+        let cancelled_note = if gen_result.cancelled {
+            if gen_result.closer_appended {
+                " [CANCELLED: closer appended]"
+            } else {
+                " [CANCELLED: clean boundary]"
+            }
+        } else {
+            ""
+        };
 
         eprintln!();
         eprintln!("[DEBUG] ─── ENGINE PERFORMANCE TELEMETRY ───{cancelled_note}");
@@ -643,6 +771,36 @@ impl EngineRuntime {
 
         let generation_elapsed = loop_start.elapsed();
 
+        // --- Coherence-preserving cancel (Path B, 2026-07-13) ---
+        // If the decode loop broke because chat_stop fired mid-generation, the
+        // model's output is left with an open `<|channel>...` block. Append
+        // the canonical closer `<channel|>` via a real micro-decode into the
+        // KV cache so the resident state ends at a clean turn boundary. This
+        // keeps cache coherence intact across cancels → next turn's delta-
+        // prefill fast path fires instead of cold-resetting → no stutter.
+        //
+        // Must run BEFORE the filter flush + parse_output so downstream sees
+        // the complete, closed channel structure.
+        let mut closer_appended = false;
+        if cancelled {
+            match self.append_channel_closer(
+                &mut raw_out,
+                &mut tokens_generated,
+                &mut n_cur,
+                &mut step_batch,
+            ) {
+                Ok(true) => closer_appended = true,
+                Ok(false) => {
+                    // Skipped (empty raw, already clean, or couldn't tokenize).
+                    // Fall back to dropping raw_output to avoid persisting a
+                    // malformed turn — accepts a cold-reset next turn.
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "append_channel_closer failed; dropping raw_output");
+                }
+            }
+        }
+
         // Flush both filters.
         let gate_tail = thought_gate.flush();
         if !gate_tail.is_empty() {
@@ -664,8 +822,20 @@ impl EngineRuntime {
         // Bug #3: attach the raw model output so it can be persisted onto the
         // assistant Message. The formatter re-renders from this next turn so
         // the rendered tokens match the KV cache exactly (no re-prefill).
+        //
+        // Cancel handling (Path B, 2026-07-13): the coherence-preserving
+        // closer-append above made raw_out structurally valid (ends with
+        // `<channel|>`), so it's safe to persist verbatim — cache coherence
+        // is preserved and next turn's delta-prefill fast path fires. If the
+        // closer was NOT appended (skipped or errored — the rare fallback),
+        // drop raw_output to avoid persisting a malformed turn; that turn
+        // cold-resets next time, which is the safe degradation.
         let mut parsed = self.formatter.parse_output(&raw_out);
-        parsed.raw = raw_out;
+        parsed.raw = if cancelled && !closer_appended {
+            String::new()
+        } else {
+            raw_out
+        };
         tracing::info!(
             tokens = gen_count,
             content_len = parsed.content.len(),
@@ -681,6 +851,7 @@ impl EngineRuntime {
             time_to_first_token,
             generation_elapsed,
             cancelled,
+            closer_appended,
         })
     }
 
