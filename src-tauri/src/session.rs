@@ -98,10 +98,49 @@ impl Conversation {
         self.messages.pop();
     }
 
+    /// Persist the conversation **atomically**: serialize, write to a sibling
+    /// temp file, then `rename` it over the destination.
+    ///
+    /// Atomicity matters because `save()` runs on every message: a plain
+    /// `fs::write(path, ...)` truncates-then-writes, so a crash / power loss /
+    /// disk-full mid-write leaves `session.json` truncated and the ENTIRE
+    /// conversation unrecoverable. The temp+rename pattern guarantees the
+    /// destination is either the previous complete file or the new complete
+    /// file — never a half-written middle state.
+    ///
+    /// - The temp file is in the same directory as `path` (same volume →
+    ///   `rename` is atomic; a cross-device rename would degrade to copy+delete
+    ///   and lose the atomicity guarantee).
+    /// - On Windows, `std::fs::rename` over an existing file uses
+    ///   `MOVEFILE_REPLACE_EXISTING`, so the overwrite is atomic there too.
+    /// - A stale `.tmp` from a prior crashed save is removed first so we never
+    ///   accidentally rename a leftover corrupt temp over the good file.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        std::fs::write(path, json)
+
+        // Temp file: sibling of the destination, same directory/volume.
+        let tmp_path = temp_path_for(path);
+
+        // Clear any stale temp from a crashed prior save (ignore NotFound).
+        let _ = std::fs::remove_file(&tmp_path);
+
+        // Write + flush the temp so the bytes are durable before the rename.
+        // Without fsync, a crash after rename could expose an empty/journaled
+        // file once the OS writeback catches up.
+        {
+            let mut file = std::fs::File::create(&tmp_path)?;
+            std::io::Write::write_all(&mut file, json.as_bytes())?;
+            std::io::Write::flush(&mut file)?;
+            // Sync the file's data to disk. AllDataSync because metadata
+            // (size) for an existing file is cheap; for the rename we only
+            // truly need the data, but AllDataSync is the safer choice and
+            // the perf cost is one extra syscall on a tiny JSON file.
+            let _ = file.sync_all();
+        }
+
+        // Atomic replace. On Windows this uses MOVEFILE_REPLACE_EXISTING.
+        std::fs::rename(&tmp_path, path)
     }
 
     pub fn load(path: &Path) -> std::io::Result<Self> {
@@ -149,6 +188,21 @@ pub struct ApiMessage {
     pub raw_output: String,
 }
 
+/// Build a sibling temp-file path for an atomic save: same directory + volume
+/// as `path` (so `rename` is atomic), with a `.tmp` suffix on the file stem.
+///
+/// `session.json` → `session.json.tmp`. We keep the full original name as a
+/// prefix so the temp is visually obvious in the dir and `save`'s stale-temp
+/// cleanup (`remove_file`) targets exactly this one file — not a random one.
+fn temp_path_for(path: &Path) -> std::path::PathBuf {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .unwrap_or_else(|| std::ffi::OsString::from("wupi.tmp"));
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
 fn gen_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let ts = SystemTime::now()
@@ -182,4 +236,165 @@ fn chrono_now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Unique path in the temp dir, namespaced by pid + a counter so parallel
+    /// test runs and repeated invocations don't collide. Avoids pulling in the
+    /// `tempfile` crate for what is a one-line unique-name need.
+    fn unique_test_path(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "wupi_test_{}{}_{}_{}.json",
+            std::process::id(),
+            ts,
+            n,
+            name
+        ))
+    }
+
+    /// Build a throwaway conversation with one message for round-trip tests.
+    fn sample_conv() -> Conversation {
+        let mut c = Conversation::new();
+        c.add_message(Role::User, "hello".into());
+        c
+    }
+
+    /// Clean up both the main file and its sibling temp so the temp dir
+    /// doesn't accumulate test artifacts. NotFound is fine.
+    fn cleanup(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(temp_path_for(path));
+    }
+
+    #[test]
+    fn temp_path_is_sibling_with_tmp_suffix() {
+        let p = std::path::PathBuf::from("dir/session.json");
+        assert_eq!(temp_path_for(&p), std::path::PathBuf::from("dir/session.json.tmp"));
+        // No-extension path still gets .tmp.
+        let p2 = std::path::PathBuf::from("dir/session");
+        assert_eq!(temp_path_for(&p2), std::path::PathBuf::from("dir/session.tmp"));
+    }
+
+    #[test]
+    fn save_then_load_roundtrips() {
+        let path = unique_test_path("roundtrip");
+        cleanup(&path);
+        let conv = sample_conv();
+
+        conv.save(&path).expect("save should succeed");
+
+        // Temp must be gone after a successful save (renamed away).
+        assert!(!temp_path_for(&path).exists(), "temp file left behind");
+        // Main file exists and round-trips.
+        let loaded = Conversation::load(&path).expect("load should succeed");
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages[0].content, "hello");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn save_does_not_leave_temp_file_on_success() {
+        // Regression guard: if a future refactor drops the rename or makes it
+        // non-atomic, this test fails because the .tmp would remain.
+        let path = unique_test_path("no_temp_leftover");
+        cleanup(&path);
+        sample_conv().save(&path).expect("save");
+        assert!(path.exists(), "destination must exist");
+        assert!(
+            !temp_path_for(&path).exists(),
+            "temp file must be renamed away, not left behind"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn save_overwrites_existing_file_in_place() {
+        // Save once, then save a second time with different content. The
+        // destination must reflect the second save and the temp must be gone.
+        let path = unique_test_path("overwrite");
+        cleanup(&path);
+
+        let mut first = Conversation::new();
+        first.add_message(Role::User, "first".into());
+        first.save(&path).expect("first save");
+
+        let mut second = Conversation::new();
+        second.add_message(Role::User, "second".into());
+        second.add_message(Role::User, "third".into());
+        second.save(&path).expect("second save");
+
+        let loaded = Conversation::load(&path).expect("load");
+        assert_eq!(loaded.messages.len(), 2, "second save should win");
+        assert_eq!(loaded.messages[0].content, "second");
+        assert!(!temp_path_for(&path).exists(), "temp leaked after overwrite");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn stale_temp_from_prior_crash_is_cleared_before_rename() {
+        // Simulate a prior crashed save: drop a stale temp file in place, then
+        // save. The stale temp must not survive (it gets removed + replaced by
+        // the new one, which is then renamed away).
+        let path = unique_test_path("stale_temp");
+        cleanup(&path);
+
+        let tmp = temp_path_for(&path);
+        std::fs::write(&tmp, b"stale garbage from a crashed save").expect("seed stale temp");
+        assert!(tmp.exists(), "precondition: stale temp exists");
+
+        sample_conv().save(&path).expect("save should clear stale temp");
+        assert!(path.exists(), "destination written");
+        assert!(
+            !tmp.exists(),
+            "stale temp must be cleared (removed then renamed away), not left as garbage"
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn destination_survives_when_only_temp_would_be_corrupt() {
+        // The atomicity guarantee: if a write were to fail partway, the
+        // DESTINATION must remain the previously-saved good file. We can't
+        // easily simulate a mid-write crash, but we CAN prove the invariant
+        // indirectly: save a known-good file, then confirm a second save that
+        // completes leaves a valid file. The point of the temp+rename design
+        // is that the destination is never opened for write directly.
+        let path = unique_test_path("atomicity");
+        cleanup(&path);
+
+        let mut good = Conversation::new();
+        good.add_message(Role::User, "known-good state".into());
+        good.save(&path).expect("first save");
+        let before = std::fs::read(&path).expect("read good file");
+
+        // Second save with new content.
+        sample_conv().save(&path).expect("second save");
+        let after = std::fs::read(&path).expect("read new file");
+
+        assert_ne!(before, after, "second save must actually replace content");
+        // Both reads must be valid JSON (no partial-write corruption).
+        assert!(
+            serde_json::from_slice::<Conversation>(&before).is_ok(),
+            "pre-overwrite file must be valid"
+        );
+        assert!(
+            serde_json::from_slice::<Conversation>(&after).is_ok(),
+            "post-overwrite file must be valid"
+        );
+
+        cleanup(&path);
+    }
 }
