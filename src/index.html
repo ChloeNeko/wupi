@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WUPI OS</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <span class="brand">🐾 WUPI OS</span>
+        <span id="status" class="status">starting…</span>
+      </header>
+
+      <main id="chat" class="chat"></main>
+
+      <footer class="composer">
+        <textarea
+          id="input"
+          class="input"
+          rows="1"
+          placeholder="Ask Wupi something…"
+          autocomplete="off"
+        ></textarea>
+        <button id="send" class="send" type="button">Send</button>
+        <button id="stop" class="stop hidden" type="button">Stop</button>
+      </footer>
+    </div>
+    <script type="module" src="/main.ts"></script>
+  </body>
+</html>

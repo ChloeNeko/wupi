@@ -1,0 +1,6 @@
+[env]
+LLAMA_CMAKE_CUDA_ARCHITECTURES = "120"
+LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"
+CUDA_PATH = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.3"
+CudaToolkitDir = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.3"
+CMAKE_BUILD_PARALLEL_LEVEL = "8"

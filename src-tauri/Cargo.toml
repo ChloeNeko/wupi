@@ -1,0 +1,32 @@
+[package]
+name = "wupi-os"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "wupi_os_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Async runtime for the agent loop + streaming.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# Typed errors without boilerplate.
+anyhow = "1"
+# Regex for tool-call block parsing (ported from tools.js).
+regex = "1"
+# Logging — written to a file in app data; visible only in Debug mode.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+# CUDA is a hard dependency of the architecture (local GPU inference for the
+# 12B chat model). The `cuda` feature gates llama.cpp's CUDA backend; do NOT
+# remove it — CPU-only inference collapses ~32-42 tok/s to single digits.
+# See AGENTS.md §0 (stack), §2 (deps), §2B (build rules).
+llama-cpp-2 = { version = "0.1.151", features = ["sampler", "cuda"] }
+encoding_rs = "0.8"

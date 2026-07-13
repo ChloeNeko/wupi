@@ -1,0 +1,253 @@
+//! LLM backend façade.
+//!
+//! The heavy generation logic now lives in [`crate::engine`] — a dedicated
+//! thread owning a persistent `LlamaContext` with Q8_0 KV cache and a
+//! [`KvBuffer`] that tracks the token IDs resident in the cache so each turn
+//! only prefills the **delta** since the last turn.
+//!
+//! This module is now a thin façade: it loads the model off-thread, leaks it
+//! to `&'static` (so the engine can hold a `LlamaContext<'static>`), spawns
+//! the engine, and exposes a [`GenerationClient`] impl that posts requests to
+//! the engine thread.
+//!
+//! # Why `Box::leak`
+//!
+//! `LlamaContext<'a>` borrows `&'a LlamaModel` (see `context.rs:28` in the
+//! crate). Storing model + context together is self-referential and rejected
+//! by the borrow checker. Leaking the model to `&'static LlamaModel` dissolves
+//! the borrow — `new_context(&'static self)` yields `LlamaContext<'static>`,
+//! which the engine thread can own freely.
+//!
+//! This is the idiomatic choice for a **process-lifetime singleton**: the
+//! model is loaded once and lives until the OS exits. The memory is never
+//! reclaimed, which is exactly what we want (we don't want to unload the
+//! model mid-session). If hot-swap lands later (a P-phase settings feature),
+//! reclaim via `Box::from_raw(ptr)` + `drop` before loading the replacement.
+
+use crate::chat_format::ParsedOutput;
+use crate::chat_format::ModelFamily;
+use crate::engine::{ChatEngine, EngineReply, EngineRequest};
+use crate::session::ApiMessage;
+use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::model::LlamaModel;
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
+
+pub type StreamFuture = Pin<Box<dyn Future<Output = anyhow::Result<ParsedOutput>> + Send>>;
+pub type ChunkFn = Arc<dyn Fn(&str) + Send + Sync>;
+/// Cancellation flag shared between `chat_send` and `chat_stop`. The engine's
+/// decode loop checks this between tokens.
+pub type CancelToken = Arc<std::sync::atomic::AtomicBool>;
+
+pub trait GenerationClient: Send + Sync {
+    fn stream(
+        &self,
+        messages: Vec<ApiMessage>,
+        context_size: u32,
+        on_chunk: ChunkFn,
+        cancel: CancelToken,
+    ) -> StreamFuture;
+
+    fn is_ready(&self) -> bool {
+        false
+    }
+}
+
+/// Echo fallback used when no model file is found. Unchanged from Layer 1.
+pub struct EchoBackend;
+
+impl GenerationClient for EchoBackend {
+    fn stream(
+        &self,
+        _messages: Vec<ApiMessage>,
+        _context_size: u32,
+        on_chunk: ChunkFn,
+        _cancel: CancelToken,
+    ) -> StreamFuture {
+        Box::pin(async move {
+            let reply = "(echo backend) Wupi's model isn't loaded yet.";
+            on_chunk(reply);
+            Ok(ParsedOutput {
+                content: reply.to_string(),
+                reasoning: String::new(),
+                raw: String::new(),
+            })
+        })
+    }
+}
+
+/// The loaded model + backend, as loaded from disk. This is an intermediate
+/// value — it exists only between `load_blocking` and `into_static`, after
+/// which the backend + model are leaked to `&'static` and handed to the engine.
+pub struct LlamaModelHandle {
+    backend: LlamaBackend,
+    model: LlamaModel,
+    family: ModelFamily,
+}
+
+unsafe impl Send for LlamaModelHandle {}
+unsafe impl Sync for LlamaModelHandle {}
+
+impl LlamaModelHandle {
+    /// Leak the backend + model to `&'static` references so the engine can
+    /// own a `LlamaContext<'static>`. See the module docs for the rationale.
+    ///
+    /// The family is returned by value (it's `Copy`).
+    #[must_use]
+    fn into_static(self) -> (&'static LlamaBackend, &'static LlamaModel, ModelFamily) {
+        let backend_ref: &'static LlamaBackend = Box::leak(Box::new(self.backend));
+        let model_ref: &'static LlamaModel = Box::leak(Box::new(self.model));
+        (backend_ref, model_ref, self.family)
+    }
+}
+
+/// The backend façade. Holds a handle to the engine thread (or `None` while
+/// loading). Fully `Send`/`Sync` — no `LlamaContext` or `!Send` type crosses
+/// out of the engine thread.
+pub struct LlamaCppBackend {
+    engine: Arc<std::sync::Mutex<Option<ChatEngine>>>,
+}
+
+impl LlamaCppBackend {
+    /// Load the model off-thread, then spawn the persistent engine. Returns
+    /// immediately with a backend handle; `on_result` fires when loading +
+    /// engine init completes (success or failure).
+    ///
+    /// `context_size` fixes the `n_ctx` of the persistent context. It cannot
+    /// change without re-spawning the engine — that's a future P concern
+    /// (settings hot-reload).
+    pub fn spawn_load(
+        path: PathBuf,
+        n_gpu_layers: u32,
+        context_size: u32,
+        on_result: Box<dyn FnOnce(Result<String, String>) + Send>,
+    ) -> Arc<Self> {
+        let engine_slot: Arc<std::sync::Mutex<Option<ChatEngine>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let slot_clone = Arc::clone(&engine_slot);
+
+        std::thread::spawn(move || match Self::load_blocking(&path, n_gpu_layers) {
+            Ok(handle) => {
+                tracing::info!("model loaded from {}", path.display());
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("model")
+                    .to_string();
+
+                // Leak the model + backend to &'static. The engine thread
+                // will own them for the process lifetime.
+                let (backend_ref, model_ref, family) = handle.into_static();
+
+                // Spawn the persistent engine with Q8_0 KV cache + delta prefill.
+                let (engine, init_rx) =
+                    ChatEngine::spawn(backend_ref, model_ref, family, context_size);
+
+                // Bug #6: await engine init confirmation BEFORE signaling
+                // readiness. We're already on a background thread, so
+                // blocking here doesn't stall the UI. If init_runtime failed
+                // (CUDA context alloc error, etc.), report the error instead
+                // of falsely claiming "ready".
+                match init_rx.recv() {
+                    Ok(Ok(())) => {
+                        {
+                            let mut g = slot_clone.lock().expect("engine mutex");
+                            *g = Some(engine);
+                        }
+                        on_result(Ok(name));
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(error = %e, "engine init failed");
+                        on_result(Err(e));
+                    }
+                    Err(_) => {
+                        let msg = "engine init channel closed unexpectedly".to_string();
+                        tracing::error!(error = %msg);
+                        on_result(Err(msg));
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "model load failed");
+                on_result(Err(format!("{e}")));
+            }
+        });
+
+        Arc::new(LlamaCppBackend {
+            engine: engine_slot,
+        })
+    }
+
+    fn load_blocking(path: &PathBuf, n_gpu_layers: u32) -> anyhow::Result<LlamaModelHandle> {
+        use llama_cpp_2::model::params::LlamaModelParams;
+        let backend = LlamaBackend::init()
+            .map_err(|e| anyhow::anyhow!("backend init: {e:?}"))?;
+
+        let params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
+        let model = LlamaModel::load_from_file(&backend, path, &params)
+            .map_err(|e| anyhow::anyhow!("model load: {e:?}"))?;
+
+        let filename = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let family = ModelFamily::from_model_name(filename);
+        tracing::info!(family = ?family, filename, "detected model family");
+
+        Ok(LlamaModelHandle {
+            backend,
+            model,
+            family,
+        })
+    }
+}
+
+impl GenerationClient for LlamaCppBackend {
+    fn stream(
+        &self,
+        messages: Vec<ApiMessage>,
+        _context_size: u32,
+        on_chunk: ChunkFn,
+        cancel: CancelToken,
+    ) -> StreamFuture {
+        let engine = Arc::clone(&self.engine);
+        Box::pin(async move {
+            let (reply_tx, reply_rx) = std::sync::mpsc::channel::<EngineReply>();
+            {
+                let guard = engine.lock().expect("engine mutex");
+                let eng = guard
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("model not loaded yet"))?;
+                eng.request(EngineRequest {
+                    messages,
+                    on_chunk,
+                    cancel,
+                    reply: reply_tx,
+                })
+                .map_err(|e| anyhow::anyhow!(e))?;
+            }
+
+            // Await the reply off the async runtime — generation takes seconds
+            // and we must not block a tokio worker. The engine streams chunks
+            // directly to `on_chunk` (the Tauri Channel) while we wait.
+            let reply = tokio::task::spawn_blocking(move || reply_rx.recv())
+                .await
+                .map_err(|e| anyhow::anyhow!("join: {e}"))?
+                .map_err(|_| anyhow::anyhow!("engine reply channel closed"))?;
+
+            match reply {
+                EngineReply::Ok(parsed) => Ok(parsed),
+                EngineReply::Err(msg) => Err(anyhow::anyhow!(msg)),
+            }
+        })
+    }
+
+    fn is_ready(&self) -> bool {
+        self.engine
+            .lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
+    }
+}
