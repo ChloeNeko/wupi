@@ -224,7 +224,7 @@ async fn chat_send(
     let messages = {
         let mut s = state.session.lock().await;
         s.add_message(session::Role::User, text.clone());
-        save_session(&app, &s);
+        save_session(&app, &s).await;
         s.assemble_api_messages(&system_prompt)
     };
 
@@ -276,7 +276,7 @@ async fn chat_send(
             result.reasoning.clone(),
             result.raw.clone(),
         );
-        save_session(&app, &s);
+        save_session(&app, &s).await;
     }
 
     clear_active_cancel(&state);
@@ -302,7 +302,7 @@ async fn rollback_last_user_message(state: &tauri::State<'_, AppState>, app: &ta
     let mut s = state.session.lock().await;
     if s.last_message_is_user() {
         s.pop_last_message();
-        save_session(app, &s);
+        save_session(app, &s).await;
     }
 }
 
@@ -332,12 +332,35 @@ async fn get_settings(state: tauri::State<'_, AppState>) -> Result<serde_json::V
     }))
 }
 
-fn save_session(app: &tauri::AppHandle, conv: &session::Conversation) {
+/// Persist the session off the Tokio worker pool.
+///
+/// `Conversation::save` is atomic (temp + fsync + rename, see §2E) but
+/// synchronous — `File::create` / `write_all` / `sync_all` / `rename` all
+/// block the calling thread on the disk. Running that on a Tokio worker
+/// (which is what the old sync `save_session` did) stalls the async runtime
+/// for the duration of the write + fsync. Harmless today (one user, one
+/// chat, save is ~ms on SSD), but the moment the Memory engine adds
+/// concurrent async work racing the save, a blocked worker becomes a real
+/// stall. `spawn_blocking` moves the I/O onto the dedicated blocking thread
+/// pool (default 512 threads) so workers stay free to poll futures.
+///
+/// The session mutex guard is still held across the `.await` by the caller
+/// — that's correct for a `tokio::sync::Mutex` (its guard is await-safe) and
+/// serializes concurrent saves, which we want anyway.
+async fn save_session(app: &tauri::AppHandle, conv: &session::Conversation) {
     use tauri::Manager;
-    if let Some(data_dir) = app.path().app_data_dir().ok() {
-        let path = data_dir.join("session.json");
+    let Some(data_dir) = app.path().app_data_dir().ok() else {
+        return;
+    };
+    let path = data_dir.join("session.json");
+    // Clone so the closure owns its data (spawn_blocking needs 'static). The
+    // Conversation is a Vec of small messages — cheap to clone relative to a
+    // disk fsync.
+    let conv = conv.clone();
+    let _ = tokio::task::spawn_blocking(move || {
         if let Err(e) = conv.save(&path) {
             tracing::warn!(?e, "failed to persist session");
         }
-    }
+    })
+    .await;
 }
