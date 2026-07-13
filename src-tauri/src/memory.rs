@@ -292,7 +292,19 @@ impl<E: Embedder> MemoryEngine<E> {
         // structurally parallel.
         Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<RankedMemory>> {
             let c = conn.lock().expect("memory conn mutex");
-            let sparse = fts5_top_k(&c, &query_owned, RETRIEVAL_DEPTH)?;
+            // Degrade to dense-only if FTS5 fails. The sparse and dense paths
+            // are independent backends — a syntax error in one (e.g. an FTS5
+            // operator char that slipped past sanitization) must not kill the
+            // other. fuse_rrf handles an empty sparse list cleanly (dense
+            // results keep their 1-based ranks). Logged at warn so a
+            // recurrence is visible without breaking the turn.
+            let sparse = match fts5_top_k(&c, &query_owned, RETRIEVAL_DEPTH) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "fts5 search failed; dense-only this turn");
+                    Vec::new()
+                }
+            };
             let dense = vec0_top_k(&c, &embedding, RETRIEVAL_DEPTH)?;
             let fused = fuse_rrf(&sparse, &dense, limit);
             fetch_entries(&c, &fused)
@@ -413,11 +425,20 @@ fn insert_in_transaction(
 
 /// BM25 keyword search. Returns rowids best-first, up to `limit`.
 ///
-/// The query is passed verbatim into FTS5's MATCH operator. FTS5's query
-/// syntax (`"phrase"`, `OR`, prefix `term*`) is supported — callers don't
-/// need to escape anything for the common case; advanced users get the full
-/// query language for free.
+/// The raw query is sanitized via [`sanitize_fts5_query`] before being passed
+/// to FTS5's MATCH operator — FTS5 interprets `!`, `*`, `"`, `(`, `)`, `:` as
+/// query-syntax operators, so unsanitized user input trips a syntax error on
+/// the first punctuation mark (verified at runtime 2026-07-13: "Hello there
+/// Wupi!" → `fts5: syntax error near "!"`). Phrase-quoting each whitespace
+/// token neutralizes every operator char; FTS5's tokenizer then strips
+/// punctuation inside the quotes, so `"Wupi!"` matches the indexed token
+/// `wupi`. Empty/whitespace-only input short-circuits to an empty result
+/// (no sparse contribution — dense-only retrieval).
 fn fts5_top_k(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<MemoryId>> {
+    let sanitized = sanitize_fts5_query(query);
+    if sanitized.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut stmt = conn
         .prepare(
             "SELECT rowid FROM memories_fts
@@ -428,7 +449,7 @@ fn fts5_top_k(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Ve
         .map_err(|e| anyhow::anyhow!("prepare fts5: {e:?}"))?;
 
     let rows = stmt
-        .query_map(params![query, limit as i64], |r| r.get::<_, MemoryId>(0))
+        .query_map(params![&sanitized, limit as i64], |r| r.get::<_, MemoryId>(0))
         .map_err(|e| anyhow::anyhow!("query fts5: {e:?}"))?;
 
     let mut out = Vec::new();
@@ -436,6 +457,29 @@ fn fts5_top_k(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Ve
         out.push(r.map_err(|e| anyhow::anyhow!("fts5 row: {e:?}"))?);
     }
     Ok(out)
+}
+
+/// Turn raw user text into a safe FTS5 MATCH query.
+///
+/// Splits on ASCII whitespace and wraps each token as a double-quoted FTS5
+/// phrase. Phrase-quoted tokens are re-tokenized by FTS5's own tokenizer
+/// (unicode61 strips punctuation), so operator characters like `!`, `*`, `"`
+/// lose their special meaning. Internal double-quotes are escaped by doubling
+/// (`""`), per FTS5's phrase-escape rule. Multiple quoted tokens form an
+/// implicit-AND query.
+///
+/// Returns an empty string for empty/whitespace-only input — callers should
+/// treat that as "no sparse query" (the dense path still runs).
+fn sanitize_fts5_query(input: &str) -> String {
+    input
+        .split_whitespace()
+        .map(|tok| {
+            // Escape any literal `"` inside the token by doubling it.
+            let escaped = tok.replace('"', "\"\"");
+            format!("\"{escaped}\"")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Cosine (dense) search. Returns rowids best-first (smallest distance), up
