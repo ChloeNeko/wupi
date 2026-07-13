@@ -228,3 +228,168 @@ body {
 .hidden {
   display: none !important;
 }
+
+/* ── Topbar right cluster (status + memory toggle) ──────── */
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.memory-toggle {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 0.95rem;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.memory-toggle:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* ── Memory debug panel (pillar 4) ───────────────────────── */
+/* A persistent query box that probes the hybrid engine independently of
+   generation. Collapsed by default (`.hidden`); the topbar 🧠 toggles it.
+   Sits above the composer so it doesn't eat the chat area. Mirrors the
+   .reasoning aesthetic (muted, internal-facing). */
+.memory-debug {
+  flex: 0 0 auto;
+  max-height: 45vh;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  background: var(--bg-elev);
+}
+
+.memory-debug-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.memory-debug-title {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+}
+
+.memory-debug-close {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+.memory-debug-close:hover {
+  color: var(--accent);
+}
+
+.memory-debug-query {
+  display: flex;
+  gap: 6px;
+  padding: 8px 12px;
+}
+
+.memory-debug-query input {
+  flex: 1 1 auto;
+  padding: 6px 10px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
+  font-size: 0.85rem;
+}
+
+.memory-debug-query input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.memory-debug-query button {
+  flex: 0 0 auto;
+  padding: 6px 14px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.memory-debug-query button:hover {
+  filter: brightness(1.15);
+}
+
+.memory-debug-results {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* A single retrieved memory row. Role badge + score on top, text below.
+   Score is muted — it's diagnostic, not content. */
+.memory-result {
+  padding: 6px 10px;
+  border-left: 2px solid var(--border);
+  background: rgba(157, 78, 221, 0.06);
+  border-radius: 0 6px 6px 0;
+}
+
+.memory-result-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin-bottom: 4px;
+}
+
+.memory-result-role {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--accent);
+}
+
+.memory-result-score {
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.memory-result-text {
+  font-size: 0.82rem;
+  line-height: 1.4;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.memory-result-empty {
+  font-size: 0.82rem;
+  color: var(--text-dim);
+  font-style: italic;
+  padding: 8px 0;
+}
+
+.memory-result-error {
+  font-size: 0.82rem;
+  color: #ff6b6b;
+  padding: 8px 0;
+}

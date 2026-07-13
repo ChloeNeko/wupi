@@ -24,6 +24,31 @@ const sendBtn = document.getElementById("send") as HTMLButtonElement;
 const stopBtn = document.getElementById("stop") as HTMLButtonElement;
 const statusEl = document.getElementById("status") as HTMLSpanElement;
 
+// Memory debug panel (pillar 4). Cached once like the chat refs above.
+const memoryToggle = document.getElementById("memory-toggle") as HTMLButtonElement;
+const memoryPanel = document.getElementById("memory-debug") as HTMLDivElement;
+const memoryCloseBtn = document.getElementById("memory-debug-close") as HTMLButtonElement;
+const memoryInput = document.getElementById("memory-debug-input") as HTMLInputElement;
+const memoryRunBtn = document.getElementById("memory-debug-run") as HTMLButtonElement;
+const memoryResults = document.getElementById("memory-debug-results") as HTMLDivElement;
+
+// Mirrors the Rust `RankedMemory` (memory.rs) + nested `MemoryEntry`. The
+// backend serializes via serde, so field names are snake_case and the role
+// comes through as the serde-lowercased enum string ("user"/"assistant"/...).
+interface MemoryEntry {
+  id: number;
+  text_content: string;
+  timestamp: number;
+  role: string;
+  chunk_index: number;
+  salience: number;
+  metadata_json: string | null;
+}
+interface RankedMemory {
+  entry: MemoryEntry;
+  score: number;
+}
+
 let sending = false;
 
 function addMessage(role: "user" | "wupi" | "system", text: string): HTMLDivElement {
@@ -191,6 +216,96 @@ inputEl.addEventListener("keydown", (e) => {
     send();
   }
 });
+
+// ── Memory debug panel (pillar 4) ───────────────────────────
+// Toggle via 🧠, query via the input + search button. Results render as
+// ranked rows showing the fused RRF score + role + text. The panel is the
+// tuning surface for the hybrid engine — fire queries independently of
+// generation to see what retrieval actually returns.
+memoryToggle.addEventListener("click", () => {
+  const willOpen = memoryPanel.classList.contains("hidden");
+  memoryPanel.classList.toggle("hidden", !willOpen);
+  if (willOpen) memoryInput.focus();
+});
+
+memoryCloseBtn.addEventListener("click", () => {
+  memoryPanel.classList.add("hidden");
+});
+
+memoryRunBtn.addEventListener("click", runMemoryQuery);
+memoryInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    runMemoryQuery();
+  }
+});
+
+async function runMemoryQuery(): Promise<void> {
+  const query = memoryInput.value.trim();
+  if (!query) return;
+
+  memoryResults.innerHTML = "";
+  const placeholder = document.createElement("div");
+  placeholder.className = "memory-result-empty";
+  placeholder.textContent = "searching…";
+  memoryResults.appendChild(placeholder);
+
+  try {
+    // topK maps to the Rust `top_k: Option<usize>` param via Tauri's
+    // camelCase→snake_case serde convention.
+    const hits = await invoke<RankedMemory[]>("debug_memory_query", {
+      query,
+      topK: 10,
+    });
+    renderMemoryResults(hits);
+  } catch (err) {
+    memoryResults.innerHTML = "";
+    const errEl = document.createElement("div");
+    errEl.className = "memory-result-error";
+    errEl.textContent = `⚠️ ${String(err?.message ?? err)}`;
+    memoryResults.appendChild(errEl);
+  }
+}
+
+function renderMemoryResults(hits: RankedMemory[]): void {
+  memoryResults.innerHTML = "";
+
+  if (hits.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "memory-result-empty";
+    empty.textContent = "no memories matched.";
+    memoryResults.appendChild(empty);
+    return;
+  }
+
+  for (const hit of hits) {
+    const row = document.createElement("div");
+    row.className = "memory-result";
+
+    const head = document.createElement("div");
+    head.className = "memory-result-head";
+
+    const role = document.createElement("span");
+    role.className = "memory-result-role";
+    role.textContent = hit.entry.role;
+
+    const score = document.createElement("span");
+    score.className = "memory-result-score";
+    // Score scale is ~1/61..2/61; show raw to 4dp for diagnostic precision.
+    score.textContent = `rrf ${hit.score.toFixed(4)}`;
+
+    head.appendChild(role);
+    head.appendChild(score);
+    row.appendChild(head);
+
+    const text = document.createElement("div");
+    text.className = "memory-result-text";
+    text.textContent = hit.entry.text_content;
+    row.appendChild(text);
+
+    memoryResults.appendChild(row);
+  }
+}
 
 async function boot(): Promise<void> {
   try {

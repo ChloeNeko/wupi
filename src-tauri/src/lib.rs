@@ -14,6 +14,15 @@ use std::sync::Arc;
 use tauri::{Emitter, Manager};
 use llm::GenerationClient;
 
+/// The Memory engine's concrete embedder type, decided ONCE at startup. Using
+/// `Box<dyn Embedder + Send + Sync>` lets `AppState` hold one concrete
+/// `MemoryEngine` regardless of whether `Embed.gguf` was found — `LlamaCppEmbedder`
+/// (real BERT backend) or `StubEmbedder` (byte-histogram fallback) both box into
+/// this slot. One virtual call per `embed`, negligible next to multi-ms GPU work.
+/// The `Embedder` trait is verified dyn-compatible (no `Self`, no generic
+/// methods, manually-desugared `EmbedFuture` instead of `async fn`).
+pub type DynEmbedder = Box<dyn memory_embedder::Embedder + Send + Sync>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub session: Arc<tokio::sync::Mutex<session::Conversation>>,
@@ -24,6 +33,11 @@ pub struct AppState {
     /// signals whatever is in this slot. This prevents overlapping sends from
     /// cross-wiring each other's cancellation (Bug #7).
     pub active_cancel: Arc<std::sync::Mutex<Option<llm::CancelToken>>>,
+    /// The Memory engine. Wrapped in `OnceLock` because the embedder needs a
+    /// model path resolved from the Tauri `app` handle, which isn't available
+    /// when `AppState::new()` runs (before `setup()`). `setup()` fills it once;
+    /// reads after init are lock-free. Always `Some` after `setup()` completes.
+    pub memory: Arc<std::sync::OnceLock<Arc<memory::MemoryEngine<DynEmbedder>>>>,
 }
 
 impl AppState {
@@ -33,6 +47,7 @@ impl AppState {
             backend: Arc::new(std::sync::Mutex::new(None)),
             settings: Arc::new(std::sync::Mutex::new(prompts::WupiSettings::default())),
             active_cancel: Arc::new(std::sync::Mutex::new(None)),
+            memory: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
@@ -110,6 +125,76 @@ pub fn run() {
                 );
             }
 
+            // ── Memory engine (pillar 1) ────────────────────────────────
+            // Build the MemoryEngine with the real BERT embedder if
+            // `Embed.gguf` is on disk; fall back to StubEmbedder otherwise
+            // (graceful degradation — documented contract in
+            // memory_embedder_llama.rs::resolve_embed_model). The embedder is
+            // boxed into `Box<dyn Embedder + Send + Sync>` so AppState holds
+            // one concrete type regardless of which backend was chosen.
+            //
+            // `shared_backend()` (§2H) is the single `LlamaBackend::init()`
+            // chokepoint: both the chat loader (above) and the embedder route
+            // through it. The embedder thread does NOT block on chat-model
+            // loading — `shared_backend` is a `OnceLock` that resolves on first
+            // call; whichever loader hits it first inits, the other reuses.
+            let embedder: DynEmbedder = match resolve_embed_model_dirs(app.handle()) {
+                Some(path) => {
+                    tracing::info!("spawning embed model load: {}", path.display());
+                    let (embedder, init_rx) =
+                        memory_embedder_llama::LlamaCppEmbedder::spawn_load(path, 99);
+                    // Block on the readiness channel — same contract as the
+                    // chat engine's Bug #6 fix. If init failed, fall back to
+                    // the stub so the app still runs (memory just won't be
+                    // semantic). This recv runs on the setup thread, which is
+                    // fine — setup is allowed to block.
+                    match init_rx.recv() {
+                        Ok(Ok(())) => {
+                            tracing::info!("memory engine: LlamaCppEmbedder ready");
+                            Box::new(embedder)
+                        }
+                        Ok(Err(msg)) => {
+                            tracing::warn!(
+                                error = %msg,
+                                "embedder init failed; falling back to StubEmbedder"
+                            );
+                            Box::new(memory_embedder::StubEmbedder {
+                                dim: memory_embedder::EMBED_DIM,
+                            })
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "embedder init channel closed; falling back to StubEmbedder"
+                            );
+                            Box::new(memory_embedder::StubEmbedder {
+                                dim: memory_embedder::EMBED_DIM,
+                            })
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        "no Embed.gguf found; memory engine using StubEmbedder (no semantic search)"
+                    );
+                    Box::new(memory_embedder::StubEmbedder {
+                        dim: memory_embedder::EMBED_DIM,
+                    })
+                }
+            };
+
+            let memory_db_path = data_dir.join("memory.sqlite");
+            match memory::MemoryEngine::open(&memory_db_path, embedder) {
+                Ok(engine) => {
+                    let _ = state.memory.set(Arc::new(engine));
+                    tracing::info!(db = %memory_db_path.display(), "memory engine initialized");
+                }
+                Err(e) => {
+                    // DB open failure is fatal for memory but must not kill
+                    // the app. Leave the OnceLock empty; callers check `get`.
+                    tracing::error!(error = %format!("{e:#}"), "memory engine init failed");
+                }
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -124,6 +209,7 @@ pub fn run() {
             chat_send,
             chat_stop,
             get_settings,
+            debug_memory_query,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -200,6 +286,35 @@ fn pick_main_model(dir: &std::path::Path) -> Option<std::path::PathBuf> {
         .map(|e| e.path())
 }
 
+/// Walk the same candidate dirs as `resolve_model_path`, but for the embeddings
+/// model (`Embed.gguf`). Sibling to the chat model's discovery so the embedder
+/// loader is self-contained at the wiring seam. Returns `None` when no embed
+/// model is present — the caller falls back to `StubEmbedder` (graceful, not a
+/// crash). Exact-name match only; no size fallback (only one file will ever be
+/// named `Embed.gguf`).
+fn resolve_embed_model_dirs(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    use tauri::Manager;
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(d) = app.path().resource_dir().ok() {
+        dirs.push(d.join("models"));
+    }
+    if let Some(exe) = std::env::current_exe().ok() {
+        if let Some(parent) = exe.parent() {
+            dirs.push(parent.join("models"));
+            if let Some(grand) = parent.parent().and_then(|g| g.parent()) {
+                dirs.push(grand.join("src-tauri").join("models"));
+            }
+            if let Some(gg) = parent.parent().and_then(|g| g.parent()).and_then(|g| g.parent()) {
+                dirs.push(gg.join("src-tauri").join("models"));
+            }
+        }
+    }
+    if let Some(data) = app.path().app_data_dir().ok() {
+        dirs.push(data.join("models"));
+    }
+    memory_embedder_llama::resolve_embed_model(&dirs)
+}
+
 #[tauri::command]
 async fn chat_send(
     text: String,
@@ -221,7 +336,35 @@ async fn chat_send(
     }
 
     let settings = state.settings.lock().expect("settings mutex").clone();
-    let system_prompt = prompts::build_system_content(&settings);
+
+    // ── Memory retrieval (pillar 3, §2F Option 3) ───────────────────────
+    // Embed the user's just-typed text and pull top hits BEFORE the session
+    // lock. This is ON the chat path by design (§3A) — embedding takes ms on
+    // GPU, the SQLite work is spawn_blocking-internal. The just-typed message
+    // isn't archived yet (pillar 2 archives after generation), so we never
+    // retrieve the thing we're about to send.
+    //
+    // §2F cost: the retrieved block differs per query → the prompt structure
+    // changes every turn → the structural-divergence guard (engine.rs) cold-
+    // resets the KV cache. Delta-prefill is dead on Memory-enabled turns. This
+    // is the accepted v1 cost; the cache-layout optimization is a later pass.
+    let memory_block = match state.memory.get() {
+        Some(engine) => match engine.search(&text, 5).await {
+            Ok(hits) if !hits.is_empty() => Some(memory::render_memory_block(&hits)),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "memory search failed; injecting nothing");
+                None
+            }
+        },
+        // OnceLock empty = memory engine failed to init at startup. Memory is
+        // best-effort; chat proceeds with no retrieved context.
+        None => {
+            tracing::trace!("memory engine not initialized; skipping retrieval");
+            None
+        }
+    };
+    let system_prompt = prompts::build_system_content(&settings, memory_block.as_deref());
 
     let messages = {
         let mut s = state.session.lock().await;
@@ -279,6 +422,40 @@ async fn chat_send(
             result.raw.clone(),
         );
         save_session(&app, &s).await;
+
+        // ── Memory archiving (pillar 2) ───────────────────────────────
+        // Trigger is turn-COMPLETION, not truncation. We read from the
+        // Conversation (clean strings), sidestepping the engine.rs:480
+        // token-boundary-drift landmine entirely — truncate_to_fit operates on
+        // LlamaToken slices with no safe mapping back to Message text.
+        //
+        // Both turns archived (user + assistant) so search can match either.
+        // spawn detaches → add_memory's internal spawn_blocking runs the SQLite
+        // insert off the hot path. The chat loop never awaits it. Errors are
+        // logged-and-dropped inside the task: memory is best-effort, a failed
+        // archive must not break chat.
+        //
+        // Salience flat 1.0 for v1 (the field is stored but unused by
+        // retrieval today; a heuristic is a later concern). chunk_index stays
+        // 0 (whole-message; no chunking yet).
+        if let Some(engine) = state.memory.get() {
+            // The user message is the second-to-last (last is the assistant
+            // turn we just appended). checked_sub(2) guards the cold-start
+            // edge where messages is unexpectedly short.
+            let user_text = s.messages.len().checked_sub(2).and_then(|i| s.messages.get(i)).map(|m| m.content.clone());
+            let asst_text = result.content.clone();
+            let engine = Arc::clone(engine);
+            tokio::spawn(async move {
+                if let Some(text) = user_text {
+                    if let Err(e) = engine.add_memory(text, memory::Role::User, 1.0).await {
+                        tracing::warn!(error = %format!("{e:#}"), "archive user turn failed");
+                    }
+                }
+                if let Err(e) = engine.add_memory(asst_text, memory::Role::Assistant, 1.0).await {
+                    tracing::warn!(error = %format!("{e:#}"), "archive assistant turn failed");
+                }
+            });
+        }
     }
 
     clear_active_cancel(&state);
@@ -316,6 +493,30 @@ async fn chat_stop(state: tauri::State<'_, AppState>) -> Result<(), String> {
         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(())
+}
+
+/// Debug probe into the Memory engine (pillar 4). Embeds the query, runs the
+/// hybrid FTS5 + vec0 search, and returns the RRF-fused ranked results with
+/// scores. Off the chat path entirely — this is the observability surface for
+/// tuning retrieval independently of generation.
+///
+/// `top_k` defaults to 10 when `None`. Returns an error string (not a panic)
+/// if the memory engine isn't initialized or the query fails — the panel
+/// renders it as a red message.
+#[tauri::command]
+async fn debug_memory_query(
+    query: String,
+    top_k: Option<usize>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<memory::RankedMemory>, String> {
+    let engine = state
+        .memory
+        .get()
+        .ok_or_else(|| "memory engine not initialized".to_string())?;
+    engine
+        .search(&query, top_k.unwrap_or(10))
+        .await
+        .map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]

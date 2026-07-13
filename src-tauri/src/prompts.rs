@@ -11,13 +11,28 @@ need approval; the system validates your changes.
 You are an out-of-character assistant, not part of any roleplay. Speak to the \
 user, not to characters.";
 
-pub fn build_system_content(settings: &WupiSettings) -> String {
+pub fn build_system_content(settings: &WupiSettings, memory_block: Option<&str>) -> String {
     let mut sections = Vec::new();
 
     sections.push(format!(
         "<assistant_identity>\n{}\n</assistant_identity>",
         DEFAULT_SYSTEM_PROMPT
     ));
+
+    // Retrieved memory block (pillar 3, §2F Option 3). Sits between identity
+    // and current_context so it's close to the user's attention without
+    // displacing Wupi's core identity. Empty/whitespace blocks are skipped
+    // entirely — no empty tag pollution. When this block's content changes
+    // turn-to-turn (which it will, since each query retrieves a different
+    // set), the §2F structural-divergence guard cold-resets the KV cache.
+    // That is the accepted v1 cost; the cache-layout optimization is a
+    // dedicated later pass.
+    if let Some(block) = memory_block {
+        let trimmed = block.trim();
+        if !trimmed.is_empty() {
+            sections.push(format!("<retrieved_memory>\n{trimmed}\n</retrieved_memory>"));
+        }
+    }
 
     sections.push(format!(
         "<current_context>\ncontext_size: {}\nconversation_budget: {}\n</current_context>",
@@ -59,9 +74,34 @@ mod tests {
             conversation_budget: 8192,
         };
 
-        let content = build_system_content(&settings);
+        let content = build_system_content(&settings, None);
         assert!(content.contains("<assistant_identity>"));
         assert!(content.contains("context_size: 2048"));
         assert!(content.contains("conversation_budget: 8192"));
+        // No memory block supplied → no tag leaks.
+        assert!(!content.contains("<retrieved_memory>"));
+    }
+
+    #[test]
+    fn build_system_content_includes_memory_block_when_supplied() {
+        let settings = WupiSettings::default();
+        let block = "[user] earlier I mentioned the project plan";
+
+        let content = build_system_content(&settings, Some(block));
+        assert!(content.contains("<retrieved_memory>"));
+        assert!(content.contains(block));
+        // Block sits AFTER identity, BEFORE current_context.
+        let id_pos = content.find("<assistant_identity>").unwrap();
+        let mem_pos = content.find("<retrieved_memory>").unwrap();
+        let ctx_pos = content.find("<current_context>").unwrap();
+        assert!(id_pos < mem_pos && mem_pos < ctx_pos);
+    }
+
+    #[test]
+    fn build_system_content_skips_empty_memory_block() {
+        let settings = WupiSettings::default();
+
+        let content = build_system_content(&settings, Some("   \n  "));
+        assert!(!content.contains("<retrieved_memory>"));
     }
 }

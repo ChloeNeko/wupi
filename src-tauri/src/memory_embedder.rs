@@ -65,6 +65,27 @@ pub trait Embedder: Send + Sync {
     fn dim(&self) -> usize;
 }
 
+/// Blanket forward `Embedder` through `Box<E>`. Without this, `Box<dyn Embedder>`
+/// does NOT auto-implement `Embedder` (trait objects don't self-forward), so
+/// `MemoryEngine<Box<dyn Embedder>>` would not satisfy the `E: Embedder` bound.
+/// This is the standard Rust pattern — the same blanket impl `std` provides for
+/// `Box<dyn Read>`/`Box<dyn Write>`. `?Sized` is required so `dyn Embedder`
+/// (which is `!Sized`) is covered, and it additionally covers `Box<ConcreteType>`.
+///
+/// Lets `AppState` hold one concrete `MemoryEngine<Box<dyn Embedder + Send + Sync>>`
+/// regardless of which backend (`LlamaCppEmbedder` or `StubEmbedder`) was chosen
+/// at startup — decided once in `setup()`, dispatched through one virtual call
+/// per embed (negligible next to multi-ms GPU work).
+impl<E: Embedder + ?Sized> Embedder for Box<E> {
+    fn embed(&self, text: String) -> EmbedFuture {
+        (**self).embed(text)
+    }
+
+    fn dim(&self) -> usize {
+        (**self).dim()
+    }
+}
+
 /// Deterministic, dependency-free embedder for tests.
 ///
 /// NOT a real embedding. Produces a bag-of-characters histogram (byte value

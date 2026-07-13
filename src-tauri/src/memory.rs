@@ -123,12 +123,26 @@ pub struct MemoryEntry {
 /// Returned by [`MemoryEngine::search`] so the debug IPC can show *why* a
 /// memory was pulled (verdict C, 2026-07-13: observability wins). Callers who
 /// don't care about the score map to `.entry`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RankedMemory {
     pub entry: MemoryEntry,
     /// Fused RRF score. Higher is better. The scale is `1/61..~2/61` (one or
     /// both lists, top rank); absolute value is not meaningful, only ordering.
     pub score: f32,
+}
+
+/// Render a ranked hit list as a compact injection block for the system prompt.
+///
+/// One line per memory, prefixed with `[role]`, ordered by fused score (the
+/// slice's natural order from `search`). No scores or metadata in the block —
+/// keep it token-cheap (Prime Directive §1B.3: serialize strictly, no bloat).
+/// The observability panel (pillar 4) is where scores go; the prompt only needs
+/// the text the model should attend to.
+pub fn render_memory_block(hits: &[RankedMemory]) -> String {
+    hits.iter()
+        .map(|h| format!("[{}] {}", h.entry.role.as_str(), h.entry.text_content))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ---------------------------------------------------------------------------

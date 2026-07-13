@@ -9,10 +9,25 @@
     <div id="app">
       <header class="topbar">
         <span class="brand">🐾 WUPI OS</span>
-        <span id="status" class="status">starting…</span>
+        <div class="topbar-right">
+          <button id="memory-toggle" class="memory-toggle" type="button" title="Memory debug panel" aria-label="Toggle memory debug panel">🧠</button>
+          <span id="status" class="status">starting…</span>
+        </div>
       </header>
 
       <main id="chat" class="chat"></main>
+
+      <section id="memory-debug" class="memory-debug hidden">
+        <div class="memory-debug-head">
+          <span class="memory-debug-title">memory retrieval</span>
+          <button id="memory-debug-close" class="memory-debug-close" type="button" aria-label="Close memory debug panel">×</button>
+        </div>
+        <div class="memory-debug-query">
+          <input id="memory-debug-input" type="text" placeholder="query the memory engine…" autocomplete="off" />
+          <button id="memory-debug-run" type="button">search</button>
+        </div>
+        <div id="memory-debug-results" class="memory-debug-results"></div>
+      </section>
 
       <footer class="composer">
         <textarea
