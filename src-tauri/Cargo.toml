@@ -30,3 +30,11 @@ tracing-appender = "0.2"
 # See AGENTS.md §0 (stack), §2 (deps), §2B (build rules).
 llama-cpp-2 = { version = "0.1.151", features = ["sampler", "cuda"] }
 encoding_rs = "0.8"
+# Memory engine (Phase 2). `bundled` compiles SQLite from the amalgamation →
+# FTS5 is guaranteed available on Windows without a system SQLite install.
+# No `load_extension` feature — sqlite-vec is registered via the
+# `sqlite3_auto_extension` FFI at startup (see memory.rs::ensure_vec_loaded).
+rusqlite = { version = "0.31", features = ["bundled"] }
+# sqlite-vec virtual table for dense vector (cosine) search. v0.1.9 is the
+# latest 0.1.x (2025-07). Embeds the C source, compiled via the `cc` crate.
+sqlite-vec = "0.1.9"
