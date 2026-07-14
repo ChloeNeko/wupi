@@ -348,6 +348,11 @@ async fn chat_send(
     // changes every turn → the structural-divergence guard (engine.rs) cold-
     // resets the KV cache. Delta-prefill is dead on Memory-enabled turns. This
     // is the accepted v1 cost; the cache-layout optimization is a later pass.
+    // ── Memory retrieval (§2F eager-prefill layout, 2026-07-13) ────────
+    // The retrieved block is NO LONGER baked into the system prompt. It's
+    // threaded separately as `memory_block` and injected into the inter-turn
+    // region by `render_prompt`. This keeps the system+turns prefix
+    // byte-identical across turns (the precondition for eager prefill).
     let memory_block = match state.memory.get() {
         Some(engine) => match engine.search(&text, 5).await {
             Ok(hits) if !hits.is_empty() => Some(memory::render_memory_block(&hits)),
@@ -364,7 +369,7 @@ async fn chat_send(
             None
         }
     };
-    let system_prompt = prompts::build_system_content(&settings, memory_block.as_deref());
+    let system_prompt = prompts::build_system_content(&settings);
 
     let messages = {
         let mut s = state.session.lock().await;
@@ -383,7 +388,7 @@ async fn chat_send(
     let backend_opt = state.backend.lock().expect("backend mutex").clone();
     let result = if let Some(backend) = backend_opt {
         match backend
-            .stream(messages, settings.context_size, on_chunk, cancel.clone())
+            .stream(messages, memory_block, settings.context_size, on_chunk, cancel.clone())
             .await
         {
             Ok(text) => text,
@@ -398,7 +403,7 @@ async fn chat_send(
         }
     } else {
         let echo = llm::EchoBackend;
-        match echo.stream(messages, settings.context_size, on_chunk, cancel.clone()).await {
+        match echo.stream(messages, None, settings.context_size, on_chunk, cancel.clone()).await {
             Ok(t) => t,
             Err(e) => {
                 clear_active_cancel(&state);

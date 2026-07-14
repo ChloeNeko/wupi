@@ -52,6 +52,7 @@ pub trait GenerationClient: Send + Sync {
     fn stream(
         &self,
         messages: Vec<ApiMessage>,
+        memory_block: Option<String>,
         context_size: u32,
         on_chunk: ChunkFn,
         cancel: CancelToken,
@@ -94,6 +95,7 @@ impl GenerationClient for EchoBackend {
     fn stream(
         &self,
         _messages: Vec<ApiMessage>,
+        _memory_block: Option<String>,
         _context_size: u32,
         on_chunk: ChunkFn,
         _cancel: CancelToken,
@@ -240,6 +242,7 @@ impl GenerationClient for LlamaCppBackend {
     fn stream(
         &self,
         messages: Vec<ApiMessage>,
+        memory_block: Option<String>,
         _context_size: u32,
         on_chunk: ChunkFn,
         cancel: CancelToken,
@@ -256,6 +259,7 @@ impl GenerationClient for LlamaCppBackend {
                     messages,
                     on_chunk,
                     cancel,
+                    memory_block,
                     reply: reply_tx,
                 })
                 .map_err(|e| anyhow::anyhow!(e))?;

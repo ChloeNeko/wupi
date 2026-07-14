@@ -85,6 +85,12 @@ pub struct EngineRequest {
     /// at the next token boundary. The engine checks this between tokens —
     /// never mid-decode — so the KV cache stays in a consistent state.
     pub cancel: Arc<AtomicBool>,
+    /// Retrieved-memory block injected into the inter-turn region by
+    /// `render_prompt` (§2F eager-prefill design). `None` = no memory this
+    /// turn. Lives here (not baked into messages[0].content) so the stable
+    /// prefix (system + turns) stays byte-identical across turns regardless
+    /// of retrieval results — that's the precondition for eager prefill.
+    pub memory_block: Option<String>,
     /// One-shot reply: the engine fills this with the generation result (or an
     /// error). Using a separate channel (not the Tauri Channel) keeps the
     /// engine decoupled from Tauri's IPC types and lets `stream()` await it.
@@ -169,13 +175,14 @@ impl ChatEngine {
                                 messages,
                                 on_chunk,
                                 cancel,
+                                memory_block,
                                 reply,
                             } = *req;
 
                             // Self-healing: isolate each generation so one
                             // panic doesn't kill the thread.
                             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                                || engine.generate(messages, &on_chunk, &cancel),
+                                || engine.generate(messages, memory_block.as_deref(), &on_chunk, &cancel),
                             ));
                             let reply_msg = match outcome {
                                 Ok(Ok(parsed)) => EngineReply::Ok(parsed),
@@ -442,6 +449,7 @@ impl EngineRuntime {
     fn generate(
         &mut self,
         messages: Vec<ApiMessage>,
+        memory_block: Option<&str>,
         on_chunk: &ChunkFn,
         cancel: &Arc<AtomicBool>,
     ) -> anyhow::Result<ParsedOutput> {
@@ -456,7 +464,9 @@ impl EngineRuntime {
             }
         }
         let tools: Vec<ToolSpec> = Vec::new();
-        let prompt = self.formatter.render_prompt(&system, &conv, &tools, true);
+        let prompt = self
+            .formatter
+            .render_prompt(&system, &conv, &tools, memory_block, true);
         tracing::debug!(prompt_len = prompt.len(), "rendered prompt");
 
         let full_tokens = self
