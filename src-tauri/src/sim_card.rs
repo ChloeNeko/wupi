@@ -199,10 +199,17 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         .then_some(doc.root_element())
         .ok_or_else(|| anyhow::anyhow!("root element must be <sim_card>"))?;
 
-    let id = text_of(root, "metadata", "id")?;
+    // `id` is OPTIONAL and derived from <identity><name> (lowercased) when
+    // <metadata> is absent. The metadata block is NOT part of the card format
+    // by design — cards stay clean and persona-only. The id is vestigial today
+    // anyway: memory partitioning uses the WUPI_OS_CARD_ID sentinel, not the
+    // card's id. Keeping a derived id preserves the field for a future
+    // roleplay-card partition path without forcing metadata onto every card.
     let name = first_child(root, "identity")
         .and_then(|n| child_text(n, "name"))
-        .unwrap_or_else(|| id.clone());
+        .unwrap_or_else(|| "unknown".to_owned());
+    let id = nested_text(root, "metadata", "id")
+        .unwrap_or_else(|| name.to_lowercase());
     let card_type = nested_text(root, "metadata", "type").unwrap_or_else(|| "system".to_owned());
 
     let identity = first_child(root, "identity");
@@ -303,13 +310,6 @@ fn child_text(node: roxmltree::Node, tag: &str) -> Option<String> {
 /// absent (so optional fields like `metadata/type` degrade cleanly).
 fn nested_text(root: roxmltree::Node, parent: &str, child: &str) -> Option<String> {
     first_child(root, parent).and_then(|n| child_text(n, child))
-}
-
-/// Like [`nested_text`] but required — returns `Err` if missing. Used for the
-/// card `id`, the one field a card cannot boot without.
-fn text_of(root: roxmltree::Node, parent: &str, child: &str) -> anyhow::Result<String> {
-    nested_text(root, parent, child)
-        .ok_or_else(|| anyhow::anyhow!("required field <{parent}><{child}> is missing"))
 }
 
 #[cfg(test)]
@@ -442,9 +442,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_requires_id() {
-        // No <metadata><id> → error (the one field a card can't boot without).
-        let bad = "<sim_card><metadata><name>x</name></metadata></sim_card>";
-        assert!(parse(bad).is_err());
+    fn parse_derives_id_from_name_when_no_metadata() {
+        // Metadata is OPTIONAL — a clean, persona-only card (no <metadata>
+        // block) must still parse. The id derives from <identity><name>,
+        // lowercased. This is the card format going forward.
+        let no_meta = r#"<sim_card>
+  <identity>
+    <name>Wupi</name>
+    <core_persona>A catgirl.</core_persona>
+  </identity>
+</sim_card>"#;
+        let card = parse(no_meta).expect("metadata-free card parses");
+        assert_eq!(card.name, "Wupi");
+        assert_eq!(card.id, "wupi");
+        assert_eq!(card.card_type, "system");
     }
 }
