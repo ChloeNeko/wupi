@@ -91,6 +91,12 @@ pub struct EngineRequest {
     /// prefix (system + turns) stays byte-identical across turns regardless
     /// of retrieval results — that's the precondition for eager prefill.
     pub memory_block: Option<String>,
+    /// World-state schema block, sibling to `memory_block`. The persistent
+    /// simulation state (summary + recent events + entities) that the
+    /// 6-message window can't hold alone. Same inter-turn position, same
+    /// non-turn annotation shape. `None`/empty = no schema this turn (first
+    /// turn before any deltas have landed, or schema engine unavailable).
+    pub world_state: Option<String>,
     /// One-shot reply: the engine fills this with the generation result (or an
     /// error). Using a separate channel (not the Tauri Channel) keeps the
     /// engine decoupled from Tauri's IPC types and lets `stream()` await it.
@@ -176,13 +182,14 @@ impl ChatEngine {
                                 on_chunk,
                                 cancel,
                                 memory_block,
+                                world_state,
                                 reply,
                             } = *req;
 
                             // Self-healing: isolate each generation so one
                             // panic doesn't kill the thread.
                             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                                || engine.generate(messages, memory_block.as_deref(), &on_chunk, &cancel),
+                                || engine.generate(messages, memory_block.as_deref(), world_state.as_deref(), &on_chunk, &cancel),
                             ));
                             let reply_msg = match outcome {
                                 Ok(Ok(parsed)) => EngineReply::Ok(parsed),
@@ -450,6 +457,7 @@ impl EngineRuntime {
         &mut self,
         messages: Vec<ApiMessage>,
         memory_block: Option<&str>,
+        world_state: Option<&str>,
         on_chunk: &ChunkFn,
         cancel: &Arc<AtomicBool>,
     ) -> anyhow::Result<ParsedOutput> {
@@ -466,7 +474,7 @@ impl EngineRuntime {
         let tools: Vec<ToolSpec> = Vec::new();
         let prompt = self
             .formatter
-            .render_prompt(&system, &conv, &tools, memory_block, true);
+            .render_prompt(&system, &conv, &tools, memory_block, world_state, true);
         tracing::debug!(prompt_len = prompt.len(), "rendered prompt");
 
         let full_tokens = self

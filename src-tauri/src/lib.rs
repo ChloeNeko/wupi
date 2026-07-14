@@ -457,6 +457,20 @@ async fn chat_send(
             None
         }
     };
+
+    // ── World-state schema injection (Component D) ──────────────────────
+    // Render the current schema into the inter-turn region as a sibling
+    // annotation to memory_block. `render_for_prompt()` returns "" for an
+    // empty schema → we pass None → no <world_state> block on the first turn
+    // (before any deltas have landed). Same empty-skip pattern as memory.
+    // The schema is read here (before the session lock) so the chat engine
+    // sees the state as of turn-start; any delta fired by the PREVIOUS turn
+    // has already landed via the pending_delta await above.
+    let world_state = {
+        let s = state.schema.lock().await;
+        let rendered = s.render_for_prompt();
+        if rendered.is_empty() { None } else { Some(rendered) }
+    };
     let system_prompt = prompts::build_system_content(&settings);
 
     // §2F eager-prefill sliding window (2026-07-13): cap visible history to
@@ -486,7 +500,7 @@ async fn chat_send(
     let backend_opt = state.backend.lock().expect("backend mutex").clone();
     let result = if let Some(backend) = backend_opt {
         match backend
-            .stream(messages, memory_block, settings.context_size, on_chunk, cancel.clone())
+            .stream(messages, memory_block, world_state, settings.context_size, on_chunk, cancel.clone())
             .await
         {
             Ok(text) => text,
@@ -501,7 +515,7 @@ async fn chat_send(
         }
     } else {
         let echo = llm::EchoBackend;
-        match echo.stream(messages, None, settings.context_size, on_chunk, cancel.clone()).await {
+        match echo.stream(messages, None, None, settings.context_size, on_chunk, cancel.clone()).await {
             Ok(t) => t,
             Err(e) => {
                 clear_active_cancel(&state);

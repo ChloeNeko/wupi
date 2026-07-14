@@ -31,12 +31,19 @@ pub trait ChatFormat: Send + Sync {
     /// the next turn can delta-prefill against. The block is a non-turn
     /// annotation (no turn markers around it) so it reads as context, not a
     /// conversational turn.
+    ///
+    /// `world_state` — an optional world-state schema annotation, sibling to
+    /// `memory_block`. Same inter-turn position, same non-turn annotation
+    /// shape (wrapped in `<world_state>` tags so the model can distinguish it
+    /// from retrieved memory). Carries the persistent simulation state the
+    /// 6-message window can't hold alone (summary, recent events, entities).
     fn render_prompt(
         &self,
         system: &str,
         messages: &[ApiMessage],
         tools: &[ToolSpec],
         memory_block: Option<&str>,
+        world_state: Option<&str>,
         add_generation_prompt: bool,
     ) -> String;
 
@@ -152,6 +159,7 @@ impl ChatFormat for Gemma4Format {
         messages: &[ApiMessage],
         tools: &[ToolSpec],
         memory_block: Option<&str>,
+        world_state: Option<&str>,
         add_generation_prompt: bool,
     ) -> String {
         let mut out = String::with_capacity(2048);
@@ -204,15 +212,14 @@ impl ChatFormat for Gemma4Format {
             out.push_str("<turn|>\n");
         }
 
-        // --- Retrieved-memory block (inter-turn injection, §2F eager-prefill) ---
-        // Sits AFTER all conversation turns, BEFORE the generation prompt. This
-        // is the load-bearing position: it's a non-turn annotation (no `<|turn>`
-        // markers around it) injected into the inter-turn region, so it reads as
-        // context for the upcoming model turn rather than a turn itself. The
-        // model hasn't seen this exact structure in training — flagged as a
-        // runtime-tested risk in the plan. Only emitted when there's content
-        // AND a generation prompt follows (no point annotating a render that
-        // isn't going to generate).
+        // --- Inter-turn annotations (§2F eager-prefill layout) ───────────
+        // Both retrieved_memory and world_state sit AFTER all conversation
+        // turns, BEFORE the generation prompt. Non-turn annotations (no
+        // `<|turn>` markers) so they read as context for the upcoming model
+        // turn, not as conversational turns. Only emitted when a generation
+        // prompt follows (no point annotating a render that won't generate).
+        // Order: memory first, then world_state — retrieval is conversational
+        // recall (transient per query), world_state is persistent ground truth.
         if add_generation_prompt {
             if let Some(block) = memory_block {
                 let trimmed = block.trim();
@@ -220,6 +227,14 @@ impl ChatFormat for Gemma4Format {
                     out.push_str("<retrieved_memory>\n");
                     out.push_str(trimmed);
                     out.push_str("\n</retrieved_memory>\n");
+                }
+            }
+            if let Some(state) = world_state {
+                let trimmed = state.trim();
+                if !trimmed.is_empty() {
+                    out.push_str("<world_state>\n");
+                    out.push_str(trimmed);
+                    out.push_str("\n</world_state>\n");
                 }
             }
         }
@@ -547,6 +562,7 @@ impl ChatFormat for PlainFormat {
         messages: &[ApiMessage],
         _tools: &[ToolSpec],
         memory_block: Option<&str>,
+        world_state: Option<&str>,
         add_generation_prompt: bool,
     ) -> String {
         let mut out = String::new();
@@ -571,14 +587,22 @@ impl ChatFormat for PlainFormat {
             out.push_str(&m.content);
             out.push('\n');
         }
-        // Best-effort memory annotation for the fallback family. Plain has no
-        // turn protocol to respect, so a plain [memory] line before the
-        // generation prompt is the natural shape.
+        // Best-effort inter-turn annotations for the fallback family. Plain
+        // has no turn protocol to respect, so plain [memory] / [world] lines
+        // before the generation prompt are the natural shape.
         if add_generation_prompt {
             if let Some(block) = memory_block {
                 let trimmed = block.trim();
                 if !trimmed.is_empty() {
                     out.push_str("[memory] ");
+                    out.push_str(trimmed);
+                    out.push('\n');
+                }
+            }
+            if let Some(state) = world_state {
+                let trimmed = state.trim();
+                if !trimmed.is_empty() {
+                    out.push_str("[world] ");
                     out.push_str(trimmed);
                     out.push('\n');
                 }
@@ -619,6 +643,7 @@ mod tests {
             &[msg("user", "Hello"), msg("model", "Hi there")],
             &[],
             None,
+            None,
             true,
         );
         assert!(out.contains("<|turn>system\nYou are Wupi.<turn|>"));
@@ -642,6 +667,7 @@ mod tests {
             &[msg("user", "Hello"), msg("model", "Hi there")],
             &[],
             Some(block),
+            None,
             true,
         );
         // Block appears AFTER the last turn close, BEFORE the generation prompt.
@@ -665,6 +691,7 @@ mod tests {
             &[msg("user", "Hello")],
             &[],
             None,
+            None,
             true,
         );
         assert!(!out.contains("<retrieved_memory>"));
@@ -680,6 +707,7 @@ mod tests {
                 &[msg("user", "Hello")],
                 &[],
                 Some(empty),
+                None,
                 true,
             );
             assert!(!out.contains("<retrieved_memory>"), "empty block should not render: {out}");
@@ -687,9 +715,58 @@ mod tests {
     }
 
     #[test]
+    fn gemma4_injects_world_state_as_sibling_annotation() {
+        // Component D: the world-state schema block sits in the same inter-turn
+        // region as retrieved_memory, AFTER all turns and BEFORE the generation
+        // prompt. Sibling annotation (not a turn), wrapped in <world_state> tags
+        // so the model can distinguish persistent ground truth from transient
+        // retrieval. Verifies position, ordering (memory before world_state),
+        // and the no-turn-marker shape.
+        let f = Gemma4Format;
+        let mem = "[user] earlier I mentioned the sword";
+        let world = "summary: the hero has a sword\nentities:\n  iron sword: acquired";
+        let out = f.render_prompt(
+            "You are Wupi.",
+            &[msg("user", "Hello"), msg("model", "Hi there")],
+            &[],
+            Some(mem),
+            Some(world),
+            true,
+        );
+        let last_turn_end = out.rfind("<turn|>\n").unwrap();
+        let mem_pos = out.find("<retrieved_memory>").unwrap();
+        let world_pos = out.find("<world_state>").unwrap();
+        let gen_pos = out.rfind("<|turn>model\n").unwrap();
+        assert!(last_turn_end < mem_pos, "memory must come after all turns");
+        assert!(mem_pos < world_pos, "world_state must come after memory");
+        assert!(world_pos < gen_pos, "world_state must come before generation prompt");
+        assert!(out.contains(world));
+        assert!(out.ends_with("<|turn>model\n"));
+        // No turn markers wrap either annotation.
+        assert!(!out.contains("<|turn>world_state"));
+        assert!(!out.contains("<|turn>retrieved_memory"));
+    }
+
+    #[test]
+    fn gemma4_world_state_omitted_when_none_or_empty() {
+        let f = Gemma4Format;
+        for world in [None, Some(""), Some("   \n")].into_iter() {
+            let out = f.render_prompt(
+                "You are Wupi.",
+                &[msg("user", "Hello")],
+                &[],
+                None,
+                world,
+                true,
+            );
+            assert!(!out.contains("<world_state>"), "empty world_state should not render: {out}");
+        }
+    }
+
+    #[test]
     fn gemma4_assistant_role_becomes_model() {
         let f = Gemma4Format;
-        let out = f.render_prompt("", &[msg("assistant", "hi")], &[], None, false);
+        let out = f.render_prompt("", &[msg("assistant", "hi")], &[], None, None, false);
         assert!(out.contains("<|turn>model\nhi<turn|>"));
         assert!(!out.contains("<|turn>assistant"));
     }
@@ -724,7 +801,7 @@ mod tests {
         let f = Gemma4Format;
         let mut m = msg("assistant", "visible reply");
         m.raw_output = "<|channel>thought\nsecret\n<channel|>visible reply".into();
-        let out = f.render_prompt("", &[m], &[], None, false);
+        let out = f.render_prompt("", &[m], &[], None, None, false);
         assert!(
             out.contains("<|channel>thought\nsecret\n<channel|>visible reply"),
             "raw_output should be rendered verbatim for cache coherence, got: {out}"
@@ -736,7 +813,7 @@ mod tests {
         // Legacy turns (no raw_output) still get the strip_thinking path.
         let f = Gemma4Format;
         let m = msg("assistant", "<|channel>thought\nsecret\n<channel|>visible");
-        let out = f.render_prompt("", &[m], &[], None, false);
+        let out = f.render_prompt("", &[m], &[], None, None, false);
         assert!(
             !out.contains("<|channel>"),
             "legacy turn should strip thinking, got: {out}"
