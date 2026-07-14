@@ -375,7 +375,11 @@ async fn chat_send(
     // the last VISIBLE_WINDOW messages regardless of token budget. Memory (M)
     // backfills evicted turns via retrieval. Truncation in the engine becomes
     // a safety net that effectively never fires (4 short turns ≪ ~3000 budget).
-    const VISIBLE_WINDOW: usize = 4;
+    // 6 messages = 3 full user↔assistant turns. The sweet spot: enough
+    // recency that the model has natural conversational continuity, small
+    // enough that truncation never fires and the prompt stays cheap. Gemma
+    // 12B handles this with zero performance hit. Tunable.
+    const VISIBLE_WINDOW: usize = 6;
 
     let messages = {
         let mut s = state.session.lock().await;
