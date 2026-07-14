@@ -32,6 +32,20 @@ const memoryInput = document.getElementById("memory-debug-input") as HTMLInputEl
 const memoryRunBtn = document.getElementById("memory-debug-run") as HTMLButtonElement;
 const memoryResults = document.getElementById("memory-debug-results") as HTMLDivElement;
 
+// Schema delta debug panel (B/C runtime test). Mirrors the memory panel but
+// takes a synthetic user+assistant exchange pair (a delta is computed against
+// a turn pair, not a single query). The "apply" checkbox toggles dry-run vs.
+// live schema mutation so the panel can both probe the model AND demonstrate
+// schema evolution across chained calls.
+const schemaToggle = document.getElementById("schema-toggle") as HTMLButtonElement;
+const schemaPanel = document.getElementById("schema-debug") as HTMLDivElement;
+const schemaCloseBtn = document.getElementById("schema-debug-close") as HTMLButtonElement;
+const schemaUserInput = document.getElementById("schema-debug-user") as HTMLTextAreaElement;
+const schemaAsstInput = document.getElementById("schema-debug-asst") as HTMLTextAreaElement;
+const schemaApplyCheckbox = document.getElementById("schema-debug-apply") as HTMLInputElement;
+const schemaRunBtn = document.getElementById("schema-debug-run") as HTMLButtonElement;
+const schemaResults = document.getElementById("schema-debug-results") as HTMLDivElement;
+
 // Mirrors the Rust `RankedMemory` (memory.rs) + nested `MemoryEntry`. The
 // backend serializes via serde, so field names are snake_case and the role
 // comes through as the serde-lowercased enum string ("user"/"assistant"/...).
@@ -216,6 +230,118 @@ inputEl.addEventListener("keydown", (e) => {
     send();
   }
 });
+
+// ── Schema delta debug panel (B/C runtime test) ─────────────
+// Toggle via 🌍, supply a synthetic user+assistant exchange, run the delta
+// pass. Shows the raw model output + parsed delta + resulting schema. With
+// "apply delta" checked, the delta is merged into AppState.schema so chained
+// calls demonstrate schema evolution across turns.
+schemaToggle.addEventListener("click", () => {
+  const willOpen = schemaPanel.classList.contains("hidden");
+  schemaPanel.classList.toggle("hidden", !willOpen);
+  if (willOpen) schemaUserInput.focus();
+});
+
+schemaCloseBtn.addEventListener("click", () => {
+  schemaPanel.classList.add("hidden");
+});
+
+schemaRunBtn.addEventListener("click", runSchemaDelta);
+
+async function runSchemaDelta(): Promise<void> {
+  const userExchange = schemaUserInput.value.trim();
+  const assistantExchange = schemaAsstInput.value.trim();
+  if (!userExchange || !assistantExchange) return;
+
+  schemaResults.innerHTML = "";
+  const placeholder = document.createElement("div");
+  placeholder.className = "memory-result-empty";
+  placeholder.textContent = "generating delta…";
+  schemaResults.appendChild(placeholder);
+
+  try {
+    const result = await invoke<SchemaDeltaResult>("debug_schema_delta", {
+      userExchange,
+      assistantExchange,
+      apply: schemaApplyCheckbox.checked,
+    });
+    renderSchemaResult(result);
+  } catch (err) {
+    schemaResults.innerHTML = "";
+    const errEl = document.createElement("div");
+    errEl.className = "memory-result-error";
+    errEl.textContent = `⚠️ ${String(err?.message ?? err)}`;
+    schemaResults.appendChild(errEl);
+  }
+}
+
+// Mirrors the JSON returned by debug_schema_delta (lib.rs).
+interface SchemaDeltaResult {
+  raw_output: string;
+  delta: {
+    summary?: string | null;
+    recent_events?: string[] | null;
+    entities?: Record<string, string | null> | null;
+  } | null;
+  error: string;
+  schema_after: string;
+}
+
+function renderSchemaResult(result: SchemaDeltaResult): void {
+  schemaResults.innerHTML = "";
+
+  // Error banner (parse failure / generation error). Even on error we show
+  // the raw output below so the malformed emission is visible.
+  if (result.error) {
+    const errEl = document.createElement("div");
+    errEl.className = "memory-result-error";
+    errEl.textContent = `⚠️ ${result.error}`;
+    schemaResults.appendChild(errEl);
+  }
+
+  // Raw model output — preformatted so the exact bytes are visible. This is
+  // the diagnostic heart of the panel: if the model wraps JSON in fences,
+  // rambles, or emits garbage, it shows here.
+  if (result.raw_output) {
+    const rawBlock = document.createElement("div");
+    rawBlock.className = "schema-delta-block";
+    const rawLabel = document.createElement("div");
+    rawLabel.className = "schema-delta-label";
+    rawLabel.textContent = "raw model output";
+    rawBlock.appendChild(rawLabel);
+    const raw = document.createElement("pre");
+    raw.className = "schema-raw";
+    raw.textContent = result.raw_output;
+    rawBlock.appendChild(raw);
+    schemaResults.appendChild(rawBlock);
+  }
+
+  // Parsed delta (as JSON). null when parsing failed.
+  const deltaBlock = document.createElement("div");
+  deltaBlock.className = "schema-delta-block";
+  const deltaLabel = document.createElement("div");
+  deltaLabel.className = "schema-delta-label";
+  deltaLabel.textContent = result.delta ? "parsed delta" : "parsed delta (none)";
+  deltaBlock.appendChild(deltaLabel);
+  const delta = document.createElement("pre");
+  delta.className = "schema-raw";
+  delta.textContent = result.delta ? JSON.stringify(result.delta, null, 2) : "(parse failed)";
+  deltaBlock.appendChild(delta);
+  schemaResults.appendChild(deltaBlock);
+
+  // Resulting schema state (the full WorldSchema after optional apply).
+  const schemaBlock = document.createElement("div");
+  schemaBlock.className = "schema-delta-block";
+  const schemaLabel = document.createElement("div");
+  schemaLabel.className = "schema-delta-label";
+  schemaLabel.textContent = "schema after";
+  schemaBlock.appendChild(schemaLabel);
+  const schema = document.createElement("pre");
+  schema.className = "schema-raw";
+  schema.textContent = result.schema_after;
+  schemaBlock.appendChild(schema);
+  schemaResults.appendChild(schemaBlock);
+}
 
 // ── Memory debug panel (pillar 4) ───────────────────────────
 // Toggle via 🧠, query via the input + search button. Results render as

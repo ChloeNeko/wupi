@@ -52,6 +52,13 @@ pub struct AppState {
     /// generation starts. None = no pass running, proceed immediately.
     /// Always `Some(JoinHandle)` between turn-finalize and the next chat_send.
     pub pending_delta: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// The schema delta engine. Wrapped in `OnceLock` because spawning it
+    /// requires the chat model to have loaded first (`shared_model()` is the
+    /// leaked `&'static LlamaModel` the schema context is created from). For
+    /// the B/C runtime test the engine is spawned LAZILY on first
+    /// `debug_schema_delta` call; Component E will move this to an eager spawn
+    /// at model-ready.
+    pub schema_engine: Arc<std::sync::OnceLock<Arc<schema_engine::SchemaEngine>>>,
 }
 
 impl AppState {
@@ -64,6 +71,7 @@ impl AppState {
             memory: Arc::new(std::sync::OnceLock::new()),
             schema: Arc::new(tokio::sync::Mutex::new(schema::WorldSchema::default())),
             pending_delta: Arc::new(tokio::sync::Mutex::new(None)),
+            schema_engine: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
@@ -226,6 +234,7 @@ pub fn run() {
             chat_stop,
             get_settings,
             debug_memory_query,
+            debug_schema_delta,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -548,6 +557,95 @@ async fn debug_memory_query(
         .search(&query, top_k.unwrap_or(10))
         .await
         .map_err(|e| format!("{e:#}"))
+}
+
+/// Debug probe into the schema delta engine (B/C runtime test). Posts a
+/// SYNTHETIC exchange (the caller supplies both sides) + the current schema,
+/// waits for the delta pass to complete, and returns:
+///   - the raw model output (what the schema model actually emitted)
+///   - the parsed delta (if JSON was valid; else null)
+///   - any error string
+///   - the resulting schema JSON (after optionally applying the delta)
+///
+/// `apply: true` merges the delta into AppState.schema so the caller can
+/// chain multiple calls and watch the schema evolve. `apply: false` is a dry
+/// run — the schema is untouched, useful for prompt-tuning without side effects.
+///
+/// The schema engine is spawned LAZILY on first call (gated on the chat model
+/// being loaded — `shared_model()` must be `Some`). Mirrors the Memory engine's
+/// OnceLock-once pattern; Component E will move this to an eager spawn at
+/// model-ready. Returns an error string if the chat model isn't loaded yet.
+#[tauri::command]
+async fn debug_schema_delta(
+    user_exchange: String,
+    assistant_exchange: String,
+    apply: Option<bool>,
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    // Lazy-spawn the schema engine on first call. `get_or_init` is race-safe
+    // if two debug calls land concurrently.
+    let engine = if let Some(e) = state.schema_engine.get() {
+        Arc::clone(e)
+    } else {
+        // The chat model must be loaded first — shared_model() is None until
+        // the loader thread finishes + hands back the &'static LlamaModel.
+        if llm::shared_model().is_none() {
+            return Err("chat model not loaded yet — schema engine cannot start".into());
+        }
+        let (engine, init_rx) = schema_engine::SchemaEngine::spawn();
+        // Block on the readiness channel (Bug #6 contract). This recv runs on
+        // the tokio worker — fine, setup-style blocking, not a hot path.
+        let ready = tokio::task::spawn_blocking(move || init_rx.recv())
+            .await
+            .map_err(|e| format!("init join: {e}"))?
+            .map_err(|e| format!("init channel: {e}"))?;
+        match ready {
+            Ok(()) => {
+                tracing::info!("schema engine ready (lazy spawn via debug IPC)");
+            }
+            Err(msg) => {
+                return Err(format!("schema engine init failed: {msg}"));
+            }
+        }
+        let engine = Arc::new(engine);
+        let _ = state.schema_engine.set(Arc::clone(&engine));
+        engine
+    };
+
+    // Snapshot the current schema (the delta pass diffs against this).
+    let current = state.schema.lock().await.clone();
+
+    // Post the delta request + await the reply off the tokio worker (the
+    // schema thread is a bare std::thread; its mpsc::Receiver is blocking).
+    let reply_rx = engine
+        .request_delta((user_exchange, assistant_exchange), &current)
+        .map_err(|e| format!("{e:#}"))?;
+    let reply = tokio::task::spawn_blocking(move || reply_rx.recv())
+        .await
+        .map_err(|e| format!("reply join: {e}"))?
+        .map_err(|e| format!("reply channel: {e}"))?;
+
+    // Optionally apply the delta so the caller can chain calls and watch the
+    // schema evolve across a multi-turn scenario.
+    let schema_after = if apply.unwrap_or(false) {
+        if let Some(ref delta) = reply.delta {
+            let mut s = state.schema.lock().await;
+            s.apply_delta(delta.clone());
+            s.to_json_pretty()
+        } else {
+            // Parse failed — return the unchanged schema.
+            state.schema.lock().await.to_json_pretty()
+        }
+    } else {
+        current.to_json_pretty()
+    };
+
+    Ok(serde_json::json!({
+        "raw_output": reply.raw_output,
+        "delta": reply.delta,
+        "error": reply.error,
+        "schema_after": schema_after,
+    }))
 }
 
 #[tauri::command]

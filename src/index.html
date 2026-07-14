@@ -10,12 +10,29 @@
       <header class="topbar">
         <span class="brand">🐾 WUPI OS</span>
         <div class="topbar-right">
+          <button id="schema-toggle" class="memory-toggle" type="button" title="Schema delta debug panel" aria-label="Toggle schema debug panel">🌍</button>
           <button id="memory-toggle" class="memory-toggle" type="button" title="Memory debug panel" aria-label="Toggle memory debug panel">🧠</button>
           <span id="status" class="status">starting…</span>
         </div>
       </header>
 
       <main id="chat" class="chat"></main>
+
+      <section id="schema-debug" class="memory-debug hidden">
+        <div class="memory-debug-head">
+          <span class="memory-debug-title">schema delta (synthetic)</span>
+          <button id="schema-debug-close" class="memory-debug-close" type="button" aria-label="Close schema debug panel">×</button>
+        </div>
+        <div class="schema-debug-query">
+          <textarea id="schema-debug-user" class="schema-exchange" rows="2" placeholder="synthetic user turn…" autocomplete="off"></textarea>
+          <textarea id="schema-debug-asst" class="schema-exchange" rows="4" placeholder="synthetic assistant turn…" autocomplete="off"></textarea>
+          <div class="schema-debug-controls">
+            <label class="schema-debug-apply"><input id="schema-debug-apply" type="checkbox" checked /> apply delta</label>
+            <button id="schema-debug-run" type="button">run delta</button>
+          </div>
+        </div>
+        <div id="schema-debug-results" class="memory-debug-results"></div>
+      </section>
 
       <section id="memory-debug" class="memory-debug hidden">
         <div class="memory-debug-head">

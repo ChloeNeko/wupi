@@ -66,13 +66,22 @@ struct SchemaRequest {
     reply: mpsc::Sender<SchemaReply>,
 }
 
-/// What the schema thread sends back when a delta pass completes. The fields
-/// are read by the caller (Component D's queue, lib.rs chat_send) — the
-/// "never read" warning resolves when D lands and consumes the reply.
-#[allow(dead_code)]
-pub enum SchemaReply {
-    Ok(SchemaDelta),
-    Err(String),
+/// What the schema thread sends back when a delta pass completes. Carries the
+/// RAW model output alongside the parsed delta so callers (the debug IPC, and
+/// Component D's queue) can see exactly what the model emitted — essential for
+/// diagnosing JSON malformedness. On parse failure, `delta` is `None` and
+/// `error` explains why. `raw_output` is always populated on a completed pass.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SchemaReply {
+    /// The verbatim model output (post generation). Empty only if generation
+    /// itself failed before producing tokens.
+    pub raw_output: String,
+    /// The parsed delta, if JSON was valid. `None` on parse failure or
+    /// generation error.
+    pub delta: Option<SchemaDelta>,
+    /// Human-readable error if the pass failed (tokenize/prefill/decode, or
+    /// JSON parse failure after both passes). Empty string on success.
+    pub error: String,
 }
 
 enum SchemaMsg {
@@ -138,14 +147,33 @@ impl SchemaEngine {
                                 }),
                             );
                             let reply_msg = match outcome {
-                                Ok(Ok(delta)) => SchemaReply::Ok(delta),
-                                Ok(Err(e)) => {
-                                    tracing::warn!(error = %format!("{e:#}"), "schema delta failed");
-                                    // Clear the schema context's cache so the
-                                    // next pass starts fresh (mirrors the chat
-                                    // engine's Bug B self-healing).
+                                Ok(Ok((raw, Ok(delta)))) => SchemaReply {
+                                    raw_output: raw,
+                                    delta: Some(delta),
+                                    error: String::new(),
+                                },
+                                Ok(Ok((raw, Err(e)))) => {
+                                    // Generation succeeded but JSON parse failed
+                                    // twice. Surface the raw output so the debug
+                                    // panel can show what the model emitted.
+                                    tracing::warn!(error = %e, "schema delta parse failed");
                                     runtime.ctx.clear_kv_cache();
-                                    SchemaReply::Err(format!("{e:#}"))
+                                    SchemaReply {
+                                        raw_output: raw,
+                                        delta: None,
+                                        error: e,
+                                    }
+                                }
+                                Ok(Err(e)) => {
+                                    // Generation itself failed (tokenize/prefill/
+                                    // decode). No raw output to report.
+                                    tracing::warn!(error = %format!("{e:#}"), "schema delta failed");
+                                    runtime.ctx.clear_kv_cache();
+                                    SchemaReply {
+                                        raw_output: String::new(),
+                                        delta: None,
+                                        error: format!("{e:#}"),
+                                    }
                                 }
                                 Err(payload) => {
                                     let msg = payload
@@ -159,7 +187,11 @@ impl SchemaEngine {
                                         });
                                     tracing::error!(panic = %msg, "schema delta panicked");
                                     runtime.ctx.clear_kv_cache();
-                                    SchemaReply::Err(format!("schema panic: {msg}"))
+                                    SchemaReply {
+                                        raw_output: String::new(),
+                                        delta: None,
+                                        error: format!("schema panic: {msg}"),
+                                    }
                                 }
                             };
                             let _ = req.reply.send(reply_msg);
@@ -203,7 +235,11 @@ impl SchemaEngine {
     fn drain_failed(rx: &mpsc::Receiver<SchemaMsg>, why: String) {
         while let Ok(msg) = rx.recv_timeout(std::time::Duration::from_millis(50)) {
             if let SchemaMsg::Request(req) = msg {
-                let _ = req.reply.send(SchemaReply::Err(why.clone()));
+                let _ = req.reply.send(SchemaReply {
+                    raw_output: String::new(),
+                    delta: None,
+                    error: why.clone(),
+                });
             }
         }
     }
@@ -247,13 +283,20 @@ impl SchemaRuntime {
     /// Two-pass: render the delta prompt, generate, parse JSON. If parsing
     /// fails, retry once with a repair prompt. On second failure, return Err
     /// (the schema is left unchanged for this turn — graceful degradation).
-    fn generate_delta(&mut self, req: &SchemaRequest) -> anyhow::Result<SchemaDelta> {
+    ///
+    /// Returns `(raw_output, Result<delta, error>)` so the caller can always
+    /// see what the model emitted, even when parsing failed — essential for the
+    /// debug panel's JSON-malformedness diagnosis.
+    fn generate_delta(
+        &mut self,
+        req: &SchemaRequest,
+    ) -> Result<(String, Result<SchemaDelta, String>), anyhow::Error> {
         let prompt = render_delta_prompt(&req.current_schema_json, &req.last_exchange);
         let raw = self.generate_text(&prompt)?;
         match SchemaDelta::from_model_output(&raw) {
             Ok(delta) => {
                 tracing::debug!(tokens = raw.len(), "schema delta parsed on first pass");
-                Ok(delta)
+                Ok((raw, Ok(delta)))
             }
             Err(first_err) => {
                 tracing::warn!(
@@ -263,9 +306,18 @@ impl SchemaRuntime {
                 );
                 let repair = render_repair_prompt(&raw);
                 let raw2 = self.generate_text(&repair)?;
-                SchemaDelta::from_model_output(&raw2).map_err(|e| {
-                    anyhow::anyhow!("schema delta parse failed twice: first={first_err}, retry={e}")
-                })
+                // The returned raw_output is the RETRY's output (the most
+                // recent model emission) — that's what's diagnostically
+                // useful when the caller wants to see why parsing failed.
+                match SchemaDelta::from_model_output(&raw2) {
+                    Ok(delta) => Ok((raw2, Ok(delta))),
+                    Err(e) => Ok((
+                        raw2,
+                        Err(format!(
+                            "schema delta parse failed twice: first={first_err}, retry={e}"
+                        )),
+                    )),
+                }
             }
         }
     }

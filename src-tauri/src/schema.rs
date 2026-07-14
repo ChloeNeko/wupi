@@ -200,7 +200,7 @@ impl WorldSchema {
 /// or a set (`Some`)?". `serde` deserializes JSON `null` to `None` and a
 /// string to `Some(string)`, giving us the unambiguous delete-vs-set signal
 /// for free.
-#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct SchemaDelta {
     #[serde(default)]
     pub summary: Option<String>,

@@ -393,3 +393,99 @@ body {
   color: #ff6b6b;
   padding: 8px 0;
 }
+
+/* ── Schema delta debug panel (B/C runtime test) ──────────── */
+/* Mirrors the memory panel's structure (.memory-debug* classes) but swaps
+   the single-line query input for a two-textarea synthetic-exchange form
+   (a schema delta is computed against a user+assistant turn pair). The
+   "apply" checkbox toggles dry-run vs. live schema mutation so the panel
+   can both probe the model AND demonstrate schema evolution across calls. */
+.schema-debug-query {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px;
+}
+
+.schema-exchange {
+  width: 100%;
+  padding: 6px 10px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
+  font-size: 0.85rem;
+  resize: vertical;
+}
+
+.schema-exchange:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.schema-debug-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.schema-debug-apply {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.78rem;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.schema-debug-apply input {
+  cursor: pointer;
+}
+
+.schema-debug-controls button {
+  flex: 0 0 auto;
+  padding: 6px 14px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.schema-debug-controls button:hover {
+  filter: brightness(1.15);
+}
+
+/* Raw model output block — preformatted so the model's exact JSON (or
+   malformed emission) is visible. Diagnostic, not content. */
+.schema-raw {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.76rem;
+  line-height: 1.45;
+  color: var(--text-dim);
+  background: rgba(0, 0, 0, 0.18);
+  padding: 6px 8px;
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  margin-bottom: 6px;
+}
+
+/* The parsed delta (shown as JSON) + the resulting schema state. Same
+   monospace treatment as .schema-raw so structure is scannable. */
+.schema-delta-block {
+  margin-bottom: 6px;
+}
+
+.schema-delta-label {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--accent);
+  margin-bottom: 3px;
+}
