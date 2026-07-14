@@ -175,6 +175,53 @@ impl Conversation {
         }
         out
     }
+
+    /// Windowed variant of [`assemble_api_messages`]: prepends the system
+    /// message in full, then takes only the LAST `window` stored messages.
+    ///
+    /// This is the §2F eager-prefill sliding window (2026-07-13). Capping
+    /// visible history to a fixed message count (regardless of token budget)
+    /// does two things:
+    /// 1. Makes `truncate_to_fit` effectively never fire (4 short turns +
+    ///    system ≪ the ~3000-token budget), eliminating truncation-driven
+    ///    cold-resets.
+    /// 2. Keeps the stable prefix short and predictable so eager prefill is
+    ///    cheap and the delta (memory block + new user) stays small.
+    ///
+    /// Memory (M) is supposed to backfill the evicted older turns via
+    /// retrieval — that's the whole point of the offload. If retrieval misses,
+    /// the model genuinely sees less recency than before; the cap is in a
+    /// `const` at the call site, trivially tunable.
+    pub fn assemble_api_messages_windowed(
+        &self,
+        system_prompt: &str,
+        window: usize,
+    ) -> Vec<ApiMessage> {
+        let start = self.messages.len().saturating_sub(window);
+        let visible = &self.messages[start..];
+
+        let mut out = Vec::with_capacity(visible.len() + 1);
+        if !system_prompt.is_empty() {
+            out.push(ApiMessage {
+                role: "system".into(),
+                content: system_prompt.into(),
+                raw_output: String::new(),
+            });
+        }
+        for m in visible {
+            out.push(ApiMessage {
+                role: match m.role {
+                    Role::User => "user",
+                    Role::Assistant => "assistant",
+                    Role::System => "system",
+                }
+                .into(),
+                content: m.content.clone(),
+                raw_output: m.raw_output.clone(),
+            });
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

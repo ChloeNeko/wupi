@@ -371,11 +371,17 @@ async fn chat_send(
     };
     let system_prompt = prompts::build_system_content(&settings);
 
+    // §2F eager-prefill sliding window (2026-07-13): cap visible history to
+    // the last VISIBLE_WINDOW messages regardless of token budget. Memory (M)
+    // backfills evicted turns via retrieval. Truncation in the engine becomes
+    // a safety net that effectively never fires (4 short turns ≪ ~3000 budget).
+    const VISIBLE_WINDOW: usize = 4;
+
     let messages = {
         let mut s = state.session.lock().await;
         s.add_message(session::Role::User, text.clone());
         save_session(&app, &s).await;
-        s.assemble_api_messages(&system_prompt)
+        s.assemble_api_messages_windowed(&system_prompt, VISIBLE_WINDOW)
     };
 
     let on_chunk: llm::ChunkFn = Arc::new({
