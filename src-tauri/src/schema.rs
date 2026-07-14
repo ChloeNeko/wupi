@@ -211,12 +211,47 @@ pub struct SchemaDelta {
 }
 
 impl SchemaDelta {
-    /// Parse a model-emitted JSON string into a delta. Tolerant of surrounding
-    /// whitespace/markdown fences (the model may wrap output in ```json even
-    /// when told not to) — strips them before parsing.
+    /// Parse a model-emitted string into a delta. Tolerant of three layers of
+    /// wrapping the model may apply:
+    /// 1. The Gemma4 channel protocol (`<|channel>thought\n...<channel|>reply`).
+    ///    The model emits this protocol for ALL output (including the schema
+    ///    delta pass, which is instructed to emit raw JSON). The JSON lives in
+    ///    the REPLY channel — the text after the last `<channel|>` marker.
+    /// 2. Markdown fences (```` ```json ... ``` ````) — stripped if present.
+    /// 3. Surrounding whitespace.
+    ///
+    /// Runtime-discovered 2026-07-13: the delta pass emitted
+    /// `<|channel>thought\n<channel|>{}` — a valid empty delta `{}` wrapped in
+    /// the channel protocol. Without extracting the reply channel, serde saw
+    /// `<|channel>...` and bailed at column 1.
     pub fn from_model_output(raw: &str) -> Result<Self, serde_json::Error> {
-        let cleaned = strip_markdown_fences(raw).trim();
+        let reply = extract_reply_channel(raw);
+        let cleaned = strip_markdown_fences(reply).trim();
         serde_json::from_str(cleaned)
+    }
+}
+
+/// Extract the reply channel from Gemma4 protocol output. The model emits
+/// `<|channel>thought\n...<channel|>reply` — the thought channel (internal
+/// reasoning) comes first, closed by `<channel|>`, then the reply text
+/// follows. The JSON delta is in the reply.
+///
+/// Uses `rsplit_once("<channel|>")` to take everything after the LAST closing
+/// marker. This correctly handles:
+/// - Protocol-wrapped output (the common case): the thought block is
+///   discarded, the reply JSON is kept.
+/// - Thought-only output (no reply): returns empty string → parse fails
+///   gracefully (the repair prompt or error path takes over).
+/// - Raw JSON with no protocol wrapping: returns the whole string unchanged
+///   (the rare case where the model emits JSON directly).
+///
+/// This mirrors `chat_format.rs::Gemma4Format::parse_output`'s split-on-
+/// `<channel|>` logic, specialized to the schema's "I only want the reply"
+/// need (parse_output splits into both channels; we discard thought entirely).
+fn extract_reply_channel(raw: &str) -> &str {
+    match raw.rsplit_once("<channel|>") {
+        Some((_, reply)) => reply,
+        None => raw,
     }
 }
 
@@ -377,6 +412,59 @@ mod tests {
         let raw = r#"{"entities":{"drop_me":null}}"#;
         let delta = SchemaDelta::from_model_output(raw).unwrap();
         assert_eq!(delta.entities.unwrap().get("drop_me"), Some(&None));
+    }
+
+    #[test]
+    fn from_model_output_strips_gemma4_channel_protocol() {
+        // Regression for the 2026-07-13 runtime failure: the delta pass
+        // emitted `<|channel>thought\n<channel|>{}` — a valid empty delta
+        // wrapped in the Gemma4 channel protocol. Without extracting the
+        // reply channel serde saw `<|channel>...` and bailed at column 1.
+        let raw = "<|channel>thought\n<channel|>{}";
+        let delta = SchemaDelta::from_model_output(raw).unwrap();
+        assert!(delta.summary.is_none());
+        assert!(delta.recent_events.is_none());
+        assert!(delta.entities.is_none());
+    }
+
+    #[test]
+    fn from_model_output_extracts_json_after_thought_channel() {
+        // The realistic case: model thinks briefly, then emits the JSON delta
+        // in the reply channel.
+        let raw = "<|channel>thought\nI should record the sword pickup.\n<channel|>{\"entities\":{\"item.iron_sword\":\"acquired\"}}";
+        let delta = SchemaDelta::from_model_output(raw).unwrap();
+        assert_eq!(
+            delta.entities.unwrap().get("item.iron_sword"),
+            Some(&Some("acquired".to_string()))
+        );
+    }
+
+    #[test]
+    fn from_model_output_channel_protocol_with_markdown_fence() {
+        // Double wrapping: channel protocol + markdown fence. The reply
+        // channel is extracted first, then the fence is stripped.
+        let raw = "<|channel>thought\n<channel|>```json\n{\"summary\":\"updated\"}\n```";
+        let delta = SchemaDelta::from_model_output(raw).unwrap();
+        assert_eq!(delta.summary.as_deref(), Some("updated"));
+    }
+
+    #[test]
+    fn from_model_output_thought_only_no_reply_is_error() {
+        // The model emitted only a thought channel (no reply). Extraction
+        // returns empty → parse fails gracefully. The repair prompt or error
+        // path takes over; the schema is left unchanged for that turn.
+        let raw = "<|channel>thought\nthinking...\n<channel|>";
+        assert!(SchemaDelta::from_model_output(raw).is_err());
+    }
+
+    #[test]
+    fn from_model_output_raw_json_without_protocol_passes_through() {
+        // No channel markers at all — the model emitted JSON directly (rare
+        // but possible). rsplit_once finds no `<channel|>` and returns the
+        // whole string unchanged.
+        let raw = r#"{"recent_events":["saw a fox"]}"#;
+        let delta = SchemaDelta::from_model_output(raw).unwrap();
+        assert_eq!(delta.recent_events.unwrap(), vec!["saw a fox".to_string()]);
     }
 
     #[test]
