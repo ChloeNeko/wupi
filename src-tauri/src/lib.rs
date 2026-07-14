@@ -7,6 +7,7 @@ pub mod memory_embedder;
 pub mod memory_embedder_llama;
 pub mod memory_rrf;
 pub mod prompts;
+pub mod schema;
 pub mod session;
 pub mod stream_filter;
 
@@ -38,6 +39,18 @@ pub struct AppState {
     /// when `AppState::new()` runs (before `setup()`). `setup()` fills it once;
     /// reads after init are lock-free. Always `Some` after `setup()` completes.
     pub memory: Arc<std::sync::OnceLock<Arc<memory::MemoryEngine<DynEmbedder>>>>,
+    /// The world-state schema — "the schema IS the summarizer." A persistent,
+    /// semi-structured record of the simulated world's state, updated after
+    /// every chat turn by the background state-delta pass (schema_engine.rs).
+    /// Held under tokio::sync::Mutex because it's read by chat_send (to inject
+    /// into the prompt) and written by the delta-completion path.
+    pub schema: Arc<tokio::sync::Mutex<schema::WorldSchema>>,
+    /// Handle to the in-flight schema delta pass (if any). chat_send checks
+    /// this to implement the invisible queue: if a pass is running when the
+    /// user sends, the message waits for it to finish before the next
+    /// generation starts. None = no pass running, proceed immediately.
+    /// Always `Some(JoinHandle)` between turn-finalize and the next chat_send.
+    pub pending_delta: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl AppState {
@@ -48,6 +61,8 @@ impl AppState {
             settings: Arc::new(std::sync::Mutex::new(prompts::WupiSettings::default())),
             active_cancel: Arc::new(std::sync::Mutex::new(None)),
             memory: Arc::new(std::sync::OnceLock::new()),
+            schema: Arc::new(tokio::sync::Mutex::new(schema::WorldSchema::default())),
+            pending_delta: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 }
