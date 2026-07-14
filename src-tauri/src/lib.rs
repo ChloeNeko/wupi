@@ -10,6 +10,7 @@ pub mod prompts;
 pub mod schema;
 pub mod schema_engine;
 pub mod session;
+pub mod sim_card;
 pub mod stream_filter;
 
 use std::sync::Arc;
@@ -65,6 +66,12 @@ pub struct AppState {
     /// the character/simulation card system exists; when a card loads, its
     /// loader sets this. Read on every chat turn (search + 2× archive).
     pub active_card_id: Arc<std::sync::Mutex<String>>,
+    /// The active Simulation Card (the parsed persona artifact). Filled once
+    /// in `setup()` from `cards/Wupi.sim`; reads after init are lock-free.
+    /// `chat_send` renders it into the system-prompt persona section;
+    /// `get_intro` reads its randomized introduction list. Always `Some`
+    /// after `setup()` (the loader falls back to a stub, never `None`).
+    pub active_card: Arc<std::sync::OnceLock<sim_card::SimCard>>,
 }
 
 impl AppState {
@@ -81,6 +88,7 @@ impl AppState {
             active_card_id: Arc::new(std::sync::Mutex::new(
                 memory::WUPI_OS_CARD_ID.to_owned(),
             )),
+            active_card: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
@@ -138,6 +146,27 @@ pub fn run() {
             // atomic save/load methods in session.rs + schema.rs are retained
             // for that future use (marked #[allow(dead_code)] until then).
             tracing::info!("fresh session + empty schema (ephemeral mode)");
+
+            // ── Simulation Card (Wupi's persona) ─────────────────────────
+            // Load the default card (`cards/Wupi.sim`) before anything else —
+            // it's a single cheap file read + parse, independent of model
+            // loading, and `get_intro` (called from the frontend's boot) may
+            // race the model load. `load_or_fallback` degrades gracefully to
+            // a stub persona on any error (missing file, bad XML), so the OS
+            // always boots. The card's `id` becomes the active card partition
+            // key for Memory once cards own their partition; today Memory
+            // stays on the Wupi sentinel namespace.
+            let card = match resolve_card_path(app.handle()) {
+                Some(path) => sim_card::load_or_fallback(&path),
+                None => {
+                    tracing::warn!(
+                        "no cards/Wupi.sim found; using minimal fallback persona \
+                         (persona section suppressed in the prompt)"
+                    );
+                    sim_card::fallback()
+                }
+            };
+            let _ = state.active_card.set(card);
 
             let model_path = resolve_model_path(app.handle());
             if let Some(path) = model_path {
@@ -295,6 +324,7 @@ pub fn run() {
             chat_send,
             chat_stop,
             get_settings,
+            get_intro,
             debug_memory_query,
             debug_schema_delta,
         ])
@@ -313,6 +343,21 @@ fn app_ready(state: tauri::State<'_, AppState>) -> String {
         return "loading model…".to_string();
     }
     "ready · no model (echo mode)".to_string()
+}
+
+/// Randomized boot greeting — picks one line from the active card's
+/// `<introductions>` list. The result is a UI-only flourish: the frontend
+/// renders it as a Wupi bubble but it is NEVER added to the conversation,
+/// sent to the model, or archived to memory (an assistant turn with no
+/// preceding user turn would be a malformed structure + memory noise). Returns
+/// `null` when the card has no introductions (e.g. the fallback stub) → the
+/// frontend shows no boot bubble.
+#[tauri::command]
+fn get_intro(state: tauri::State<'_, AppState>) -> Option<String> {
+    state
+        .active_card
+        .get()
+        .and_then(|c| c.random_intro().map(|s| s.to_owned()))
 }
 
 fn resolve_model_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
@@ -400,6 +445,54 @@ fn resolve_embed_model_dirs(app: &tauri::AppHandle) -> Option<std::path::PathBuf
         dirs.push(data.join("models"));
     }
     memory_embedder_llama::resolve_embed_model(&dirs)
+}
+
+/// Resolve the default Simulation Card (`cards/Wupi.sim`) by walking the same
+/// candidate-dir list as [`resolve_model_path`], but joining `"cards"` instead
+/// of `"models"` and exact-matching `Wupi.sim` (case-insensitive). Locked-name
+/// single file — no size fallback (only one file will ever be named
+/// `Wupi.sim`). Returns `None` when no card is found; the caller falls back to
+/// a minimal stub persona so the app still boots.
+fn resolve_card_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    use tauri::Manager;
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(d) = app.path().resource_dir().ok() {
+        candidates.push(d.join("cards"));
+    }
+    if let Some(exe) = std::env::current_exe().ok() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("cards"));
+            if let Some(grand) = parent.parent().and_then(|g| g.parent()) {
+                candidates.push(grand.join("cards"));
+            }
+            if let Some(gg) = parent.parent().and_then(|g| g.parent()).and_then(|g| g.parent()) {
+                candidates.push(gg.join("cards"));
+            }
+        }
+    }
+    if let Some(data) = app.path().app_data_dir().ok() {
+        candidates.push(data.join("cards"));
+    }
+
+    for dir in &candidates {
+        if !dir.exists() {
+            continue;
+        }
+        // Exact name match (case-insensitive). The dev path resolves to the
+        // repo's `cards/` dir; the exe-sibling + resource paths resolve to
+        // wherever cards ship alongside a packaged build.
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().to_lowercase() == "wupi.sim" {
+                    let path = entry.path();
+                    tracing::info!("resolved card: {} (from {})", path.display(), dir.display());
+                    return Some(path);
+                }
+            }
+        }
+    }
+    None
 }
 
 #[tauri::command]
@@ -492,7 +585,17 @@ async fn chat_send(
         let rendered = s.render_for_prompt();
         if rendered.is_empty() { None } else { Some(rendered) }
     };
-    let system_prompt = prompts::build_system_content(&settings);
+    // Persona: rendered once per turn from the active Simulation Card. The
+    // card is immutable after setup, so the rendered string is byte-identical
+    // across turns → the persona block in the system prompt is stable and does
+    // NOT trigger the §2F cold-reset guard (only the inter-turn memory block
+    // does, by design). The fallback card renders to "" → section suppressed.
+    let persona = state
+        .active_card
+        .get()
+        .map(|c| c.render_for_prompt());
+    let system_prompt =
+        prompts::build_system_content(&settings, persona.as_deref());
 
     // §2F eager-prefill sliding window (2026-07-13): cap visible history to
     // the last VISIBLE_WINDOW messages regardless of token budget. Memory (M)

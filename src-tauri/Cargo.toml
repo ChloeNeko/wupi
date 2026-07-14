@@ -38,3 +38,11 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # sqlite-vec virtual table for dense vector (cosine) search. v0.1.9 is the
 # latest 0.1.x (2025-07). Embeds the C source, compiled via the `cc` crate.
 sqlite-vec = "0.1.9"
+# Simulation Card (.sim) loader — small structured persona files. roxmltree is
+# a tiny DOM parser that auto-merges CDATA into text nodes, so the emoticons
+# and quotes in card prose parse with zero special handling. Purpose-built for
+# read-once-at-startup config files; no streaming overhead.
+roxmltree = "0.10"
+# Randomized startup introduction selection (one pick per boot from the active
+# card's <introductions> list). The canonical RNG; not otherwise in the tree.
+rand = "0.9"

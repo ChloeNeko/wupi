@@ -482,6 +482,18 @@ async function boot(): Promise<void> {
     setStatus("error", `init failed: ${String(err)}`);
   }
 
+  // Boot greeting — a randomized introduction line from the active Simulation
+  // Card. This is a UI-only flourish: it renders as a Wupi bubble but is NEVER
+  // sent to the model or added to the conversation (an assistant turn with no
+  // preceding user turn would be a malformed structure + memory noise). `null`
+  // (e.g. the fallback stub persona) → no bubble. Errors are non-fatal.
+  try {
+    const intro: string | null = await invoke("get_intro");
+    if (intro) addMessage("wupi", intro);
+  } catch (err) {
+    console.warn("get_intro failed:", err);
+  }
+
   await listen<{ status: string; model?: string; message?: string }>(
     "model-status",
     (event) => {
