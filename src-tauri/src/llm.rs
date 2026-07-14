@@ -145,6 +145,14 @@ pub struct LlamaCppBackend {
     engine: Arc<std::sync::Mutex<Option<ChatEngine>>>,
 }
 
+/// Process-level slot for the leaked `&'static LlamaModel`. Filled once when
+/// the chat backend loads (so the leaked model survives the loader thread
+/// exiting). The schema delta engine reads this to create its OWN isolated
+/// `LlamaContext` on the same model — true context isolation, the same
+/// pattern as the embedder (§3B). `LlamaModel` is `Sync`, so a `&'static` ref
+/// is safely shareable across the chat, embedder, and schema threads.
+static SHARED_MODEL: std::sync::OnceLock<&'static LlamaModel> = std::sync::OnceLock::new();
+
 impl LlamaCppBackend {
     /// Load the model off-thread, then spawn the persistent engine. Returns
     /// immediately with a backend handle; `on_result` fires when loading +
@@ -176,6 +184,11 @@ impl LlamaCppBackend {
                 // process-wide &'static from shared_backend). The engine thread
                 // owns both for the process lifetime.
                 let (backend_ref, model_ref, family) = handle.into_static();
+
+                // Stash the model ref in the process-level slot so the schema
+                // delta engine can create an isolated context on the same model.
+                // set() is a no-op if already set (it won't be — first load).
+                let _ = SHARED_MODEL.set(model_ref);
 
                 // Spawn the persistent engine with Q8_0 KV cache + delta prefill.
                 let (engine, init_rx) =
@@ -286,4 +299,12 @@ impl GenerationClient for LlamaCppBackend {
             .map(|g| g.is_some())
             .unwrap_or(false)
     }
+}
+
+/// Free function: the leaked `&'static LlamaModel`, available after the chat
+/// backend finishes loading. Used by the schema delta engine to create an
+/// isolated `LlamaContext` on the same model. Returns `None` if the model
+/// hasn't loaded yet (callers should gate on backend readiness first).
+pub fn shared_model() -> Option<&'static LlamaModel> {
+    SHARED_MODEL.get().copied()
 }

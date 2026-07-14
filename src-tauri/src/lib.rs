@@ -8,6 +8,7 @@ pub mod memory_embedder_llama;
 pub mod memory_rrf;
 pub mod prompts;
 pub mod schema;
+pub mod schema_engine;
 pub mod session;
 pub mod stream_filter;
 

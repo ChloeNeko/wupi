@@ -1,0 +1,453 @@
+//! The background state-delta schema engine.
+//!
+//! A dedicated `std::thread` ("wupi-schema") owning an ISOLATED
+//! `LlamaContext<'static>` on the same leaked model the chat engine uses.
+//! After each chat turn, `chat_send` posts a [`SchemaRequest`] here; the
+//! thread generates a micro-delta JSON (only the changed keys), parses it,
+//! and replies. The chat KV cache is never touched — true context isolation.
+//!
+//! # Why a separate context (the load-bearing isolation requirement)
+//!
+//! The schema pass MUST NOT pollute the chat engine's rolling KV cache. A
+//! second `LlamaContext` on the same `&'static LlamaModel` achieves this:
+//! the two contexts share model weights (one VRAM copy) but have independent
+//! KV state. This is the same pattern as the embedder (§3B, memory_embedder_
+//! llama.rs) — proven architecture.
+//!
+//! # The micro-delta contract
+//!
+//! The pass emits ONLY changed keys, not a full schema rewrite. A typical
+//! delta is 20-100 tokens → sub-second generation. See `schema.rs` for the
+//! merge semantics (`null` = delete key).
+//!
+//! # JSON robustness
+//!
+//! `SchemaDelta::from_model_output` strips markdown fences. If parsing still
+//! fails, the thread retries once with a repair prompt; on second failure it
+//! replies `Err` and the schema is left unchanged for that turn (graceful —
+//! chat proceeds with stale schema).
+
+use std::sync::mpsc;
+
+use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
+use llama_cpp_2::llama_batch::LlamaBatch;
+use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
+
+use crate::llm::{shared_backend, shared_model};
+use crate::schema::{SchemaDelta, WorldSchema};
+
+/// The schema context's token budget. Smaller than chat's 4000 — the delta
+/// pass only needs: system instruction (~150 tokens) + current schema JSON
+/// (~200-800) + last exchange (~100-400) + generation room. 2048 is generous
+/// headroom; the KV cost at Q8_0 is ~75MB.
+const SCHEMA_CTX: u32 = 2048;
+const SCHEMA_BATCH: u32 = 512;
+/// Cap on generated tokens for a delta pass. A compliant micro-delta is
+/// 20-100 tokens; 256 is hard headroom before truncation forces the model to
+/// stop rambling. If it hits this cap the output likely isn't valid JSON
+/// anyway and the repair path or error path handles it.
+const SCHEMA_MAX_TOKENS: i32 = 256;
+
+// ---------------------------------------------------------------------------
+// Control plane — channel types
+// ---------------------------------------------------------------------------
+
+/// A request to the schema thread: diff `last_exchange` against
+/// `current_schema` and emit the changed keys.
+struct SchemaRequest {
+    /// (user_message, assistant_message) from the turn that just completed.
+    last_exchange: (String, String),
+    /// The current schema serialized as pretty JSON, so the model knows what
+    /// to diff against.
+    current_schema_json: String,
+    /// One-shot reply channel.
+    reply: mpsc::Sender<SchemaReply>,
+}
+
+/// What the schema thread sends back when a delta pass completes. The fields
+/// are read by the caller (Component D's queue, lib.rs chat_send) — the
+/// "never read" warning resolves when D lands and consumes the reply.
+#[allow(dead_code)]
+pub enum SchemaReply {
+    Ok(SchemaDelta),
+    Err(String),
+}
+
+enum SchemaMsg {
+    Request(Box<SchemaRequest>),
+    /// Kept for future hot-swap / clean shutdown, mirroring `ChatEngine`.
+    #[allow(dead_code)]
+    Shutdown,
+}
+
+// ---------------------------------------------------------------------------
+// Handle (held by callers; fully Send + Sync)
+// ---------------------------------------------------------------------------
+
+/// The handle callers hold. Fully `Send + Sync` — just a channel sender.
+/// Mirrors `ChatEngine` and `LlamaCppEmbedder`.
+pub struct SchemaEngine {
+    tx: mpsc::Sender<SchemaMsg>,
+}
+
+// SAFETY: mpsc::Sender<SchemaMsg> is Send (SchemaMsg owns only Send data).
+unsafe impl Send for SchemaEngine {}
+unsafe impl Sync for SchemaEngine {}
+
+impl SchemaEngine {
+    /// Spawn the schema thread. The chat backend MUST be loaded first (we read
+    /// `shared_model()` to get the leaked `&'static LlamaModel`). Returns
+    /// `None` if no model is available — callers should treat the schema
+    /// engine as optional (chat proceeds without schema updates).
+    ///
+    /// The readiness receiver yields `Ok(())` once the schema context is live
+    /// (or `Err` if init failed). The caller SHOULD `recv()` before treating
+    /// the engine as ready, same contract as `ChatEngine::spawn` (Bug #6).
+    pub fn spawn() -> (Self, mpsc::Receiver<Result<(), String>>) {
+        let (tx, rx) = mpsc::channel::<SchemaMsg>();
+        let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
+
+        std::thread::Builder::new()
+            .name("wupi-schema".into())
+            .spawn(move || {
+                let mut runtime = match Self::init_runtime() {
+                    Ok(rt) => {
+                        let _ = init_tx.send(Ok(()));
+                        rt
+                    }
+                    Err(e) => {
+                        let msg = format!("schema engine init failed: {e}");
+                        tracing::error!(error = %msg, "schema engine init failed; thread exiting");
+                        let _ = init_tx.send(Err(msg.clone()));
+                        Self::drain_failed(&rx, msg);
+                        return;
+                    }
+                };
+                tracing::info!("wupi-schema thread ready");
+
+                loop {
+                    match rx.recv() {
+                        Ok(SchemaMsg::Request(req)) => {
+                            // Self-healing: isolate each delta pass so one
+                            // panic doesn't kill the thread.
+                            let outcome = std::panic::catch_unwind(
+                                std::panic::AssertUnwindSafe(|| {
+                                    runtime.generate_delta(&req)
+                                }),
+                            );
+                            let reply_msg = match outcome {
+                                Ok(Ok(delta)) => SchemaReply::Ok(delta),
+                                Ok(Err(e)) => {
+                                    tracing::warn!(error = %format!("{e:#}"), "schema delta failed");
+                                    // Clear the schema context's cache so the
+                                    // next pass starts fresh (mirrors the chat
+                                    // engine's Bug B self-healing).
+                                    runtime.ctx.clear_kv_cache();
+                                    SchemaReply::Err(format!("{e:#}"))
+                                }
+                                Err(payload) => {
+                                    let msg = payload
+                                        .downcast_ref::<String>()
+                                        .map(|s| s.clone())
+                                        .or_else(|| {
+                                            payload.downcast_ref::<&str>().map(|s| s.to_string())
+                                        })
+                                        .unwrap_or_else(|| {
+                                            "schema delta panic (unknown cause)".to_string()
+                                        });
+                                    tracing::error!(panic = %msg, "schema delta panicked");
+                                    runtime.ctx.clear_kv_cache();
+                                    SchemaReply::Err(format!("schema panic: {msg}"))
+                                }
+                            };
+                            let _ = req.reply.send(reply_msg);
+                        }
+                        Ok(SchemaMsg::Shutdown) => {
+                            tracing::info!("wupi-schema shutting down");
+                            break;
+                        }
+                        Err(mpsc::RecvError) => {
+                            tracing::info!("wupi-schema: all senders dropped, exiting");
+                            break;
+                        }
+                    }
+                }
+            })
+            .expect("failed to spawn wupi-schema thread");
+
+        (SchemaEngine { tx }, init_rx)
+    }
+
+    /// Post a delta request. The caller awaits the reply via the receiver
+    /// it created. Fire-and-forget is NOT the contract here — the caller
+    /// (chat_send's queue) needs the result before proceeding.
+    pub fn request_delta(
+        &self,
+        last_exchange: (String, String),
+        current_schema: &WorldSchema,
+    ) -> anyhow::Result<mpsc::Receiver<SchemaReply>> {
+        let (reply_tx, reply_rx) = mpsc::channel::<SchemaReply>();
+        let req = SchemaRequest {
+            last_exchange,
+            current_schema_json: current_schema.to_json_pretty(),
+            reply: reply_tx,
+        };
+        self.tx
+            .send(SchemaMsg::Request(Box::new(req)))
+            .map_err(|_| anyhow::anyhow!("schema engine thread closed"))?;
+        Ok(reply_rx)
+    }
+
+    fn drain_failed(rx: &mpsc::Receiver<SchemaMsg>, why: String) {
+        while let Ok(msg) = rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            if let SchemaMsg::Request(req) = msg {
+                let _ = req.reply.send(SchemaReply::Err(why.clone()));
+            }
+        }
+    }
+
+    /// Initialize the schema runtime: create an isolated context on the
+    /// shared model. Runs on the schema thread.
+    fn init_runtime() -> anyhow::Result<SchemaRuntime> {
+        let backend = shared_backend();
+        let model = shared_model().ok_or_else(|| {
+            anyhow::anyhow!("no shared model loaded — schema engine cannot start")
+        })?;
+
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(std::num::NonZeroU32::new(SCHEMA_CTX))
+            .with_n_batch(SCHEMA_BATCH)
+            .with_embeddings(false)
+            // Match the chat engine's KV quantization for consistency.
+            .with_type_k(KvCacheType::Q8_0)
+            .with_type_v(KvCacheType::Q8_0);
+        let ctx = model
+            .new_context(backend, ctx_params)
+            .map_err(|e| anyhow::anyhow!("schema context init: {e:?}"))?;
+        tracing::info!(n_ctx = SCHEMA_CTX, "schema context created (isolated)");
+
+        Ok(SchemaRuntime { ctx, model })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime (owned by the schema thread; never crosses thread boundaries)
+// ---------------------------------------------------------------------------
+
+struct SchemaRuntime {
+    ctx: llama_cpp_2::context::LlamaContext<'static>,
+    model: &'static LlamaModel,
+}
+
+impl SchemaRuntime {
+    /// Generate a micro-delta for the given exchange + current schema.
+    ///
+    /// Two-pass: render the delta prompt, generate, parse JSON. If parsing
+    /// fails, retry once with a repair prompt. On second failure, return Err
+    /// (the schema is left unchanged for this turn — graceful degradation).
+    fn generate_delta(&mut self, req: &SchemaRequest) -> anyhow::Result<SchemaDelta> {
+        let prompt = render_delta_prompt(&req.current_schema_json, &req.last_exchange);
+        let raw = self.generate_text(&prompt)?;
+        match SchemaDelta::from_model_output(&raw) {
+            Ok(delta) => {
+                tracing::debug!(tokens = raw.len(), "schema delta parsed on first pass");
+                Ok(delta)
+            }
+            Err(first_err) => {
+                tracing::warn!(
+                    error = %first_err,
+                    raw_preview = %raw.chars().take(200).collect::<String>(),
+                    "schema delta JSON parse failed; retrying with repair prompt"
+                );
+                let repair = render_repair_prompt(&raw);
+                let raw2 = self.generate_text(&repair)?;
+                SchemaDelta::from_model_output(&raw2).map_err(|e| {
+                    anyhow::anyhow!("schema delta parse failed twice: first={first_err}, retry={e}")
+                })
+            }
+        }
+    }
+
+    /// Tokenize → prefill → sample-and-decode a single response. One-shot
+    /// generation with a max-tokens cap and greedy sampling (the delta is
+    /// deterministic JSON; no creativity needed). Returns the decoded text.
+    ///
+    /// The context is fully reset each call (clear_kv_cache + re-prefill from
+    /// zero). Unlike the chat engine, there's no delta-prefill optimization
+    /// here — each prompt is a different schema + exchange, and the prompt is
+    /// small (~1-2KB), so a full prefill each call is cheap and correct.
+    ///
+    /// The sample/detokenize/batch pattern mirrors `engine.rs::decode_loop`
+    /// exactly: `sample(&ctx, -1)` reads from the last logits position,
+    /// `accept` advances sampler state, `token_to_piece` with an encoding_rs
+    /// decoder handles multibyte boundaries, and the sampled token is fed
+    /// back at position `n_cur - 1`.
+    fn generate_text(&mut self, prompt: &str) -> anyhow::Result<String> {
+        let mut tokens = self
+            .model
+            .str_to_token(prompt, AddBos::Always)
+            .map_err(|e| anyhow::anyhow!("schema tokenize: {e:?}"))?;
+        if tokens.is_empty() {
+            anyhow::bail!("schema tokenized prompt is empty");
+        }
+        // Guard: if the prompt alone exceeds the context, truncate from the
+        // FRONT (keep the generation prompt + last exchange). Losing the
+        // oldest schema detail beats failing entirely.
+        let max_prompt = (SCHEMA_CTX as usize).saturating_sub(SCHEMA_MAX_TOKENS as usize);
+        if tokens.len() > max_prompt {
+            let drop = tokens.len() - max_prompt;
+            tokens.drain(0..drop);
+            tracing::warn!(dropped = drop, "schema prompt exceeded context; truncated from front");
+        }
+
+        // Fresh cache each call — the schema context is one-shot, no reuse.
+        self.ctx.clear_kv_cache();
+
+        // Prefill in batches (mirrors engine.rs::prefill).
+        let n_prompt = tokens.len() as i32;
+        let mut batch = LlamaBatch::new(SCHEMA_BATCH as usize, 1);
+        let mut consumed = 0usize;
+        while consumed < tokens.len() {
+            let take = std::cmp::min(SCHEMA_BATCH as usize, tokens.len() - consumed);
+            let is_last_chunk = consumed + take == tokens.len();
+            batch.clear();
+            for (i, tok) in tokens[consumed..consumed + take].iter().enumerate() {
+                let is_final = is_last_chunk && i == take - 1;
+                batch
+                    .add(*tok, (consumed + i) as i32, &[0], is_final)
+                    .map_err(|e| anyhow::anyhow!("schema batch add: {e:?}"))?;
+            }
+            self.ctx
+                .decode(&mut batch)
+                .map_err(|e| anyhow::anyhow!("schema prefill decode: {e:?}"))?;
+            consumed += take;
+        }
+
+        // Sample-and-decode loop. Greedy (argmax) — JSON wants determinism,
+        // and there's no ThoughtGate/StreamFilter here (the output is JSON,
+        // not the Gemma4 channel protocol). n_cur = next position to decode.
+        let mut sampler = LlamaSampler::greedy();
+        let eos = self.model.token_eos();
+        let mut n_cur = n_prompt;
+        let mut step_batch = LlamaBatch::new(1, 1);
+        let mut out = String::new();
+
+        for _ in 0..SCHEMA_MAX_TOKENS {
+            // sample(&ctx, -1) reads logits from the last decoded position.
+            let new_token: LlamaToken = sampler.sample(&self.ctx, -1);
+            sampler.accept(new_token);
+
+            if self.model.is_eog_token(new_token) || new_token == eos {
+                break;
+            }
+
+            // Detokenize with an encoding_rs decoder for multibyte safety
+            // (mirrors engine.rs:750-754).
+            let mut decoder = encoding_rs::UTF_8.new_decoder();
+            let piece = self
+                .model
+                .token_to_piece(new_token, &mut decoder, true, None)
+                .map_err(|e| anyhow::anyhow!("schema token to piece: {e:?}"))?;
+            if !piece.is_empty() {
+                out.push_str(&piece);
+            }
+
+            // Feed the sampled token back at position n_cur (one past the
+            // last prefilled/decoded), then decode to produce the next
+            // position's logits. Mirrors engine.rs:770-776.
+            step_batch.clear();
+            step_batch
+                .add(new_token, n_cur, &[0], true)
+                .map_err(|e| anyhow::anyhow!("schema decode batch: {e:?}"))?;
+            self.ctx
+                .decode(&mut step_batch)
+                .map_err(|e| anyhow::anyhow!("schema decode: {e:?}"))?;
+            n_cur += 1;
+        }
+
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prompt rendering (Component C)
+// ---------------------------------------------------------------------------
+
+/// Render the schema-delta generation prompt. Uses the Gemma4 turn markers so
+/// the model sees familiar structure, but the content is schema-specific.
+/// NOT routed through `ChatFormat::render_prompt` — this is a dedicated
+/// renderer (the schema pass isn't a chat turn).
+fn render_delta_prompt(current_schema_json: &str, last_exchange: &(String, String)) -> String {
+    let mut out = String::with_capacity(2048);
+    out.push_str("<|turn>system\n");
+    out.push_str(DELTA_SYSTEM_INSTRUCTION);
+    out.push_str("<turn|>\n");
+    out.push_str("<|turn>user\n");
+    out.push_str("Current schema:\n");
+    out.push_str(current_schema_json);
+    out.push_str("\n\nLast exchange:\n[user]: ");
+    out.push_str(&last_exchange.0);
+    out.push_str("\n[model]: ");
+    out.push_str(&last_exchange.1);
+    out.push_str("\n<turn|>\n");
+    out.push_str("<|turn>model\n");
+    out
+}
+
+/// Repair prompt: when the first output wasn't valid JSON, ask again tightly.
+fn render_repair_prompt(bad_output: &str) -> String {
+    let mut out = String::with_capacity(1024);
+    out.push_str("<|turn>system\n");
+    out.push_str("Your previous output was not valid JSON. Emit ONLY the JSON delta object — no prose, no markdown fences, no commentary. If nothing changed, emit {}.");
+    out.push_str("<turn|>\n");
+    out.push_str("<|turn>user\n");
+    out.push_str("Previous (invalid) output:\n");
+    out.push_str(bad_output);
+    out.push_str("\n<turn|>\n");
+    out.push_str("<|turn>model\n");
+    out
+}
+
+const DELTA_SYSTEM_INSTRUCTION: &str = "\
+You are a world-state tracker. Given the current schema and the last exchange, emit ONLY the keys that changed as a JSON delta. Do NOT rewrite unchanged keys.
+
+Output format (raw JSON only — no markdown fences, no prose):
+{
+  \"summary\": \"<updated summary string, or omit if unchanged>\",
+  \"recent_events\": [\"<new event>\", ...],
+  \"entities\": {\"<key>\": \"<new value>\", \"<key_to_delete>\": null}
+}
+
+Rules:
+- Emit ONLY changed keys. Omit unchanged sections entirely. If nothing tracked changed this turn, emit {}.
+- entities: a null value means DELETE the key. A non-null string means SET/overwrite.
+- Keep the delta minimal — a few keys at most per turn.
+- summary: only emit when the narrative arc meaningfully shifts, not every turn.
+- recent_events: append only genuinely new salient events.\n";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delta_prompt_contains_system_instruction_and_exchange() {
+        let prompt = render_delta_prompt(
+            "{\"summary\":\"\"}",
+            &("I pick up the sword".to_string(), "You grab it.".to_string()),
+        );
+        assert!(prompt.contains("world-state tracker"));
+        assert!(prompt.contains("I pick up the sword"));
+        assert!(prompt.contains("You grab it."));
+        assert!(prompt.starts_with("<|turn>system\n"));
+        assert!(prompt.ends_with("<|turn>model\n"));
+    }
+
+    #[test]
+    fn repair_prompt_references_invalid_output() {
+        let prompt = render_repair_prompt("not json at all");
+        assert!(prompt.contains("not valid JSON"));
+        assert!(prompt.contains("not json at all"));
+    }
+}
