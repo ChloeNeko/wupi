@@ -423,6 +423,19 @@ async fn chat_send(
         *slot = Some(Arc::clone(&cancel));
     }
 
+    // ── State-Delta queue (invisible, Component D) ─────────────────────
+    // If a background schema delta pass is still in flight from the PREVIOUS
+    // turn, await it before doing anything else. To the user this looks like
+    // normal thinking time — the frontend gets no signal until the first chunk
+    // arrives, so a pre-stream delay is indistinguishable from model latency.
+    // The await resolves when the delta task completes (success or failure);
+    // the schema is already updated in AppState by the task before it exits.
+    // Errors are ignored — schema is best-effort, a failed delta must not
+    // block chat (the schema stays at its last-good state).
+    if let Some(handle) = state.pending_delta.lock().await.take() {
+        let _ = handle.await;
+    }
+
     let settings = state.settings.lock().expect("settings mutex").clone();
 
     // ── Memory retrieval (pillar 3, §2F Option 3) ───────────────────────
@@ -573,6 +586,68 @@ async fn chat_send(
                 }
             });
         }
+    }
+
+    // ── State-Delta fire (Component D) ──────────────────────────────────
+    // Fire the background schema delta pass for the turn that just completed.
+    // Mirrors the memory archive spawn above: detached, best-effort, errors
+    // logged-and-dropped. The handle is stored in pending_delta so the NEXT
+    // chat_send awaits it (the invisible queue) before reading the schema —
+    // guaranteeing the next turn sees this turn's schema update.
+    //
+    // The delta pass runs on the dedicated wupi-schema thread (isolated
+    // context, never touches the chat KV cache). The JoinHandle wraps the
+    // post-generation work: post the request, await the reply via
+    // spawn_blocking, apply the delta, persist. If the schema engine isn't
+    // available (init failed, or chat proceeded in echo mode), skip silently.
+    if let Some(schema_engine) = state.schema_engine.get() {
+        // Capture the exchange from the session (clean strings, same source
+        // as the memory archive — sidesteps the token-boundary-drift landmine
+        // the same way). Read inside a brief lock, clone out, then drop the
+        // guard before spawning so the task doesn't pin the session mutex.
+        let (user_text, asst_text) = {
+            let s = state.session.lock().await;
+            let user = s.messages.len().checked_sub(2).and_then(|i| s.messages.get(i)).map(|m| m.content.clone());
+            (user, result.content.clone())
+        };
+        let current_schema = state.schema.lock().await.clone();
+        let schema_engine = Arc::clone(schema_engine);
+        let schema_slot = state.schema.clone();
+        let app_for_save = app.clone();
+        let handle = tokio::spawn(async move {
+            // Post the delta request. The reply comes back on a std::mpsc
+            // channel (the schema thread is a bare std::thread), so we await
+            // it via spawn_blocking — same pattern as the chat engine reply.
+            let reply_rx = match schema_engine
+                .request_delta((user_text.unwrap_or_default(), asst_text), &current_schema)
+            {
+                Ok(rx) => rx,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "schema delta request failed; schema unchanged");
+                    return;
+                }
+            };
+            let reply = match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %format!("{e}"), "schema delta reply channel closed");
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e}"), "schema delta reply join failed");
+                    return;
+                }
+            };
+            if let Some(delta) = reply.delta {
+                let mut s = schema_slot.lock().await;
+                s.apply_delta(delta);
+                save_schema(&app_for_save, &s).await;
+                tracing::debug!("schema delta applied + persisted");
+            } else if !reply.error.is_empty() {
+                tracing::warn!(error = %reply.error, "schema delta produced no delta (parse/generation failure); schema unchanged");
+            }
+        });
+        *state.pending_delta.lock().await = Some(handle);
     }
 
     clear_active_cancel(&state);
@@ -778,7 +853,6 @@ async fn save_session(app: &tauri::AppHandle, conv: &session::Conversation) {
 /// `save_session`: `WorldSchema::save` is atomic (temp + fsync + rename) but
 /// synchronous, so `spawn_blocking` keeps the async runtime free. Called by
 /// Component D's delta-completion path after a successful `apply_delta`.
-#[allow(dead_code)] // consumed by Component D's post-turn delta fire (pending)
 async fn save_schema(app: &tauri::AppHandle, schema: &schema::WorldSchema) {
     use tauri::Manager;
     let Some(data_dir) = app.path().app_data_dir().ok() else {
