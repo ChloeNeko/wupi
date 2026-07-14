@@ -1,16 +1,47 @@
-//! Reciprocal Rank Fusion (RRF) — the merge step of hybrid search.
+//! Score-aware Reciprocal Rank Fusion (RRF) — the merge step of hybrid search.
 //!
-//! Given two ranked id lists (sparse/FTS5 and dense/vec0), fuse them into one
-//! ranking via the standard formula:
+//! Given two ranked lists — sparse (FTS5) and dense (vec0) — each carrying its
+//! raw score, this module:
+//!
+//! 1. Floors the dense list on an absolute cosine threshold (the rejection
+//!    authority — see [`DENSE_COSINE_FLOOR`]).
+//! 2. Ranks the survivors within each list (position = 1-based rank).
+//! 3. Fuses via weighted RRF:
 //!
 //! ```text
-//! score(id) = Σ over each list L of  1 / (k + rank_L(id))
+//! score(id) = w_sparse / (k + rank_sparse(id))
+//!           + w_dense  / (k + rank_dense(id))
 //! ```
 //!
 //! Pure, allocation-light, and the single most testable piece of the Memory
 //! engine. No SQLite, no embedder, no async, no CUDA. The whole point of
 //! keeping this in its own file is so the §3A promise ("retrieval math is
 //! unit-testable without the embedding backend") is enforced by construction.
+//!
+//! # Why dense-only flooring (AGENTS.md §2M)
+//!
+//! The original v1 RRF (2026-07-13) fused on RANK ALONE and discarded the raw
+//! scores. That meant a near-random dense hit at cosine 0.25 would still
+//! contribute `1/(k+rank)` and could fuse-promote into the prompt. The
+//! cross-topic bleed that surfaced in the schema-engine full-system test
+//! (a dungeon query retrieving an unrelated cyberpunk memory — §2L) was a
+//! direct consequence: rank-based RRF has no rejection signal.
+//!
+//! The fix is an ABSOLUTE cosine floor on the dense path. Dense (semantic)
+//! similarity is the signal that catches "Alex in dungeon" vs "Alex in
+//! cyberpunk" — the shared name gives weak lexical overlap but the scenes are
+//! semantically distant, landing cosine around 0.25-0.35, below the floor.
+//!
+//! The sparse (BM25) path is deliberately NOT floored. Two reasons:
+//! 1. BM25's absolute scale is model-dependent (document-length normalization,
+//!    IDF behavior) and unreliable as a universal threshold — a floor that
+//!    works for one corpus mis-tunes for another.
+//! 2. The dense floor is already the rejection authority. Sparse only adds
+//!    precision-boost on memories that PASSED the dense floor. Flooring sparse
+//!    too would be a second rejection gate with no calibration story, and
+//!    min-max on it would be RELATIVE to the retrieved set (it maps the
+//!    best-of-the-batch to 1.0 regardless of whether the batch is all garbage)
+//!    — exactly the failure mode that defeated v1.
 //!
 //! # Rank indexing is 1-BASED (not 0)
 //!
@@ -32,53 +63,144 @@
 
 use std::collections::HashMap;
 
-use crate::memory::{MemoryId, RankedMemory};
+use crate::memory::{DebugScores, MemoryId, RankedMemory};
 
 /// RRF smoothing constant. Standard value from Cormack et al. (2009).
 ///
 /// Pinned as a `const` so call sites read `RRF_K` instead of a magic `60`.
-/// Distinct from the final `limit` passed to [`fuse_rrf`].
+/// Distinct from the final `limit` passed to [`fuse_scored_rrf`].
 pub const RRF_K: u32 = 60;
 
-/// Fuse two ranked id lists into one sorted ranking.
+/// Default hard cosine floor for the dense path. Memories whose query→memory
+/// cosine similarity falls below this are REJECTED before fusion — they never
+/// contribute to the prompt. This is the rejection authority for cross-topic
+/// bleed (AGENTS.md §2L problem #1, §2M fix).
 ///
-/// `sparse` and `dense` are each already sorted best-first — that is, the
-/// order returned by FTS5's `ORDER BY bm25() ASC` and vec0's
-/// `ORDER BY distance ASC` respectively. Position within each slice IS the
-/// rank (1-based: index 0 → rank 1).
+/// Calibrated against real retrieval data 2026-07-14 (post embedder-fix +
+/// asymmetric query-prefix verification). A multi-topic seed conversation
+/// (butter, platinum, diamonds, tiramisu, carbon) queried with the single
+/// word "butter" showed a clean ~4× gap between relevant and irrelevant:
+///   - relevant (butter Q&A)      : cosine 0.317 – 0.376
+///   - irrelevant (all 7 others)  : cosine 0.006 – 0.094
+/// A floor of 0.25 sits in the wide gap — keeps the relevant matches with
+/// ~0.07 margin and rejects every off-topic result with ~0.16 margin.
 ///
-/// An id appearing in BOTH lists gets both score contributions summed — this
-/// is the whole point of fusion: a memory that matches on both axes deserves
-/// to outrank one that matches on only one.
+/// The earlier 0.40 const was a guess from the synthetic self-test probe;
+/// it sat ABOVE the real relevant matches (0.32–0.38) and would have
+/// rejected the very memories it should keep. Single-word queries score
+/// lower than full-sentence queries because there's little context to build
+/// meaning from, so the floor must accommodate the weak end of legitimate
+/// matches, not the strong end.
 ///
-/// Returns up to `limit` entries, highest score first, each carrying its
-/// fused score. The score's absolute value is not meaningful (it's a sum of
-/// small fractions); only the ordering is.
-pub fn fuse_rrf(sparse: &[MemoryId], dense: &[MemoryId], limit: usize) -> Vec<RankedMemory> {
-    // Accumulate scores. Capacity is the smaller of "everything" and "a sane
-    // cap" — in practice both inputs are <= RETRIEVAL_DEPTH (64), so this map
-    // holds at most 128 entries. HashMap over i64 is cheap.
-    let mut scores: HashMap<MemoryId, f32> = HashMap::with_capacity(sparse.len() + dense.len());
+/// This is a PROVISIONAL value — recalibrate as more query shapes come in.
+/// The 🧠 debug panel's `dense_floor` override (`cos ≥`) lets you test
+/// alternatives live without a rebuild (AGENTS.md §2M Checkpoint E).
+pub const DENSE_COSINE_FLOOR: f32 = 0.25;
 
-    // Add a list's rank contributions. `enumerate()` is 0-based; rank is
-    // 1-based, so `+ 1`. Fused into a closure to avoid duplicating the loop
-    // body across the two inputs (one block of math, two call sites).
-    let mut add_list = |list: &[MemoryId]| {
-        for (i, &id) in list.iter().enumerate() {
-            let rank = (i as u32) + 1; // 1-based — see module doc.
-            let contribution = 1.0 / (RRF_K as f32 + rank as f32);
-            *scores.entry(id).or_insert(0.0) += contribution;
-        }
-    };
-    add_list(sparse);
-    add_list(dense);
+/// Per-list weights for weighted RRF. Both default to 0.5 (standard RRF —
+/// equal contribution). Tilting `dense` higher biases toward semantic
+/// relevance (the rejection authority); tilting `sparse` higher biases toward
+/// keyword precision. The weights need not sum to 1 — RRF is rank-based, so
+/// only the RATIO between them matters.
+#[derive(Debug, Clone, Copy)]
+pub struct FusionWeights {
+    pub sparse: f32,
+    pub dense: f32,
+}
 
-    // Sort by score descending. For ties (same score), break ties by id
-    // ascending so the order is deterministic — tests and the debug panel
-    // both rely on stable output across runs.
-    let mut ranked: Vec<(MemoryId, f32)> = scores.into_iter().collect();
+impl Default for FusionWeights {
+    fn default() -> Self {
+        Self { sparse: 0.5, dense: 0.5 }
+    }
+}
+
+/// Fuse two ranked, scored lists into one sorted ranking with a hard dense
+/// floor and weighted RRF.
+///
+/// # Inputs
+///
+/// - `sparse`: `(id, bm25_raw)` best-first. Lower (more-negative) BM25 is a
+///   better match. UNFLOORED — see module docs for why.
+/// - `dense`: `(id, distance)` best-first. Lower distance is better;
+///   cosine = `1 - distance`. Floored on `dense_cosine_floor`.
+/// - `dense_cosine_floor`: drop dense candidates whose cosine < floor.
+/// - `weights`: per-list RRF weights ([`FusionWeights::default`] = equal).
+/// - `limit`: truncate the fused output to this many entries.
+///
+/// # Output
+///
+/// Up to `limit` [`RankedMemory`] entries, highest fused score first. Each
+/// carries its fused `score` AND a populated [`DebugScores`] (raw cosine +
+/// per-list ranks) so the 🧠 panel can show why each memory was pulled.
+///
+/// An id appearing in BOTH (floored) lists gets both score contributions
+/// summed — this is the whole point of fusion: a memory that matches on both
+/// axes deserves to outrank one that matches on only one.
+pub fn fuse_scored_rrf(
+    sparse: &[(MemoryId, f32)],
+    dense: &[(MemoryId, f32)],
+    dense_cosine_floor: f32,
+    weights: FusionWeights,
+    limit: usize,
+) -> Vec<RankedMemory> {
+    // ── Floor the dense list on absolute cosine ──────────────────────────
+    // distance = 1 - cosine  →  cosine = 1 - distance. Keep cosine >= floor.
+    // The rejected candidates never enter the fusion map, so they contribute
+    // nothing to any id's score. This is the cross-topic rejection gate.
+    let dense_survivors: Vec<(MemoryId, f32)> = dense
+        .iter()
+        .filter(|(_, distance)| {
+            let cosine = 1.0 - distance;
+            cosine >= dense_cosine_floor
+        })
+        .cloned()
+        .collect();
+
+    // ── Accumulate fused scores + record per-list ranks ──────────────────
+    // Each entry in the map carries: accumulated weighted score, dense rank
+    // (if present), sparse rank (if present), and the raw dense cosine (for
+    // the debug panel — read off borderline hits to calibrate the floor).
+    #[derive(Default, Clone)]
+    struct Accum {
+        score: f32,
+        dense_rank: Option<u32>,
+        sparse_rank: Option<u32>,
+        dense_cosine: Option<f32>,
+    }
+
+    let mut acc: HashMap<MemoryId, Accum> = HashMap::with_capacity(
+        sparse.len() + dense_survivors.len(),
+    );
+
+    // Sparse contributions (unfloored — rank order is the input order).
+    for (i, (id, _bm25)) in sparse.iter().enumerate() {
+        let rank = (i as u32) + 1; // 1-based
+        let contribution = weights.sparse / (RRF_K as f32 + rank as f32);
+        let a = acc.entry(*id).or_default();
+        a.score += contribution;
+        a.sparse_rank = Some(rank);
+    }
+
+    // Dense contributions (post-floor survivors only).
+    for (i, (id, distance)) in dense_survivors.iter().enumerate() {
+        let rank = (i as u32) + 1; // 1-based, among survivors
+        let cosine = 1.0 - distance;
+        let contribution = weights.dense / (RRF_K as f32 + rank as f32);
+        let a = acc.entry(*id).or_default();
+        a.score += contribution;
+        a.dense_rank = Some(rank);
+        // Record the raw cosine for the debug panel. Only dense survivors
+        // have a cosine; memories surfaced via sparse-only have None here.
+        a.dense_cosine = Some(cosine);
+    }
+
+    // ── Sort by fused score descending ───────────────────────────────────
+    // Tie-break by id ascending so output is deterministic (tests + the debug
+    // panel both rely on stable ordering across runs).
+    let mut ranked: Vec<(MemoryId, Accum)> = acc.into_iter().collect();
     ranked.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
+        b.1.score
+            .partial_cmp(&a.1.score)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.cmp(&b.0))
     });
@@ -86,20 +208,24 @@ pub fn fuse_rrf(sparse: &[MemoryId], dense: &[MemoryId], limit: usize) -> Vec<Ra
     ranked
         .into_iter()
         .take(limit)
-        // The entry text isn't known here — RRF is pure ranks. Callers hydrate
-        // the full MemoryEntry via fetch_entries after fusion. The placeholder
-        // text_content is fine because fetch_entries overwrites it.
-        .map(|(id, score)| RankedMemory {
+        .map(|(id, a)| RankedMemory {
             entry: crate::memory::MemoryEntry {
                 id,
-                text_content: String::new(),
+                text_content: String::new(), // hydrated by fetch_entries
                 timestamp: 0,
                 role: crate::memory::Role::System,
                 chunk_index: 0,
                 salience: 0.0,
                 metadata_json: None,
+                card_id: String::new(),
+                session_id: None,
             },
-            score,
+            score: a.score,
+            debug: DebugScores {
+                dense_cosine: a.dense_cosine,
+                dense_rank: a.dense_rank,
+                sparse_rank: a.sparse_rank,
+            },
         })
         .collect()
 }
@@ -113,89 +239,126 @@ mod tests {
         out.iter().map(|r| r.entry.id).collect()
     }
 
+    /// Dense list helper: `(id, distance)`. distance = 1 - cosine, so cosine
+    /// 0.9 → distance 0.1. Lower distance = better.
+    fn dense(id: MemoryId, cosine: f32) -> (MemoryId, f32) {
+        (id, 1.0 - cosine)
+    }
+
+    /// Sparse list helper: `(id, bm25)`. More-negative = better; the exact
+    /// value is irrelevant to fusion (only rank matters), pick negatives.
+    fn sparse(id: MemoryId, rank_quality: f32) -> (MemoryId, f32) {
+        (id, -rank_quality)
+    }
+
     #[test]
     fn empty_inputs_return_empty() {
-        let out = fuse_rrf(&[], &[], 10);
+        let out = fuse_scored_rrf(&[], &[], 0.40, FusionWeights::default(), 10);
         assert!(out.is_empty(), "no inputs → no results");
     }
 
     #[test]
     fn one_empty_list_passes_the_other_through() {
-        let sparse: Vec<MemoryId> = vec![10, 20, 30];
-        let out = fuse_rrf(&sparse, &[], 10);
+        let s = vec![sparse(10, 1.0), sparse(20, 0.9), sparse(30, 0.8)];
+        let out = fuse_scored_rrf(&s, &[], 0.40, FusionWeights::default(), 10);
         assert_eq!(ids(&out), vec![10, 20, 30]);
     }
 
     #[test]
-    fn top_of_each_list_dominates() {
-        // Distinct ids, no overlap. Each list's top ranks highest in its own
-        // contribution; sparse[0] and dense[0] both score 1/61, tie broken by
-        // id ascending → dense id 100 comes before sparse id 1.
-        let sparse: Vec<MemoryId> = vec![1, 2, 3];
-        let dense: Vec<MemoryId> = vec![100, 200, 300];
-        let out = fuse_rrf(&sparse, &dense, 10);
-        // Both tops score 1/61; tie broken by id asc → 1 < 100.
-        assert_eq!(out[0].entry.id, 1, "tie should break to lower id");
-        assert_eq!(out[1].entry.id, 100);
-        // Next tier: both 2nd-rank, score 1/62 each.
-        assert_eq!(out[2].entry.id, 2);
-        assert_eq!(out[3].entry.id, 200);
+    fn dense_floor_drops_below_threshold() {
+        // Three dense candidates: cosine 0.9 (keep), 0.5 (keep), 0.2 (drop).
+        // Floor 0.40 → only the first two survive.
+        let d = vec![dense(1, 0.9), dense(2, 0.5), dense(3, 0.2)];
+        let out = fuse_scored_rrf(&[], &d, 0.40, FusionWeights::default(), 10);
+        assert_eq!(ids(&out), vec![1, 2], "below-floor candidate must be rejected");
+        // The dropped one (id 3) must not appear anywhere.
+        assert!(!ids(&out).contains(&3));
     }
 
     #[test]
-    fn id_in_both_lists_outranks_id_in_one() {
-        // The whole point of fusion. id=5 is rank-1 in BOTH lists →
-        // score = 2/61. Every other id is in only one list → max 1/61.
-        let sparse: Vec<MemoryId> = vec![5, 1, 2];
-        let dense: Vec<MemoryId> = vec![5, 9, 8];
-        let out = fuse_rrf(&sparse, &dense, 10);
-        assert_eq!(out[0].entry.id, 5, "overlap must dominate");
-        // Verify the math: 2/61 vs 1/61.
-        let top_score = out[0].score;
-        let second_score = out[1].score;
+    fn dense_floor_records_cosine_on_survivors_only() {
+        let d = vec![dense(1, 0.9), dense(2, 0.2)];
+        let out = fuse_scored_rrf(&[], &d, 0.40, FusionWeights::default(), 10);
+        // Survivor carries its raw cosine; the rejected one isn't in the output.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].entry.id, 1);
         assert!(
-            top_score > second_score,
-            "fused score {top_score} must beat single-list {second_score}"
+            (out[0].debug.dense_cosine.unwrap() - 0.9).abs() < 1e-5,
+            "survivor cosine should be recorded"
         );
     }
 
     #[test]
+    fn id_in_both_lists_outranks_id_in_one() {
+        // id=5 is rank-1 in BOTH lists → score = (0.5+0.5)/(60+1) ≈ 0.0164.
+        // Every other id is in only one list. With equal weights the overlap
+        // must dominate.
+        let s = vec![sparse(5, 1.0), sparse(1, 0.9), sparse(2, 0.8)];
+        let d = vec![dense(5, 0.9), dense(9, 0.8), dense(8, 0.7)];
+        let out = fuse_scored_rrf(&s, &d, 0.40, FusionWeights::default(), 10);
+        assert_eq!(out[0].entry.id, 5, "overlap must dominate");
+        assert!(
+            out[0].score > out[1].score,
+            "fused score {} must beat single-list {}",
+            out[0].score,
+            out[1].score
+        );
+    }
+
+    #[test]
+    fn dense_weight_tilts_toward_semantic() {
+        // id=1 is sparse-only (rank 1); id=2 is dense-only (rank 1, cosine 0.9).
+        // Equal weights → tie broken by id → [1, 2].
+        // Dense-heavy weights (sparse 0.1, dense 0.9) → id=2 dominates.
+        let s = vec![sparse(1, 1.0)];
+        let d = vec![dense(2, 0.9)];
+
+        let equal = fuse_scored_rrf(&s, &d, 0.40, FusionWeights::default(), 10);
+        assert_eq!(ids(&equal), vec![1, 2], "equal weights → tie-break by id");
+
+        let dense_heavy = fuse_scored_rrf(
+            &s,
+            &d,
+            0.40,
+            FusionWeights { sparse: 0.1, dense: 0.9 },
+            10,
+        );
+        assert_eq!(ids(&dense_heavy), vec![2, 1], "dense-heavy → dense id first");
+    }
+
+    #[test]
     fn limit_truncates() {
-        let sparse: Vec<MemoryId> = vec![1, 2, 3, 4, 5];
-        let dense: Vec<MemoryId> = vec![6, 7, 8, 9, 10];
-        let out = fuse_rrf(&sparse, &dense, 3);
+        let s: Vec<_> = (1..=5).map(|i| sparse(i, 1.0 / i as f32)).collect();
+        let d: Vec<_> = (6..=10).map(|i| dense(i, 0.9 - i as f32 * 0.01)).collect();
+        let out = fuse_scored_rrf(&s, &d, 0.40, FusionWeights::default(), 3);
         assert_eq!(out.len(), 3, "limit must truncate the result");
     }
 
     #[test]
     fn rank_indexing_is_1_based_not_0() {
-        // Regression guard for the classic RRF bug. If indexing were 0-based,
-        // the top rank would contribute 1/60 ≈ 0.01667 instead of 1/61 ≈
-        // 0.01639. The difference is small but compounds across rankings.
-        let sparse: Vec<MemoryId> = vec![1];
-        let out = fuse_rrf(&sparse, &[], 10);
-        let expected = 1.0 / (RRF_K as f32 + 1.0); // 1 / (60 + 1)
+        // Regression guard: top rank contributes 1/(k+1), NOT 1/k. With equal
+        // weights (0.5 each), a single sparse-list rank-1 id contributes
+        // 0.5 / 61.
+        let s = vec![sparse(1, 1.0)];
+        let out = fuse_scored_rrf(&s, &[], 0.40, FusionWeights::default(), 10);
+        let expected = 0.5 / (RRF_K as f32 + 1.0);
         let got = out[0].score;
-        let delta = (got - expected).abs();
         assert!(
-            delta < 1e-6,
-            "top score {got} should be 1/(k+1) = {expected} (1-based), delta={delta}"
+            (got - expected).abs() < 1e-6,
+            "top score {got} should be w/(k+1) = {expected} (1-based)"
         );
-        // And specifically NOT 1/k.
-        let wrong = 1.0 / RRF_K as f32;
+        let wrong = 0.5 / RRF_K as f32;
         assert!(
             (got - wrong).abs() > 1e-6,
-            "top score must not equal 1/k (0-based bug); got {got}, 1/k = {wrong}"
+            "must not equal w/k (0-based bug); got {got}, w/k = {wrong}"
         );
     }
 
     #[test]
     fn scores_descend_monotonically() {
-        // Enough ids to populate several tiers; verify strict descent (ties
-        // broken by id, so no equal scores in this input).
-        let sparse: Vec<MemoryId> = vec![1, 2, 3, 4];
-        let dense: Vec<MemoryId> = vec![5, 1, 6, 2];
-        let out = fuse_rrf(&sparse, &dense, 10);
+        let s = vec![sparse(1, 1.0), sparse(2, 0.9), sparse(3, 0.8), sparse(4, 0.7)];
+        let d = vec![dense(5, 0.9), dense(1, 0.85), dense(6, 0.8), dense(2, 0.75)];
+        let out = fuse_scored_rrf(&s, &d, 0.40, FusionWeights::default(), 10);
         for w in out.windows(2) {
             assert!(
                 w[0].score >= w[1].score,
@@ -207,22 +370,14 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_ids_within_one_list_dont_double_count() {
-        // Defensive: a buggy upstream that returns the same id twice in one
-        // list should NOT let it score 2x. The current impl uses
-        // `entry().or_insert(0.0) += contribution`, which DOES double-count.
-        // This test documents that behavior. If we later decide duplicates
-        // should be deduped per-list, flip the assertion.
-        let sparse: Vec<MemoryId> = vec![7, 7];
-        let out = fuse_rrf(&sparse, &[], 10);
-        // Both occurrences contribute 1/61 + 1/62.
-        assert_eq!(out.len(), 1, "dedup across the fused output");
-        let expected = 1.0 / 61.0 + 1.0 / 62.0;
-        assert!(
-            (out[0].score - expected).abs() < 1e-6,
-            "duplicate-within-list currently double-counts: got {} expected {}",
-            out[0].score,
-            expected
-        );
+    fn sparse_only_id_has_no_dense_debug() {
+        // An id surfaced only via sparse must have None dense_cosine/rank.
+        let s = vec![sparse(7, 1.0)];
+        let d = vec![dense(8, 0.9)];
+        let out = fuse_scored_rrf(&s, &d, 0.40, FusionWeights::default(), 10);
+        let seven = out.iter().find(|r| r.entry.id == 7).unwrap();
+        assert!(seven.debug.dense_cosine.is_none());
+        assert!(seven.debug.dense_rank.is_none());
+        assert_eq!(seven.debug.sparse_rank, Some(1));
     }
 }

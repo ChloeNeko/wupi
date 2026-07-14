@@ -56,8 +56,22 @@ pub type EmbedFuture = Pin<Box<dyn Future<Output = anyhow::Result<Vec<f32>>> + S
 /// channel, like `LlamaCppBackend` does for chat) provide it themselves behind
 /// an `Arc<Mutex<...>>` or a channel handle.
 pub trait Embedder: Send + Sync {
-    /// Embed `text` into a vector of length [`EMBED_DIM`].
+    /// Embed `text` as a DOCUMENT — the archived/storage side of retrieval.
+    /// Asymmetric models (e.g. bge-small) embed documents raw.
     fn embed(&self, text: String) -> EmbedFuture;
+
+    /// Embed `text` as a QUERY — the search side of retrieval. Asymmetric
+    /// models apply a query instruction prefix here (see the concrete impl's
+    /// doc); symmetric models (and [`StubEmbedder`]) default to [`embed`].
+    ///
+    /// The data plane calls this for search and [`embed`](Self::embed) for
+    /// archival, so the model-specific query/document asymmetry lives entirely
+    /// in the embedder — not in the retrieval math (AGENTS.md §3A). "This text
+    /// is a query" is retrieval logic; "the query gets a prefix" is model
+    /// behavior, and only the impl knows the latter.
+    fn embed_query(&self, text: String) -> EmbedFuture {
+        self.embed(text)
+    }
 
     /// Reports this embedder's output dimensionality. Must equal [`EMBED_DIM`].
     /// Exists so callers can assert the contract at construction time without
@@ -79,6 +93,10 @@ pub trait Embedder: Send + Sync {
 impl<E: Embedder + ?Sized> Embedder for Box<E> {
     fn embed(&self, text: String) -> EmbedFuture {
         (**self).embed(text)
+    }
+
+    fn embed_query(&self, text: String) -> EmbedFuture {
+        (**self).embed_query(text)
     }
 
     fn dim(&self) -> usize {

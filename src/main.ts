@@ -31,6 +31,9 @@ const memoryCloseBtn = document.getElementById("memory-debug-close") as HTMLButt
 const memoryInput = document.getElementById("memory-debug-input") as HTMLInputElement;
 const memoryRunBtn = document.getElementById("memory-debug-run") as HTMLButtonElement;
 const memoryResults = document.getElementById("memory-debug-results") as HTMLDivElement;
+// Optional dense cosine floor override (AGENTS.md §2M Checkpoint D). Empty
+// string → null → the backend uses its compiled DENSE_COSINE_FLOOR const.
+const memoryFloorInput = document.getElementById("memory-debug-floor") as HTMLInputElement;
 
 // Schema delta debug panel (B/C runtime test). Mirrors the memory panel but
 // takes a synthetic user+assistant exchange pair (a delta is computed against
@@ -46,9 +49,11 @@ const schemaApplyCheckbox = document.getElementById("schema-debug-apply") as HTM
 const schemaRunBtn = document.getElementById("schema-debug-run") as HTMLButtonElement;
 const schemaResults = document.getElementById("schema-debug-results") as HTMLDivElement;
 
-// Mirrors the Rust `RankedMemory` (memory.rs) + nested `MemoryEntry`. The
-// backend serializes via serde, so field names are snake_case and the role
-// comes through as the serde-lowercased enum string ("user"/"assistant"/...).
+// Mirrors the Rust `RankedMemory` (memory.rs) + nested `MemoryEntry` +
+// `DebugScores`. The backend serializes via serde, so field names are
+// snake_case and the role comes through as the serde-lowercased enum string
+// ("user"/"assistant"/...). The `debug` block carries the raw dense cosine
+// (the calibration readout for DENSE_COSINE_FLOOR) and per-list ranks.
 interface MemoryEntry {
   id: number;
   text_content: string;
@@ -57,10 +62,18 @@ interface MemoryEntry {
   chunk_index: number;
   salience: number;
   metadata_json: string | null;
+  card_id: string;
+  session_id: string | null;
+}
+interface DebugScores {
+  dense_cosine?: number | null;
+  dense_rank?: number | null;
+  sparse_rank?: number | null;
 }
 interface RankedMemory {
   entry: MemoryEntry;
   score: number;
+  debug?: DebugScores;
 }
 
 let sending = false;
@@ -365,10 +378,22 @@ memoryInput.addEventListener("keydown", (e) => {
     runMemoryQuery();
   }
 });
+memoryFloorInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    runMemoryQuery();
+  }
+});
 
 async function runMemoryQuery(): Promise<void> {
   const query = memoryInput.value.trim();
   if (!query) return;
+
+  // Parse the optional floor override. Empty/non-numeric → null → backend
+  // uses its compiled default. Tauri's serde bridge maps JS null → Rust None.
+  const floorRaw = memoryFloorInput.value.trim();
+  const floorParsed = floorRaw === "" ? null : Number.parseFloat(floorRaw);
+  const denseFloor = floorParsed !== null && Number.isFinite(floorParsed) ? floorParsed : null;
 
   memoryResults.innerHTML = "";
   const placeholder = document.createElement("div");
@@ -377,11 +402,13 @@ async function runMemoryQuery(): Promise<void> {
   memoryResults.appendChild(placeholder);
 
   try {
-    // topK maps to the Rust `top_k: Option<usize>` param via Tauri's
-    // camelCase→snake_case serde convention.
+    // topK + denseFloor map to the Rust `top_k: Option<usize>` and
+    // `dense_floor: Option<f32>` params via Tauri's camelCase→snake_case
+    // serde convention.
     const hits = await invoke<RankedMemory[]>("debug_memory_query", {
       query,
       topK: 10,
+      denseFloor,
     });
     renderMemoryResults(hits);
   } catch (err) {
@@ -415,10 +442,23 @@ function renderMemoryResults(hits: RankedMemory[]): void {
     role.className = "memory-result-role";
     role.textContent = hit.entry.role;
 
+    // Score row: fused RRF + raw dense cosine + per-list ranks. The cosine
+    // is the calibration readout — watch it on borderline hits to decide
+    // whether DENSE_COSINE_FLOOR should move.
     const score = document.createElement("span");
     score.className = "memory-result-score";
-    // Score scale is ~1/61..2/61; show raw to 4dp for diagnostic precision.
-    score.textContent = `rrf ${hit.score.toFixed(4)}`;
+    const parts: string[] = [`rrf ${hit.score.toFixed(4)}`];
+    const dbg = hit.debug ?? {};
+    if (dbg.dense_cosine != null) {
+      parts.push(`cos ${dbg.dense_cosine.toFixed(3)}`);
+    }
+    if (dbg.dense_rank != null || dbg.sparse_rank != null) {
+      const ranks: string[] = [];
+      if (dbg.sparse_rank != null) ranks.push(`s${dbg.sparse_rank}`);
+      if (dbg.dense_rank != null) ranks.push(`d${dbg.dense_rank}`);
+      parts.push(ranks.join(" "));
+    }
+    score.textContent = parts.join(" · ");
 
     head.appendChild(role);
     head.appendChild(score);

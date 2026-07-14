@@ -59,6 +59,12 @@ pub struct AppState {
     /// `debug_schema_delta` call; Component E will move this to an eager spawn
     /// at model-ready.
     pub schema_engine: Arc<std::sync::OnceLock<Arc<schema_engine::SchemaEngine>>>,
+    /// The active simulation card's id — the partition key for Memory
+    /// retrieval and archiving (AGENTS.md §2M). Defaults to
+    /// [`memory::WUPI_OS_CARD_ID`] (the Wupi-as-assistant namespace) until
+    /// the character/simulation card system exists; when a card loads, its
+    /// loader sets this. Read on every chat turn (search + 2× archive).
+    pub active_card_id: Arc<std::sync::Mutex<String>>,
 }
 
 impl AppState {
@@ -72,6 +78,9 @@ impl AppState {
             schema: Arc::new(tokio::sync::Mutex::new(schema::WorldSchema::default())),
             pending_delta: Arc::new(tokio::sync::Mutex::new(None)),
             schema_engine: Arc::new(std::sync::OnceLock::new()),
+            active_card_id: Arc::new(std::sync::Mutex::new(
+                memory::WUPI_OS_CARD_ID.to_owned(),
+            )),
         }
     }
 }
@@ -444,20 +453,29 @@ async fn chat_send(
     // threaded separately as `memory_block` and injected into the inter-turn
     // region by `render_prompt`. This keeps the system+turns prefix
     // byte-identical across turns (the precondition for eager prefill).
-    let memory_block = match state.memory.get() {
-        Some(engine) => match engine.search(&text, 5).await {
-            Ok(hits) if !hits.is_empty() => Some(memory::render_memory_block(&hits)),
-            Ok(_) => None,
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "memory search failed; injecting nothing");
+    let memory_block = {
+        // Read the active card id once (cheap clone of a short string) so the
+        // search and both archive calls below use the same scope within a turn.
+        let card_id = state
+            .active_card_id
+            .lock()
+            .expect("active_card_id mutex")
+            .clone();
+        match state.memory.get() {
+            Some(engine) => match engine.search(&text, &card_id, 5, None).await {
+                Ok(hits) if !hits.is_empty() => Some(memory::render_memory_block(&hits)),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "memory search failed; injecting nothing");
+                    None
+                }
+            },
+            // OnceLock empty = memory engine failed to init at startup. Memory is
+            // best-effort; chat proceeds with no retrieved context.
+            None => {
+                tracing::trace!("memory engine not initialized; skipping retrieval");
                 None
             }
-        },
-        // OnceLock empty = memory engine failed to init at startup. Memory is
-        // best-effort; chat proceeds with no retrieved context.
-        None => {
-            tracing::trace!("memory engine not initialized; skipping retrieval");
-            None
         }
     };
 
@@ -563,14 +581,19 @@ async fn chat_send(
             // edge where messages is unexpectedly short.
             let user_text = s.messages.len().checked_sub(2).and_then(|i| s.messages.get(i)).map(|m| m.content.clone());
             let asst_text = result.content.clone();
+            let card_id = state
+                .active_card_id
+                .lock()
+                .expect("active_card_id mutex")
+                .clone();
             let engine = Arc::clone(engine);
             tokio::spawn(async move {
                 if let Some(text) = user_text {
-                    if let Err(e) = engine.add_memory(text, memory::Role::User, 1.0).await {
+                    if let Err(e) = engine.add_memory(text, &card_id, memory::Role::User, 1.0).await {
                         tracing::warn!(error = %format!("{e:#}"), "archive user turn failed");
                     }
                 }
-                if let Err(e) = engine.add_memory(asst_text, memory::Role::Assistant, 1.0).await {
+                if let Err(e) = engine.add_memory(asst_text, &card_id, memory::Role::Assistant, 1.0).await {
                     tracing::warn!(error = %format!("{e:#}"), "archive assistant turn failed");
                 }
             });
@@ -599,42 +622,57 @@ async fn chat_send(
             let user = s.messages.len().checked_sub(2).and_then(|i| s.messages.get(i)).map(|m| m.content.clone());
             (user, result.content.clone())
         };
-        let current_schema = state.schema.lock().await.clone();
-        let schema_engine = Arc::clone(schema_engine);
-        let schema_slot = state.schema.clone();
-        let handle = tokio::spawn(async move {
-            // Post the delta request. The reply comes back on a std::mpsc
-            // channel (the schema thread is a bare std::thread), so we await
-            // it via spawn_blocking — same pattern as the chat engine reply.
-            let reply_rx = match schema_engine
-                .request_delta((user_text.unwrap_or_default(), asst_text), &current_schema)
-            {
-                Ok(rx) => rx,
-                Err(e) => {
-                    tracing::warn!(error = %format!("{e:#}"), "schema delta request failed; schema unchanged");
-                    return;
+        // ── Content gate (M2, 2026-07-14) ────────────────────────────────
+        // The delta pass is a full 12B forward pass. Skip it for clearly non-
+        // substantive turns (short filler like "ok"/"thanks", or empty replies)
+        // — see `should_fire_delta` for the conservative heuristic. 99% of real
+        // turns still fire; the user's typing time masks the generation cost.
+        // A skipped turn leaves pending_delta empty, so the next chat_send
+        // doesn't wait — zero latency hit for filler turns.
+        let user_text_for_gate = user_text.as_deref().unwrap_or("");
+        if !schema_engine::should_fire_delta(user_text_for_gate, &asst_text) {
+            tracing::debug!(
+                user_words = user_text_for_gate.split_whitespace().count(),
+                "schema delta skipped by content gate (non-substantive turn)"
+            );
+        } else {
+            let current_schema = state.schema.lock().await.clone();
+            let schema_engine = Arc::clone(schema_engine);
+            let schema_slot = state.schema.clone();
+            let handle = tokio::spawn(async move {
+                // Post the delta request. The reply comes back on a std::mpsc
+                // channel (the schema thread is a bare std::thread), so we await
+                // it via spawn_blocking — same pattern as the chat engine reply.
+                let reply_rx = match schema_engine
+                    .request_delta((user_text.unwrap_or_default(), asst_text), &current_schema)
+                {
+                    Ok(rx) => rx,
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), "schema delta request failed; schema unchanged");
+                        return;
+                    }
+                };
+                let reply = match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %format!("{e}"), "schema delta reply channel closed");
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e}"), "schema delta reply join failed");
+                        return;
+                    }
+                };
+                if let Some(delta) = reply.delta {
+                    let mut s = schema_slot.lock().await;
+                    s.apply_delta(delta);
+                    tracing::debug!("schema delta applied (in-memory; ephemeral)");
+                } else if !reply.error.is_empty() {
+                    tracing::warn!(error = %reply.error, "schema delta produced no delta (parse/generation failure); schema unchanged");
                 }
-            };
-            let reply = match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %format!("{e}"), "schema delta reply channel closed");
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %format!("{e}"), "schema delta reply join failed");
-                    return;
-                }
-            };
-            if let Some(delta) = reply.delta {
-                let mut s = schema_slot.lock().await;
-                s.apply_delta(delta);
-                tracing::debug!("schema delta applied (in-memory; ephemeral)");
-            } else if !reply.error.is_empty() {
-                tracing::warn!(error = %reply.error, "schema delta produced no delta (parse/generation failure); schema unchanged");
-            }
-        });
-        *state.pending_delta.lock().await = Some(handle);
+            });
+            *state.pending_delta.lock().await = Some(handle);
+        }
     }
 
     clear_active_cancel(&state);
@@ -678,25 +716,38 @@ async fn chat_stop(state: tauri::State<'_, AppState>) -> Result<(), String> {
 }
 
 /// Debug probe into the Memory engine (pillar 4). Embeds the query, runs the
-/// hybrid FTS5 + vec0 search, and returns the RRF-fused ranked results with
-/// scores. Off the chat path entirely — this is the observability surface for
-/// tuning retrieval independently of generation.
+/// hybrid FTS5 + vec0 search, and returns the score-aware-RRF-fused ranked
+/// results with raw dense cosine + per-list ranks per hit. Off the chat path
+/// entirely — this is the observability surface for tuning retrieval
+/// independently of generation, AND the calibration surface for
+/// [`memory_rrf::DENSE_COSINE_FLOOR`] (AGENTS.md §2M Checkpoint E).
 ///
-/// `top_k` defaults to 10 when `None`. Returns an error string (not a panic)
-/// if the memory engine isn't initialized or the query fails — the panel
-/// renders it as a red message.
+/// `top_k` defaults to 10 when `None`. `dense_floor` overrides the const for
+/// live calibration — pass a value to see how the result set changes at that
+/// threshold without a rebuild; leave `None` to use the compiled default.
+/// Returns an error string (not a panic) if the memory engine isn't
+/// initialized or the query fails — the panel renders it as a red message.
+///
+/// Retrieval is scoped to the active card id (AGENTS.md §2M) — cards never
+/// see each other's memory.
 #[tauri::command]
 async fn debug_memory_query(
     query: String,
     top_k: Option<usize>,
+    dense_floor: Option<f32>,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<memory::RankedMemory>, String> {
     let engine = state
         .memory
         .get()
         .ok_or_else(|| "memory engine not initialized".to_string())?;
+    let card_id = state
+        .active_card_id
+        .lock()
+        .expect("active_card_id mutex")
+        .clone();
     engine
-        .search(&query, top_k.unwrap_or(10))
+        .search(&query, &card_id, top_k.unwrap_or(10), dense_floor)
         .await
         .map_err(|e| format!("{e:#}"))
 }

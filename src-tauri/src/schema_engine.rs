@@ -462,6 +462,68 @@ fn render_repair_prompt(bad_output: &str) -> String {
     out
 }
 
+/// Cheap content gate for whether the schema delta pass should fire this turn.
+///
+/// The delta pass is a FULL 12B forward pass (tokenize + prefill + greedy
+/// decode up to 256 tokens). Firing it unconditionally on every turn —
+/// including "ok", "thanks", "lol", "yes" — burns ~1-4s of dedicated GPU time
+/// for a turn that changed nothing in the world. This gate skips those.
+///
+/// **Conservative by design.** The cost of a false skip (missing a real world-
+/// state change) is far higher than the cost of a false fire (one wasted pass),
+/// so the bar to skip is HIGH: only short, clearly-non-substantive user turns
+/// with a short assistant reply. Anything ambiguous fires the pass.
+///
+/// # What skips
+///
+/// - User message ≤ 4 words AND ≤ 32 chars (covers "ok", "thanks", "lol",
+///   "yes", "no", "sure", "k", "yep", "continue", "ok cool", etc.).
+/// - No assistant content (empty/error reply — nothing to record).
+///
+/// # What does NOT skip (deliberately)
+///
+/// - Short roleplay actions ("I nod", "I draw" — 2 words but world-moving).
+///   These are 2 words but contain a verb in first person, so the word-count
+///   gate alone is wrong for them. We can't distinguish "I nod" from "ok"
+///   cheaply without a model call, so we FIRE on anything that looks like it
+///   could be an action. The signal we use: presence of a pronoun ("i", "you",
+///   "he", "she", "they", "we") or a verb-shape. Cheaper and safer to just
+///   fire on anything that isn't obviously filler.
+/// - Long assistant replies (a meaty reply likely reflects a meaty exchange).
+///
+/// Pure + allocation-light so it's testable in isolation (Prime Directive §3A:
+/// retrieval/control logic stays decoupled from the model backend).
+pub fn should_fire_delta(user_text: &str, assistant_text: &str) -> bool {
+    // No assistant content → nothing to record (error turn, empty reply).
+    if assistant_text.trim().is_empty() {
+        return false;
+    }
+    let user = user_text.trim();
+    // Word count via split_whitespace (handles runs of spaces/tabs/newlines).
+    let word_count = user.split_whitespace().count();
+    // Short AND compact → almost certainly filler. The char ceiling catches
+    // 4 "words" that are actually one long token blob; the word ceiling catches
+    // long rambling filler. Both must hold to skip.
+    if word_count <= 4 && user.len() <= 32 {
+        // Final guard: if the short message contains a first/second-person
+        // pronoun, it might be a roleplay action ("I nod", "you see"). Fire
+        // rather than risk skipping world state. Pronoun check is case-
+        // insensitive on a small set; cheaper than a verb lookup.
+        let lower = user.to_lowercase();
+        const PRONOUNS: &[&str] = &[
+            "i ", "i'", "i’m", "i'm", "i’ll", "i'll", "i’ve", "i've",
+            "you ", "you'", "u ", "he ", "she ", "they ", "we ",
+        ];
+        let looks_like_action = PRONOUNS.iter().any(|p| lower.starts_with(p));
+        if looks_like_action {
+            return true; // ambiguous — fire to be safe
+        }
+        return false; // short, compact, no pronoun → filler, skip
+    }
+    // Everything else: fire. Long or substantive exchanges always get a pass.
+    true
+}
+
 const DELTA_SYSTEM_INSTRUCTION: &str = "\
 You are a world-state tracker. Given the current schema and the last exchange, emit ONLY the keys that changed as a JSON delta. Do NOT rewrite unchanged keys.
 
@@ -501,5 +563,73 @@ mod tests {
         let prompt = render_repair_prompt("not json at all");
         assert!(prompt.contains("not valid JSON"));
         assert!(prompt.contains("not json at all"));
+    }
+
+    // ── should_fire_delta gate tests ────────────────────────────────────
+    // The gate is the M2 overhead fix: skip the full 12B forward pass on
+    // clearly non-substantive turns. The contract is conservative — when in
+    // doubt, fire (the cost of a missed world-state change > one wasted pass).
+
+    #[test]
+    fn gate_skips_short_filler_user_messages() {
+        // The canonical skip cases: 1-4 word filler with a real assistant reply.
+        let reply = "Sure thing, here's the info you asked for.";
+        for filler in &[
+            "ok", "thanks", "lol", "yes", "no", "sure", "k", "yep",
+            "ok cool", "got it", "sounds good", "will do",
+        ] {
+            assert!(
+                !should_fire_delta(filler, reply),
+                "filler {filler:?} should skip the delta pass"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_skips_when_assistant_reply_is_empty() {
+        // Empty/error reply → nothing to record, regardless of user message.
+        assert!(!should_fire_delta("Tell me about the dungeon", ""));
+        assert!(!should_fire_delta("Tell me about the dungeon", "   "));
+    }
+
+    #[test]
+    fn gate_fires_on_normal_substantive_exchange() {
+        // A real question + real reply → always fire.
+        assert!(should_fire_delta(
+            "What's in the iron chest?",
+            "You open it and find a glowing amulet inside."
+        ));
+    }
+
+    #[test]
+    fn gate_fires_on_long_user_message_even_if_filler_sounding() {
+        // 5+ words clears the word ceiling regardless of content — fires.
+        assert!(should_fire_delta(
+            "ok so anyway let me think about that for a second",
+            "Take your time."
+        ));
+    }
+
+    #[test]
+    fn gate_fires_on_short_roleplay_action_with_pronoun() {
+        // The critical false-negative guard: "I nod" is 2 words (would skip by
+        // count alone) but it's a world-moving roleplay action. The pronoun
+        // check catches it and fires.
+        assert!(should_fire_delta("I nod", "She acknowledges you."));
+        assert!(should_fire_delta("I draw my sword", "Roll for initiative."));
+        assert!(should_fire_delta("you see a goblin", "It snarls."));
+    }
+
+    #[test]
+    fn gate_fires_on_first_person_contraction() {
+        // "I'm" / "I'll" — pronoun check covers contractions too.
+        assert!(should_fire_delta("I'm going north", "The path narrows."));
+        assert!(should_fire_delta("I'll attack", "You strike."));
+    }
+
+    #[test]
+    fn gate_skips_short_message_without_pronoun_or_verb_shape() {
+        // 3 words, no pronoun, not action-shaped → filler, skip.
+        assert!(!should_fire_delta("lol that's funny", "Glad you enjoyed it."));
     }
 }

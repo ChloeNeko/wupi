@@ -58,9 +58,33 @@ const BERT_CONTEXT_LENGTH: u32 = 512;
 /// in a single batch. Same value as the chat engine's `PREFILL_BATCH_TOKENS`.
 const BERT_N_BATCH: u32 = 512;
 
-/// Post-tokenization truncation. 511 not 512: leaves headroom in case the
-/// tokenizer didn't auto-add [CLS]/[SEP] — defensive, costs nothing.
-const BERT_TRUNCATE_TOKENS: usize = 511;
+/// Post-tokenization truncation. With `AddBos::Always` (the bug-#4 fix) the
+/// tokenizer always inserts `[CLS]` at position 0 and `[SEP]` at the end, so a
+/// full-length input is exactly `[CLS] + 510 content + [SEP] = 512`. Truncating
+/// to 512 keeps both special tokens (drops the 510th content token); the old
+/// 511 value was a stale guard from the pre-fix era that silently dropped
+/// `[SEP]` on long inputs. BERT tolerates a missing `[SEP]` but it's a small
+/// quality hit on exactly the long inputs that already suffer from no chunking.
+const BERT_TRUNCATE_TOKENS: usize = 512;
+
+/// Query instruction for `bge-small-en-v1.5`. This is an ASYMMETRIC retrieval
+/// model: per its model card, queries MUST be prefixed with this instruction
+/// before embedding; documents (archived memories) are embedded raw.
+///
+/// Without it, query embeddings collapse toward the document centroid and the
+/// cosine range compresses — irrelevant matches score too high to be floored
+/// out. Runtime-measured 2026-07-14 (post embedder-fix verification, healthy
+/// encoder): querying "gold" against "the weather is nice today" scored cosine
+/// 0.53 with no prefix — well above the dense floor, so it would have surfaced
+/// as a false positive. The asymmetric prefix is what separates the relevant
+/// from the irrelevant. (Real-data calibration later showed the floor belongs
+/// at 0.25, not 0.40 — see [`crate::memory_rrf::DENSE_COSINE_FLOOR`].)
+///
+/// The leading space is intentional — bge's instruction is `instruction + " " + text`.
+/// The trailing newline in the model-card example is not load-bearing; the
+/// tokenizer treats `: ` then text the same as `:\n` then text.
+const BGE_QUERY_INSTRUCTION: &str =
+    "Represent this sentence for searching relevant passages: ";
 
 // ---------------------------------------------------------------------------
 // Control plane — channel types
@@ -128,7 +152,15 @@ impl LlamaCppEmbedder {
             .name("wupi-embedder".into())
             .spawn(move || {
                 let mut runtime = match Self::init_runtime(&path, n_gpu_layers) {
-                    Ok(rt) => {
+                    Ok(mut rt) => {
+                        // Self-test BEFORE signaling ready: the probe runs on the
+                        // embedder thread (owns ctx + model), computes cosine in
+                        // Rust (bypasses vec0), and logs the result. If the
+                        // embedder is broken, we want to know at startup, not
+                        // after the first chat turn produces garbage retrieval.
+                        // Runs once, ~ms on GPU, never blocks the readiness
+                        // signal long (the probe is 4 short embeds).
+                        run_self_test(&mut rt);
                         let _ = init_tx.send(Ok(()));
                         rt
                     }
@@ -276,6 +308,63 @@ impl LlamaCppEmbedder {
     }
 }
 
+/// Embedder self-test (2026-07-14). Embeds three known-similarity string pairs
+/// via the real embedder and logs their Rust-computed cosine. Isolates "the
+/// embedder produces bad vectors" from "vec0 storage is broken".
+///
+/// Uses the ASYMMETRIC retrieval path the data plane actually uses: the probe
+/// is embedded AS A QUERY (with [`BGE_QUERY_INSTRUCTION`]) and each target is
+/// embedded AS A DOCUMENT (raw). This is what the dense cosine floor will see
+/// in production, so the numbers here are the calibration reference for
+/// [`crate::memory_rrf::DENSE_COSINE_FLOOR`] — not a theoretical doc-doc score.
+///
+/// Expected ordering for a healthy bge-small-en-v1.5 with the query prefix:
+///   - "gold" vs "gold is a precious metal"     → HIGH   (0.6-0.9)
+///   - "gold" vs "silver is a precious metal"   → MEDIUM (0.4-0.7)
+///   - "gold" vs "the weather is nice today"    → LOW    (~0.40-0.45 — synthetic
+///     worst case; real multi-topic data separates far more cleanly, with
+///     irrelevant matches landing ≤0.10 — see DENSE_COSINE_FLOOR's doc)
+///
+/// If all three are ~0.05 (random unit vectors), the EMBEDDER is broken and
+/// vec0 is exonerated. If they make sense here but the 🧠 panel shows garbage,
+/// vec0 storage is the suspect. Runs ONCE at startup; costs 4 embeds (~ms).
+fn run_self_test(runtime: &mut EmbedderRuntime) {
+    let pairs: &[(&str, &str, &str)] = &[
+        ("gold", "gold is a precious metal", "HIGH"),
+        ("gold", "silver is a precious metal", "MEDIUM"),
+        ("gold", "the weather is nice today", "LOW"),
+    ];
+    // Embed "gold" AS A QUERY — this is the path search() takes, prefix and all.
+    // The targets are embedded AS DOCUMENTS (raw) — the archival path. Matching
+    // the data plane's asymmetry is what makes these numbers the floor's true
+    // calibration reference.
+    let probe = match runtime.embed_one(&format!("{BGE_QUERY_INSTRUCTION}gold")) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "self-test: failed to embed probe 'gold'");
+            return;
+        }
+    };
+    for &(q, target, label) in pairs {
+        // q is always "gold" in this set, but keep the pattern general.
+        let _ = q;
+        match runtime.embed_one(target) {
+            Ok(v) => {
+                let cos = cosine(&probe, &v);
+                tracing::info!(
+                    target,
+                    expected = label,
+                    cosine = %format!("{cos:.4}"),
+                    "embedder self-test pair"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "self-test: failed to embed '{target}'");
+            }
+        }
+    }
+}
+
 impl Embedder for LlamaCppEmbedder {
     fn embed(&self, text: String) -> EmbedFuture {
         // Clone the sender so the boxed future is 'static. Routes through
@@ -310,9 +399,33 @@ impl Embedder for LlamaCppEmbedder {
         })
     }
 
+    /// bge-small is asymmetric: queries get the [`BGE_QUERY_INSTRUCTION`] prefix,
+    /// documents are embedded raw (via [`embed`](Embedder::embed)). Without the
+    /// prefix the cosine range compresses and irrelevant matches clear the dense
+    /// floor — see the const's doc for the measured failure.
+    fn embed_query(&self, text: String) -> EmbedFuture {
+        let prefixed = format!("{BGE_QUERY_INSTRUCTION}{text}");
+        self.embed(prefixed)
+    }
+
     fn dim(&self) -> usize {
         EMBED_DIM
     }
+}
+
+/// Compute cosine similarity directly in Rust, bypassing vec0. Used ONLY by
+/// the startup self-test diagnostic to isolate "embedder produces bad vectors"
+/// from "vec0 stores/retrieves vectors wrong". If two obviously-similar texts
+/// score high here but low through the 🧠 panel, the bug is in storage; if they
+/// score low here too, the embeddings themselves are broken.
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let mag_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let mag_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if mag_a <= 0.0 || mag_b <= 0.0 {
+        return 0.0;
+    }
+    dot / (mag_a * mag_b)
 }
 
 // ---------------------------------------------------------------------------
@@ -328,21 +441,56 @@ struct EmbedderRuntime {
 }
 
 impl EmbedderRuntime {
-    /// Tokenize → decode → read CLS embedding → L2-normalize.
+    /// Tokenize → encode → read CLS embedding → L2-normalize.
     ///
-    /// One context is reused across calls — each decode overwrites the
-    /// relevant state, so no `clear_kv_cache` is needed between embeds.
-    /// (If this proves wrong at runtime — e.g. results drift — adding a
-    /// clear is a one-line fix, but the contract says each decode is
-    /// independent for embedding extraction.)
+    /// # The encode vs decode distinction (2026-07-14 bug fix)
+    ///
+    /// `bge-small-en-v1.5` is a BERT encoder — bidirectional (non-causal).
+    /// llama.cpp has two entry points:
+    /// - `llama_decode` — causal mask (each token attends only to EARLIER
+    ///   tokens). For autoregressive chat models (Gemma, Llama).
+    /// - `llama_encode` — full bidirectional mask (every token attends to
+    ///   every other token). For encoder/embedding models (BERT).
+    ///
+    /// The earlier revision called `ctx.decode(...)`. That's wrong for BERT.
+    /// With a causal mask, position 0 ([CLS]) attends ONLY to itself — it
+    /// never sees the rest of the sequence. Its hidden state is nearly
+    /// context-free. The result: healthy-looking L2 norm (~9) but inverted /
+    /// length-dependent semantics — short inputs scored high cosine to
+    /// everything (CLS self-attention dominated), long inputs scored near
+    /// zero (no bidirectional context to build meaning). Runtime-observed:
+    /// "continue" scored cos 0.969 to "cow"; "Write me a short story about
+    /// cows" scored cos 0.008 to "cow". Inverted and length-correlated —
+    /// the signature of causal attention on a bidirectional model.
+    ///
+    /// The fix: `ctx.encode(...)`. The C++ `encode()` path also clears the
+    /// pooled-embedding buffer (`embd_seq.clear()`, llama-context.cpp:1376)
+    /// at the start of every call, so no manual KV/embd clear is needed
+    /// between embeds — the encoder is self-cleaning.
+    ///
+    /// # The logits flag (also fixed 2026-07-14)
+    ///
+    /// `batch.add(..., logits=true)` for EVERY position — the pooling layer
+    /// reads position 0's hidden state from the output buffer, so every
+    /// position's embedding must be stored. The chat engine's `is_last`
+    /// optimization (logits only on the final token) is wrong for encoders.
     fn embed_one(&mut self, text: &str) -> anyhow::Result<Vec<f32>> {
-        // Tokenize WITHOUT BOS. BERT's [CLS]/[SEP] are inserted by the C++
-        // tokenizer; a forced BOS prepends an unrelated token that pollutes
-        // the embedding. Precedent: the chat engine uses AddBos::Never for
-        // literal-only marker tokenization in `ChatEngine::init_runtime`.
+        // Tokenize WITH special tokens. Despite the misleading name, the
+        // `AddBos` enum in llama-cpp-2 maps to the C API's `add_special`
+        // parameter (see llama-cpp-2's str_to_token: it passes add_bos as
+        // the 6th arg to llama_tokenize, which llama.h documents as
+        // `add_special`). For BERT, `add_special=true` is what inserts
+        // [CLS] at position 0 and [SEP] at the end — WITHOUT them, CLS
+        // pooling reads position 0 = the first content token, producing
+        // embeddings with healthy magnitude but inverted/garbled semantics
+        // (runtime-observed 2026-07-14: "gold" scored HIGHER cosine to
+        // "the weather is nice today" than to "gold is a precious metal").
+        // The earlier "AddBos::Never" comment was wrong — it confused this
+        // flag with the chat engine's Gemma BOS, which is a different
+        // mechanism entirely.
         let mut tokens = self
             .model
-            .str_to_token(text, AddBos::Never)
+            .str_to_token(text, AddBos::Always)
             .map_err(|e| anyhow::anyhow!("embed tokenize: {e:?}"))?;
 
         if tokens.is_empty() {
@@ -354,22 +502,26 @@ impl EmbedderRuntime {
         // is the documented, expected behavior.
         tokens.truncate(BERT_TRUNCATE_TOKENS);
 
-        // Build the batch. Mark only the last token as is_last=true — CLS
-        // pooling produces one sequence-level embedding regardless of which
-        // tokens have logits enabled, but matching the chat prefill pattern
-        // is cheapest and correct.
+        // Build the batch. logits=true for EVERY position — the pooling layer
+        // (CLS) reads position 0's hidden state from the output buffer, so
+        // every position's embedding must be stored. The chat engine's
+        // `is_last` optimization (logits only on the final token) is WRONG
+        // for encoder/embedding models.
         let n_tokens = tokens.len();
         let mut batch = LlamaBatch::new(n_tokens, 1);
         for (i, tok) in tokens.iter().enumerate() {
-            let is_last = i == n_tokens - 1;
             batch
-                .add(*tok, i as i32, &[0], is_last)
+                .add(*tok, i as i32, &[0], true)
                 .map_err(|e| anyhow::anyhow!("embed batch add: {e:?}"))?;
         }
 
+        // ENCODE, not decode. bge-small is a BERT encoder (bidirectional).
+        // decode() applies a causal mask and produces semantically wrong
+        // embeddings for non-causal models. See the method doc for the full
+        // reasoning + the runtime signature that exposed it.
         self.ctx
-            .decode(&mut batch)
-            .map_err(|e| anyhow::anyhow!("embed decode: {e:?}"))?;
+            .encode(&mut batch)
+            .map_err(|e| anyhow::anyhow!("embed encode: {e:?}"))?;
 
         // Read the pooled sequence embedding. embeddings_seq_ith borrows from
         // &self — to_vec before returning so the borrow ends with this fn.
@@ -386,6 +538,21 @@ impl EmbedderRuntime {
         // every stored vector is already unit-length — single responsibility,
         // the embedder owns vector quality.
         let mut vec = slice.to_vec();
+        // Diagnostic: log the pre-normalization L2 norm on the first embed
+        // only. A healthy bge-small embedding has norm ~5-20; if it's ~0 or
+        // NaN, the embedder is still broken. One-shot via a static flag so
+        // the log isn't spammed on every embed.
+        static NORM_LOGGED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !NORM_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let pre_norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+            tracing::info!(
+                pre_norm,
+                dim = vec.len(),
+                first_3 = ?&vec[..3.min(vec.len())],
+                "embedder diagnostic: first embed pre-normalization via encode() (expect norm ~5-20 for healthy bge-small)"
+            );
+        }
         l2_normalize(&mut vec);
         Ok(vec)
     }

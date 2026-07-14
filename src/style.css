@@ -335,6 +335,37 @@ body {
   filter: brightness(1.15);
 }
 
+/* Dense cosine floor override (AGENTS.md §2M). Compact inline control — the
+   number input stays narrow so it doesn't crowd the query field. */
+.memory-debug-floor {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-muted, var(--text));
+  font-size: 0.8rem;
+}
+
+.memory-debug-floor input {
+  width: 3.5em;
+  padding: 2px 4px;
+  background: transparent;
+  color: var(--text);
+  border: none;
+  font: inherit;
+  font-size: 0.85rem;
+  text-align: center;
+}
+
+.memory-debug-floor input:focus {
+  outline: none;
+  color: var(--accent);
+}
+
 .memory-debug-results {
   flex: 1 1 auto;
   overflow-y: auto;
