@@ -109,36 +109,26 @@ pub fn run() {
             tracing::info!("app data dir: {}", data_dir.display());
 
             let state: tauri::State<AppState> = app.state();
-            let session_path = data_dir.join("session.json");
-            if let Ok(loaded) = session::Conversation::load(&session_path) {
-                // Bug #10: hold the guard once instead of locking twice
-                // back-to-back (once to assign, once to read .len()).
-                let count = {
-                    let mut s = state.session.blocking_lock();
-                    *s = loaded;
-                    s.messages.len()
-                };
-                tracing::info!("loaded persisted session ({} messages)", count);
-            }
 
-            // ── Schema load (Component E) ───────────────────────────────
-            // Load the persisted world-state schema (sibling to session.json).
-            // Doesn't depend on the model — pure JSON load into AppState. A
-            // missing file (first run) yields an empty schema, never an error
-            // (mirrors WorldSchema::load's NotFound handling).
-            let schema_path = data_dir.join("world_schema.json");
-            match schema::WorldSchema::load(&schema_path) {
-                Ok(loaded) => {
-                    // setup is sync — use blocking_lock on the tokio Mutex,
-                    // same as the session load above.
-                    let mut s = state.schema.blocking_lock();
-                    *s = loaded;
-                    tracing::info!(path = %schema_path.display(), "loaded world schema");
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to load world schema; starting empty");
-                }
-            }
+            // ── Session + schema are EPHEMERAL (2026-07-14) ───────────────
+            // WUPI OS launches into a FRESH session every time — no
+            // session.json or world_schema.json load. Memory (memory.sqlite)
+            // is the ONLY persistent state; it survives across launches and
+            // is how Wupi "remembers" you. The session + schema live only in
+            // memory for the current launch.
+            //
+            // Why: Wupi is a meta-assistant / Copilot (§1), not a roleplay
+            // chat app. You don't resume your last Windows session every
+            // reboot. Persisting the session caused cross-topic contamination
+            // (a cyberpunk story's messages bled into a fresh dungeon run).
+            //
+            // The character/simulation card system (future, unbuilt) will
+            // re-introduce SCOPED persistence: a card carries its own session
+            // + its own schema, resumable on demand. That's an opt-in layer
+            // on top of the ephemeral default, NOT a replacement for it. The
+            // atomic save/load methods in session.rs + schema.rs are retained
+            // for that future use (marked #[allow(dead_code)] until then).
+            tracing::info!("fresh session + empty schema (ephemeral mode)");
 
             let model_path = resolve_model_path(app.handle());
             if let Some(path) = model_path {
@@ -499,7 +489,6 @@ async fn chat_send(
     let messages = {
         let mut s = state.session.lock().await;
         s.add_message(session::Role::User, text.clone());
-        save_session(&app, &s).await;
         s.assemble_api_messages_windowed(&system_prompt, VISIBLE_WINDOW)
     };
 
@@ -541,9 +530,10 @@ async fn chat_send(
         }
     };
 
-    // Bug #3 Step 4: persist the raw model output alongside the cleaned
-    // content + reasoning so the formatter can re-render cache-coherently
-    // next turn (no full re-prefill of the previous reply).
+    // Bug #3 Step 4: hold the raw model output alongside the cleaned content +
+    // reasoning so the formatter can re-render cache-coherently next turn (no
+    // full re-prefill of the previous reply). Session is ephemeral now
+    // (2026-07-14) — no save; the turn lives only in memory for this launch.
     {
         let mut s = state.session.lock().await;
         s.add_assistant_turn(
@@ -551,7 +541,6 @@ async fn chat_send(
             result.reasoning.clone(),
             result.raw.clone(),
         );
-        save_session(&app, &s).await;
 
         // ── Memory archiving (pillar 2) ───────────────────────────────
         // Trigger is turn-COMPLETION, not truncation. We read from the
@@ -613,7 +602,6 @@ async fn chat_send(
         let current_schema = state.schema.lock().await.clone();
         let schema_engine = Arc::clone(schema_engine);
         let schema_slot = state.schema.clone();
-        let app_for_save = app.clone();
         let handle = tokio::spawn(async move {
             // Post the delta request. The reply comes back on a std::mpsc
             // channel (the schema thread is a bare std::thread), so we await
@@ -641,8 +629,7 @@ async fn chat_send(
             if let Some(delta) = reply.delta {
                 let mut s = schema_slot.lock().await;
                 s.apply_delta(delta);
-                save_schema(&app_for_save, &s).await;
-                tracing::debug!("schema delta applied + persisted");
+                tracing::debug!("schema delta applied (in-memory; ephemeral)");
             } else if !reply.error.is_empty() {
                 tracing::warn!(error = %reply.error, "schema delta produced no delta (parse/generation failure); schema unchanged");
             }
@@ -669,11 +656,14 @@ fn clear_active_cancel(state: &tauri::State<'_, AppState>) {
     *slot = None;
 }
 
-async fn rollback_last_user_message(state: &tauri::State<'_, AppState>, app: &tauri::AppHandle) {
+async fn rollback_last_user_message(state: &tauri::State<'_, AppState>, _app: &tauri::AppHandle) {
+    // Pop the orphaned user message on generation failure so the next send
+    // doesn't see two consecutive user turns (Bug C, §2D). Session is
+    // ephemeral now (2026-07-14) — no disk save, just in-memory correction.
+    // The `_app` param is retained for signature stability (callers pass it).
     let mut s = state.session.lock().await;
     if s.last_message_is_user() {
         s.pop_last_message();
-        save_session(app, &s).await;
     }
 }
 
@@ -831,6 +821,12 @@ async fn get_settings(state: tauri::State<'_, AppState>) -> Result<serde_json::V
 /// The session mutex guard is still held across the `.await` by the caller
 /// — that's correct for a `tokio::sync::Mutex` (its guard is await-safe) and
 /// serializes concurrent saves, which we want anyway.
+///
+/// UNUSED since 2026-07-14 (ephemeral sessions). Retained for the future
+/// character/simulation card system, which will re-introduce SCOPED
+/// persistence (a card carries its own resumable session). The atomic-save
+/// machinery is tested infrastructure — don't rebuild it when cards land.
+#[allow(dead_code)]
 async fn save_session(app: &tauri::AppHandle, conv: &session::Conversation) {
     use tauri::Manager;
     let Some(data_dir) = app.path().app_data_dir().ok() else {
@@ -851,8 +847,11 @@ async fn save_session(app: &tauri::AppHandle, conv: &session::Conversation) {
 
 /// Persist the world-state schema off the Tokio worker pool. Mirrors
 /// `save_session`: `WorldSchema::save` is atomic (temp + fsync + rename) but
-/// synchronous, so `spawn_blocking` keeps the async runtime free. Called by
-/// Component D's delta-completion path after a successful `apply_delta`.
+/// synchronous, so `spawn_blocking` keeps the async runtime free.
+///
+/// UNUSED since 2026-07-14 (ephemeral schema). Retained for the future
+/// character/simulation card system alongside `save_session`.
+#[allow(dead_code)]
 async fn save_schema(app: &tauri::AppHandle, schema: &schema::WorldSchema) {
     use tauri::Manager;
     let Some(data_dir) = app.path().app_data_dir().ok() else {
