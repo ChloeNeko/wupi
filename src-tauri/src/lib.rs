@@ -121,6 +121,25 @@ pub fn run() {
                 tracing::info!("loaded persisted session ({} messages)", count);
             }
 
+            // ── Schema load (Component E) ───────────────────────────────
+            // Load the persisted world-state schema (sibling to session.json).
+            // Doesn't depend on the model — pure JSON load into AppState. A
+            // missing file (first run) yields an empty schema, never an error
+            // (mirrors WorldSchema::load's NotFound handling).
+            let schema_path = data_dir.join("world_schema.json");
+            match schema::WorldSchema::load(&schema_path) {
+                Ok(loaded) => {
+                    // setup is sync — use blocking_lock on the tokio Mutex,
+                    // same as the session load above.
+                    let mut s = state.schema.blocking_lock();
+                    *s = loaded;
+                    tracing::info!(path = %schema_path.display(), "loaded world schema");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to load world schema; starting empty");
+                }
+            }
+
             let model_path = resolve_model_path(app.handle());
             if let Some(path) = model_path {
                 tracing::info!("spawning model load: {}", path.display());
@@ -133,11 +152,55 @@ pub fn run() {
                     s.context_size
                 };
                 let backend = llm::LlamaCppBackend::spawn_load(path, 99, context_size, Box::new(move |result| {
-                    let payload = match &result {
-                        Ok(name) => serde_json::json!({ "status": "ready", "model": name }),
-                        Err(msg) => serde_json::json!({ "status": "error", "message": msg }),
-                    };
-                    let _ = app_handle.emit("model-status", payload);
+                    match &result {
+                        Ok(name) => {
+                            let _ = app_handle.emit(
+                                "model-status",
+                                serde_json::json!({ "status": "ready", "model": name }),
+                            );
+
+                            // ── Eager schema-engine spawn (Component E) ────
+                            // The chat model is loaded → shared_model() is now
+                            // Some. Spawn the schema delta engine so it's ready
+                            // before the first chat turn (Component D's queue
+                            // assumes it exists). Mirrors the embedder's block-
+                            // on-readiness pattern. Runs on the loader thread
+                            // (disposable background thread) — blocking recv is
+                            // fine here. The schema context alloc is just KV
+                            // allocation (ms, reuses the leaked model), so the
+                            // delay before "ready" is negligible.
+                            let app_state = app_handle.state::<AppState>();
+                            if app_state.schema_engine.get().is_none() {
+                                let (engine, init_rx) = schema_engine::SchemaEngine::spawn();
+                                match init_rx.recv() {
+                                    Ok(Ok(())) => {
+                                        tracing::info!(
+                                            "schema engine ready (eager spawn at model-ready)"
+                                        );
+                                        let _ = app_state.schema_engine.set(Arc::new(engine));
+                                    }
+                                    Ok(Err(msg)) => {
+                                        tracing::warn!(
+                                            error = %msg,
+                                            "schema engine init failed; schema updates disabled"
+                                        );
+                                    }
+                                    Err(_) => {
+                                        tracing::warn!(
+                                            "schema engine init channel closed; \
+                                             schema updates disabled"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(msg) => {
+                            let _ = app_handle.emit(
+                                "model-status",
+                                serde_json::json!({ "status": "error", "message": msg }),
+                            );
+                        }
+                    }
                 }));
                 *state.backend.lock().expect("backend mutex") = Some(backend);
             } else {
@@ -692,6 +755,26 @@ async fn save_session(app: &tauri::AppHandle, conv: &session::Conversation) {
     let _ = tokio::task::spawn_blocking(move || {
         if let Err(e) = conv.save(&path) {
             tracing::warn!(?e, "failed to persist session");
+        }
+    })
+    .await;
+}
+
+/// Persist the world-state schema off the Tokio worker pool. Mirrors
+/// `save_session`: `WorldSchema::save` is atomic (temp + fsync + rename) but
+/// synchronous, so `spawn_blocking` keeps the async runtime free. Called by
+/// Component D's delta-completion path after a successful `apply_delta`.
+#[allow(dead_code)] // consumed by Component D's post-turn delta fire (pending)
+async fn save_schema(app: &tauri::AppHandle, schema: &schema::WorldSchema) {
+    use tauri::Manager;
+    let Some(data_dir) = app.path().app_data_dir().ok() else {
+        return;
+    };
+    let path = data_dir.join("world_schema.json");
+    let schema = schema.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Err(e) = schema.save(&path) {
+            tracing::warn!(?e, "failed to persist world schema");
         }
     })
     .await;
