@@ -1,4 +1,12 @@
-import "./style.css";
+// DORMANT — UI/UX rewrite (Aurora Core shell, 2026-07-15).
+// This module holds the chat + memory-panel + schema-panel Tauri glue from the
+// temporary chat-app shell. The new index.html references styles.css +
+// script.js (a pure, import-free OS shell) and does NOT import this file, so
+// Vite never compiles it. It is preserved verbatim for re-wiring once the new
+// UI surfaces for chat/memory/schema exist. The import below is kept valid
+// (renamed style.css → styles.css) so a future re-import doesn't hit a dead
+// path on line 1 — pure housekeeping, no logic touched.
+import "./styles.css";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 

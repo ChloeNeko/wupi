@@ -4,64 +4,140 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>WUPI OS</title>
+    <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <div id="app">
-      <header class="topbar">
-        <span class="brand">🐾 WUPI OS</span>
-        <div class="topbar-right">
-          <button id="schema-toggle" class="memory-toggle" type="button" title="Schema delta debug panel" aria-label="Toggle schema debug panel">🌍</button>
-          <button id="memory-toggle" class="memory-toggle" type="button" title="Memory debug panel" aria-label="Toggle memory debug panel">🧠</button>
-          <span id="status" class="status">starting…</span>
-        </div>
-      </header>
-
-      <main id="chat" class="chat"></main>
-
-      <section id="schema-debug" class="memory-debug hidden">
-        <div class="memory-debug-head">
-          <span class="memory-debug-title">schema delta (synthetic)</span>
-          <button id="schema-debug-close" class="memory-debug-close" type="button" aria-label="Close schema debug panel">×</button>
-        </div>
-        <div class="schema-debug-query">
-          <textarea id="schema-debug-user" class="schema-exchange" rows="2" placeholder="synthetic user turn…" autocomplete="off"></textarea>
-          <textarea id="schema-debug-asst" class="schema-exchange" rows="4" placeholder="synthetic assistant turn…" autocomplete="off"></textarea>
-          <div class="schema-debug-controls">
-            <label class="schema-debug-apply"><input id="schema-debug-apply" type="checkbox" checked /> apply delta</label>
-            <button id="schema-debug-run" type="button">run delta</button>
-          </div>
-        </div>
-        <div id="schema-debug-results" class="memory-debug-results"></div>
-      </section>
-
-      <section id="memory-debug" class="memory-debug hidden">
-        <div class="memory-debug-head">
-          <span class="memory-debug-title">memory retrieval</span>
-          <button id="memory-debug-close" class="memory-debug-close" type="button" aria-label="Close memory debug panel">×</button>
-        </div>
-        <div class="memory-debug-query">
-          <input id="memory-debug-input" type="text" placeholder="query the memory engine…" autocomplete="off" />
-          <button id="memory-debug-run" type="button">search</button>
-          <label class="memory-debug-floor" title="Override the dense cosine floor for this query (live calibration). Leave blank to use the compiled default.">
-            <span>cos ≥</span>
-            <input id="memory-debug-floor" type="number" step="0.05" min="0" max="1" placeholder="0.25" />
-          </label>
-        </div>
-        <div id="memory-debug-results" class="memory-debug-results"></div>
-      </section>
-
-      <footer class="composer">
-        <textarea
-          id="input"
-          class="input"
-          rows="1"
-          placeholder="Ask Wupi something…"
-          autocomplete="off"
-        ></textarea>
-        <button id="send" class="send" type="button">Send</button>
-        <button id="stop" class="stop hidden" type="button">Stop</button>
-      </footer>
+    <!-- ── Visual layers (lowest z) ────────────────────────────── -->
+    <!-- Aurora borealis: slow-drifting pastel radial gradients. Pure CSS,
+         pointer-events:none so it never intercepts the UI. -->
+    <div id="aurora" aria-hidden="true">
+      <span class="aurora-blob blob-pink"></span>
+      <span class="aurora-blob blob-magenta"></span>
+      <span class="aurora-blob blob-purple"></span>
+      <span class="aurora-blob blob-haze"></span>
     </div>
-    <script type="module" src="/main.ts"></script>
+
+    <!-- Sakura petals: full-screen <canvas>, semi-translucent, drifting down.
+         Drawn above the aurora but below all chrome; pointer-events:none. -->
+    <canvas id="petals" aria-hidden="true"></canvas>
+
+    <!-- ── Component 3: The desktop canvas ─────────────────────── -->
+    <!-- Floating windows are spawned into #windows. Starts empty per spec. -->
+    <div id="desktop" aria-label="Desktop">
+      <div id="windows"></div>
+    </div>
+
+    <!-- ── Component 1: The Top Glass Bar ──────────────────────── -->
+    <header id="topbar" role="banner">
+      <div class="topbar-left">
+        <!-- Glowing paw (inline SVG — no external asset, fully self-contained) -->
+        <svg class="paw" viewBox="0 0 64 64" width="26" height="26" aria-hidden="true">
+          <g class="paw-toes">
+            <ellipse cx="16" cy="18" rx="7" ry="9" />
+            <ellipse cx="32" cy="13" rx="7" ry="9.5" />
+            <ellipse cx="48" cy="18" rx="7" ry="9" />
+            <ellipse cx="8"  cy="32" rx="6" ry="8" />
+            <ellipse cx="56" cy="32" rx="6" ry="8" />
+          </g>
+          <path class="paw-pad" d="M32 31c-9 0-16 7-16 15 0 6 5 9 11 9 3 0 5-1 9-1s6 1 9 1c6 0 11-3 11-9 0-8-7-15-16-15z" />
+        </svg>
+      </div>
+
+      <div class="topbar-center">
+        <span class="brand">WUPI OS</span>
+      </div>
+
+      <div class="topbar-right">
+        <!-- System status icons: minimalist, icon-only (no percentage text). -->
+        <div class="sys-icons" aria-hidden="true">
+          <!-- Wi-Fi -->
+          <svg class="sys-icon" viewBox="0 0 24 24" width="17" height="17">
+            <path d="M12 20a2 2 0 1 0 0-4 2 2 0 0 0 0 4z"/>
+            <path class="sys-stroke" d="M6.3 13.3a8 8 0 0 1 11.4 0M3.4 10.4a12 12 0 0 1 17.2 0M.5 7.5a16 16 0 0 1 23 0"/>
+          </svg>
+          <!-- Bluetooth -->
+          <svg class="sys-icon" viewBox="0 0 24 24" width="15" height="15">
+            <path class="sys-stroke" d="M8 8l8 8-4 3V5l4 3-8 8"/>
+          </svg>
+          <!-- Battery (icon only, no fill text) -->
+          <svg class="sys-icon" viewBox="0 0 24 24" width="22" height="17">
+            <rect class="sys-stroke" x="1.5" y="6.5" width="18" height="11" rx="2"/>
+            <rect class="batt-fill" x="3.5" y="8.5" width="13" height="7" rx="1"/>
+            <rect x="20.5" y="9.5" width="2" height="5" rx="1"/>
+          </svg>
+        </div>
+
+        <!-- Stacked clock: time above, full date below. -->
+        <div class="clock" aria-live="off">
+          <span id="clock-time" class="clock-time">--:-- --</span>
+          <span id="clock-date" class="clock-date">———</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- ── Component 2: The Hidden Magnification Dock ─────────── -->
+    <nav id="dock-zone" aria-label="Application dock zone"><!-- hover trigger --></nav>
+    <nav id="dock" role="navigation" aria-label="Application dock">
+      <button class="dock-app" type="button" data-app="wupi" title="WUPI">
+        <svg class="dock-svg" viewBox="0 0 64 64" aria-hidden="true">
+          <ellipse cx="16" cy="18" rx="7" ry="9"/><ellipse cx="32" cy="13" rx="7" ry="9.5"/>
+          <ellipse cx="48" cy="18" rx="7" ry="9"/><ellipse cx="8"  cy="32" rx="6" ry="8"/>
+          <ellipse cx="56" cy="32" rx="6" ry="8"/>
+          <path d="M32 31c-9 0-16 7-16 15 0 6 5 9 11 9 3 0 5-1 9-1s6 1 9 1c6 0 11-3 11-9 0-8-7-15-16-15z"/>
+        </svg>
+        <span class="dock-label">WUPI</span>
+      </button>
+
+      <button class="dock-app" type="button" data-app="terminal" title="Terminal">
+        <svg class="dock-svg" viewBox="0 0 24 24" aria-hidden="true">
+          <path class="sys-stroke" d="M3 4h18v16H3z"/>
+          <path d="M6 9l3 3-3 3M11 15h5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span class="dock-label">Terminal</span>
+      </button>
+
+      <button class="dock-app" type="button" data-app="codex" title="Codex">
+        <svg class="dock-svg" viewBox="0 0 24 24" aria-hidden="true">
+          <path class="sys-stroke" d="M4 4h6a2 2 0 0 1 2 2v14a1.5 1.5 0 0 0-1.5-1.5H4z"/>
+          <path class="sys-stroke" d="M20 4h-6a2 2 0 0 0-2 2v14a1.5 1.5 0 0 1 1.5-1.5H20z"/>
+        </svg>
+        <span class="dock-label">Codex</span>
+      </button>
+
+      <span class="dock-sep" aria-hidden="true"></span>
+
+      <button class="dock-app dock-all" type="button" data-app="allapps" title="All Apps">
+        <svg class="dock-svg" viewBox="0 0 24 24" aria-hidden="true">
+          <!-- grid of tiny paw prints -->
+          <g><ellipse cx="5" cy="5" rx="1.2" ry="1.6"/><ellipse cx="8" cy="4.2" rx="1.2" ry="1.7"/><ellipse cx="11" cy="5" rx="1.2" ry="1.6"/><path d="M8 6.4c-1.6 0-2.8 1.2-2.8 2.6 0 1 .9 1.5 1.9 1.5h1.8c1 0 1.9-.5 1.9-1.5 0-1.4-1.2-2.6-2.8-2.6z"/></g>
+          <g transform="translate(10 0)"><ellipse cx="5" cy="5" rx="1.2" ry="1.6"/><ellipse cx="8" cy="4.2" rx="1.2" ry="1.7"/><ellipse cx="11" cy="5" rx="1.2" ry="1.6"/><path d="M8 6.4c-1.6 0-2.8 1.2-2.8 2.6 0 1 .9 1.5 1.9 1.5h1.8c1 0 1.9-.5 1.9-1.5 0-1.4-1.2-2.6-2.8-2.6z"/></g>
+          <g transform="translate(0 9)"><ellipse cx="5" cy="5" rx="1.2" ry="1.6"/><ellipse cx="8" cy="4.2" rx="1.2" ry="1.7"/><ellipse cx="11" cy="5" rx="1.2" ry="1.6"/><path d="M8 6.4c-1.6 0-2.8 1.2-2.8 2.6 0 1 .9 1.5 1.9 1.5h1.8c1 0 1.9-.5 1.9-1.5 0-1.4-1.2-2.6-2.8-2.6z"/></g>
+          <g transform="translate(10 9)"><ellipse cx="5" cy="5" rx="1.2" ry="1.6"/><ellipse cx="8" cy="4.2" rx="1.2" ry="1.7"/><ellipse cx="11" cy="5" rx="1.2" ry="1.6"/><path d="M8 6.4c-1.6 0-2.8 1.2-2.8 2.6 0 1 .9 1.5 1.9 1.5h1.8c1 0 1.9-.5 1.9-1.5 0-1.4-1.2-2.6-2.8-2.6z"/></g>
+        </svg>
+        <span class="dock-label">All Apps</span>
+      </button>
+    </nav>
+
+    <!-- ── Component 3: Hidden App-Window template ────────────── -->
+    <!-- Cloned into #windows by openWindow(). Stays in <template> so it renders
+         nothing until instantiated. -->
+    <template id="window-template">
+      <section class="window" role="dialog" aria-label="Application window">
+        <header class="window-titlebar">
+          <span class="window-title">Window</span>
+          <div class="window-controls">
+            <button class="window-close" type="button" aria-label="Close window">×</button>
+          </div>
+        </header>
+        <div class="window-body"></div>
+      </section>
+    </template>
+
+    <!-- Pure, import-free script as an ES module (auto-deferred, so no `defer`
+         attribute). Bundled + hashed by Vite, runs via the dev server
+         (localhost:1420) and the Tauri webview (dev + production build). No
+         Tauri dependency in this shell — the preserved main.ts
+         (chat/memory/schema glue) stays dormant for re-wiring later. -->
+    <script type="module" src="script.js"></script>
   </body>
 </html>
