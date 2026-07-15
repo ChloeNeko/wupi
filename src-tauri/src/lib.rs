@@ -13,6 +13,7 @@ pub mod schema_engine;
 pub mod session;
 pub mod sim_card;
 pub mod stream_filter;
+pub mod user_profile;
 
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
@@ -73,6 +74,13 @@ pub struct AppState {
     /// `get_intro` reads its randomized introduction list. Always `Some`
     /// after `setup()` (the loader falls back to a stub, never `None`).
     pub active_card: Arc<std::sync::OnceLock<sim_card::SimCard>>,
+    /// The resolved path to the operator's profile (`cards/Operator.xml`),
+    /// filled once in `setup()`. `None` when no profile resolved (the common
+    /// case until the operator authors one). The PATH is stable; the CONTENT
+    /// is re-read fresh each `chat_send` (hot-reload — see `user_profile`).
+    /// Lock-free reads after `setup`. Held as `Option<PathBuf>` so a missing
+    /// profile is `None`, distinct from "not yet resolved."
+    pub operator_path: Arc<std::sync::OnceLock<Option<std::path::PathBuf>>>,
 }
 
 impl AppState {
@@ -90,6 +98,7 @@ impl AppState {
                 memory::WUPI_OS_CARD_ID.to_owned(),
             )),
             active_card: Arc::new(std::sync::OnceLock::new()),
+            operator_path: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
@@ -168,6 +177,22 @@ pub fn run() {
                 }
             };
             let _ = state.active_card.set(card);
+
+            // ── Operator profile (User Profile system) ───────────────────────
+            // Resolve the operator's profile path (`cards/Operator.xml`) once
+            // and cache it. The CONTENT is re-read fresh each chat_send
+            // (hot-reload: a live edit takes effect on the very next message,
+            // no reboot); only the PATH is stable. `None` when no profile
+            // exists — the common case until the operator authors one. Wupi
+            // then runs without a <user_profile> section (graceful: she just
+            // doesn't know who she's talking to until the file exists).
+            let operator = resolve_operator_path(app.handle());
+            if let Some(p) = &operator {
+                tracing::info!("resolved operator profile: {}", p.display());
+            } else {
+                tracing::info!("no Operator.xml found; running without a user profile");
+            }
+            let _ = state.operator_path.set(operator);
 
             let model_path = resolve_model_path(app.handle());
             if let Some(path) = model_path {
@@ -527,6 +552,54 @@ fn resolve_card_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     None
 }
 
+/// Resolve the operator's profile (`cards/Operator.xml`) by walking the same
+/// candidate-dir list as [`resolve_card_path`], joining `"cards"`, and exact-
+/// matching `Operator.xml` (case-insensitive). Sibling to Wupi.sim in the same
+/// dir. Returns `None` when no profile is found — the common case until the
+/// operator authors one; the caller runs without a `<user_profile>` section
+/// (graceful, not a crash).
+///
+/// Only the PATH is resolved here (once, in setup). The CONTENT is re-read
+/// fresh each `chat_send` via `user_profile::load` — that's the hot-reload
+/// mechanism (live edits take effect on the next message, no reboot, no
+/// watcher thread).
+fn resolve_operator_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    use tauri::Manager;
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(d) = app.path().resource_dir().ok() {
+        candidates.push(d.join("cards"));
+    }
+    if let Some(exe) = std::env::current_exe().ok() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("cards"));
+            if let Some(grand) = parent.parent().and_then(|g| g.parent()) {
+                candidates.push(grand.join("cards"));
+            }
+            if let Some(gg) = parent.parent().and_then(|g| g.parent()).and_then(|g| g.parent()) {
+                candidates.push(gg.join("cards"));
+            }
+        }
+    }
+    if let Some(data) = app.path().app_data_dir().ok() {
+        candidates.push(data.join("cards"));
+    }
+
+    for dir in &candidates {
+        if !dir.exists() {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().to_lowercase() == "operator.xml" {
+                    return Some(entry.path());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Resolve the `codex/` directory (Codex v1, 2026-07-14). Mirrors
 /// [`resolve_card_path`] — same 5-candidate walk — but joins `"codex"` and
 /// returns the *directory* (not a single file), since the codex dir holds a
@@ -672,8 +745,18 @@ async fn chat_send(
         .active_card
         .get()
         .map(|c| c.render_for_prompt());
+    // Operator profile: re-read FRESH from disk each turn (hot-reload). The
+    // path is cached (stable); only the content refreshes — so a live edit to
+    // Operator.xml takes effect on the very next message. `load` returns None
+    // on missing/malformed → section silently suppressed (graceful). Like the
+    // persona, the rendered text is byte-identical across turns until the file
+    // is edited → no cold-reset (cache-friendly, Prime Directive).
+    let user_profile = user_profile::load(
+        state.operator_path.get().and_then(std::option::Option::as_deref),
+    )
+    .map(|p| p.render_for_prompt());
     let system_prompt =
-        prompts::build_system_content(&settings, persona.as_deref());
+        prompts::build_system_content(&settings, persona.as_deref(), user_profile.as_deref());
 
     // §2F eager-prefill sliding window (2026-07-13): cap visible history to
     // the last VISIBLE_WINDOW messages regardless of token budget. Memory (M)
