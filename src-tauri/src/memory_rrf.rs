@@ -61,7 +61,7 @@
 //! noise overwhelm the top. It is NOT the final `limit` — those are
 //! independent knobs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::memory::{DebugScores, MemoryId, RankedMemory};
 
@@ -96,6 +96,26 @@ pub const RRF_K: u32 = 60;
 /// The 🧠 debug panel's `dense_floor` override (`cos ≥`) lets you test
 /// alternatives live without a rebuild (AGENTS.md §2M Checkpoint E).
 pub const DENSE_COSINE_FLOOR: f32 = 0.25;
+
+/// The dense cosine floor for Codex (authored reference lore) entries.
+///
+/// Codex entries are static, declarative technical documents. Their embedding
+/// style is fundamentally different from conversational episodic memory:
+/// reference prose doesn't use the same vocabulary, filler, or sentence
+/// structure as chat turns. bge-small (and asymmetric retrieval models in
+/// general) score these declarative docs lower on dense cosine even when they
+/// are 100% relevant — a textbook passage about "Simulation Card XML format"
+/// doesn't embed like a chat turn asking "how do I write a sim card?", even
+/// though they're the same topic. This is standard domain asymmetry in RAG
+/// retrieval (Codex v1, 2026-07-14, §2P).
+///
+/// Expecting technical reference prose to clear the same 0.25 hurdle as casual
+/// chat history is like expecting a textbook to read like a DM. The lower
+/// floor for Codex is the principled fix: per-domain flooring is best-
+/// practice RAG design, not a hack. The 🧠 panel's `cos ≥` override does NOT
+/// affect this — it overrides the EPISODIC floor only; the Codex floor is
+/// applied independently in `fuse_scored_rrf` via the `codex_ids` set.
+pub const CODEX_DENSE_FLOOR: f32 = 0.10;
 
 /// Per-list weights for weighted RRF. Both default to 0.5 (standard RRF —
 /// equal contribution). Tilting `dense` higher biases toward semantic
@@ -136,10 +156,22 @@ impl Default for FusionWeights {
 /// An id appearing in BOTH (floored) lists gets both score contributions
 /// summed — this is the whole point of fusion: a memory that matches on both
 /// axes deserves to outrank one that matches on only one.
+///
+/// # Per-class dense floor (Codex v1, §2P)
+///
+/// `codex_ids` carries the ids of Codex (authored reference lore) entries.
+/// Codex entries are declarative technical documents whose embedding style
+/// differs fundamentally from conversational episodic memory — bge-small
+/// scores them lower on dense cosine even at 100% relevance (domain
+/// asymmetry). Entries in `codex_ids` are floored on `codex_floor` instead
+/// of `dense_cosine_floor`. Pass an empty set when no Codex entries exist
+/// (the common case before Codex v1, or when the query is purely episodic).
 pub fn fuse_scored_rrf(
     sparse: &[(MemoryId, f32)],
     dense: &[(MemoryId, f32)],
     dense_cosine_floor: f32,
+    codex_ids: &HashSet<MemoryId>,
+    codex_floor: f32,
     weights: FusionWeights,
     limit: usize,
 ) -> Vec<RankedMemory> {
@@ -147,11 +179,21 @@ pub fn fuse_scored_rrf(
     // distance = 1 - cosine  →  cosine = 1 - distance. Keep cosine >= floor.
     // The rejected candidates never enter the fusion map, so they contribute
     // nothing to any id's score. This is the cross-topic rejection gate.
+    //
+    // PER-CLASS FLOOR: Codex entries (in `codex_ids`) use the lower
+    // `codex_floor`; everything else uses `dense_cosine_floor`. This is the
+    // domain-asymmetry fix (§2P) — declarative reference docs embed lower
+    // than conversational turns at equal relevance, so they get a lower bar.
     let dense_survivors: Vec<(MemoryId, f32)> = dense
         .iter()
-        .filter(|(_, distance)| {
+        .filter(|(id, distance)| {
             let cosine = 1.0 - distance;
-            cosine >= dense_cosine_floor
+            let floor = if codex_ids.contains(id) {
+                codex_floor
+            } else {
+                dense_cosine_floor
+            };
+            cosine >= floor
         })
         .cloned()
         .collect();
@@ -253,14 +295,14 @@ mod tests {
 
     #[test]
     fn empty_inputs_return_empty() {
-        let out = fuse_scored_rrf(&[], &[], 0.40, FusionWeights::default(), 10);
+        let out = fuse_scored_rrf(&[], &[], 0.40, &HashSet::new(), CODEX_DENSE_FLOOR, FusionWeights::default(), 10);
         assert!(out.is_empty(), "no inputs → no results");
     }
 
     #[test]
     fn one_empty_list_passes_the_other_through() {
         let s = vec![sparse(10, 1.0), sparse(20, 0.9), sparse(30, 0.8)];
-        let out = fuse_scored_rrf(&s, &[], 0.40, FusionWeights::default(), 10);
+        let out = fuse_scored_rrf(&s, &[], 0.40, &HashSet::new(), CODEX_DENSE_FLOOR, FusionWeights::default(), 10);
         assert_eq!(ids(&out), vec![10, 20, 30]);
     }
 
@@ -269,7 +311,7 @@ mod tests {
         // Three dense candidates: cosine 0.9 (keep), 0.5 (keep), 0.2 (drop).
         // Floor 0.40 → only the first two survive.
         let d = vec![dense(1, 0.9), dense(2, 0.5), dense(3, 0.2)];
-        let out = fuse_scored_rrf(&[], &d, 0.40, FusionWeights::default(), 10);
+        let out = fuse_scored_rrf(&[], &d, 0.40, &HashSet::new(), CODEX_DENSE_FLOOR, FusionWeights::default(), 10);
         assert_eq!(ids(&out), vec![1, 2], "below-floor candidate must be rejected");
         // The dropped one (id 3) must not appear anywhere.
         assert!(!ids(&out).contains(&3));
@@ -278,7 +320,7 @@ mod tests {
     #[test]
     fn dense_floor_records_cosine_on_survivors_only() {
         let d = vec![dense(1, 0.9), dense(2, 0.2)];
-        let out = fuse_scored_rrf(&[], &d, 0.40, FusionWeights::default(), 10);
+        let out = fuse_scored_rrf(&[], &d, 0.40, &HashSet::new(), CODEX_DENSE_FLOOR, FusionWeights::default(), 10);
         // Survivor carries its raw cosine; the rejected one isn't in the output.
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].entry.id, 1);
@@ -289,13 +331,35 @@ mod tests {
     }
 
     #[test]
+    fn codex_floor_lets_codex_survive_below_episodic_floor() {
+        // Two dense candidates at cosine 0.15 (below episodic floor 0.25, above
+        // codex floor 0.10). id=1 is Codex; id=2 is episodic.
+        // - id=1 (Codex) → floor 0.10 → 0.15 >= 0.10 → SURVIVES.
+        // - id=2 (episodic) → floor 0.25 → 0.15 < 0.25 → REJECTED.
+        let d = vec![dense(1, 0.15), dense(2, 0.15)];
+        let codex_ids: HashSet<MemoryId> = [1].into_iter().collect();
+        let out = fuse_scored_rrf(&[], &d, 0.25, &codex_ids, 0.10, FusionWeights::default(), 10);
+        assert_eq!(ids(&out), vec![1], "only the Codex entry survives");
+    }
+
+    #[test]
+    fn codex_floor_still_rejects_garbage() {
+        // A Codex entry at cosine 0.05 — below even the Codex floor (0.10).
+        // It must still be rejected; the lower floor is not zero.
+        let d = vec![dense(1, 0.05)];
+        let codex_ids: HashSet<MemoryId> = [1].into_iter().collect();
+        let out = fuse_scored_rrf(&[], &d, 0.25, &codex_ids, 0.10, FusionWeights::default(), 10);
+        assert!(out.is_empty(), "Codex entry below codex floor must be rejected");
+    }
+
+    #[test]
     fn id_in_both_lists_outranks_id_in_one() {
         // id=5 is rank-1 in BOTH lists → score = (0.5+0.5)/(60+1) ≈ 0.0164.
         // Every other id is in only one list. With equal weights the overlap
         // must dominate.
         let s = vec![sparse(5, 1.0), sparse(1, 0.9), sparse(2, 0.8)];
         let d = vec![dense(5, 0.9), dense(9, 0.8), dense(8, 0.7)];
-        let out = fuse_scored_rrf(&s, &d, 0.40, FusionWeights::default(), 10);
+        let out = fuse_scored_rrf(&s, &d, 0.40, &HashSet::new(), CODEX_DENSE_FLOOR, FusionWeights::default(), 10);
         assert_eq!(out[0].entry.id, 5, "overlap must dominate");
         assert!(
             out[0].score > out[1].score,
@@ -313,13 +377,15 @@ mod tests {
         let s = vec![sparse(1, 1.0)];
         let d = vec![dense(2, 0.9)];
 
-        let equal = fuse_scored_rrf(&s, &d, 0.40, FusionWeights::default(), 10);
+        let equal = fuse_scored_rrf(&s, &d, 0.40, &HashSet::new(), CODEX_DENSE_FLOOR, FusionWeights::default(), 10);
         assert_eq!(ids(&equal), vec![1, 2], "equal weights → tie-break by id");
 
         let dense_heavy = fuse_scored_rrf(
             &s,
             &d,
             0.40,
+            &HashSet::new(),
+            CODEX_DENSE_FLOOR,
             FusionWeights { sparse: 0.1, dense: 0.9 },
             10,
         );
@@ -330,7 +396,7 @@ mod tests {
     fn limit_truncates() {
         let s: Vec<_> = (1..=5).map(|i| sparse(i, 1.0 / i as f32)).collect();
         let d: Vec<_> = (6..=10).map(|i| dense(i, 0.9 - i as f32 * 0.01)).collect();
-        let out = fuse_scored_rrf(&s, &d, 0.40, FusionWeights::default(), 3);
+        let out = fuse_scored_rrf(&s, &d, 0.40, &HashSet::new(), CODEX_DENSE_FLOOR, FusionWeights::default(), 3);
         assert_eq!(out.len(), 3, "limit must truncate the result");
     }
 
@@ -340,7 +406,7 @@ mod tests {
         // weights (0.5 each), a single sparse-list rank-1 id contributes
         // 0.5 / 61.
         let s = vec![sparse(1, 1.0)];
-        let out = fuse_scored_rrf(&s, &[], 0.40, FusionWeights::default(), 10);
+        let out = fuse_scored_rrf(&s, &[], 0.40, &HashSet::new(), CODEX_DENSE_FLOOR, FusionWeights::default(), 10);
         let expected = 0.5 / (RRF_K as f32 + 1.0);
         let got = out[0].score;
         assert!(
@@ -358,7 +424,7 @@ mod tests {
     fn scores_descend_monotonically() {
         let s = vec![sparse(1, 1.0), sparse(2, 0.9), sparse(3, 0.8), sparse(4, 0.7)];
         let d = vec![dense(5, 0.9), dense(1, 0.85), dense(6, 0.8), dense(2, 0.75)];
-        let out = fuse_scored_rrf(&s, &d, 0.40, FusionWeights::default(), 10);
+        let out = fuse_scored_rrf(&s, &d, 0.40, &HashSet::new(), CODEX_DENSE_FLOOR, FusionWeights::default(), 10);
         for w in out.windows(2) {
             assert!(
                 w[0].score >= w[1].score,
@@ -374,7 +440,7 @@ mod tests {
         // An id surfaced only via sparse must have None dense_cosine/rank.
         let s = vec![sparse(7, 1.0)];
         let d = vec![dense(8, 0.9)];
-        let out = fuse_scored_rrf(&s, &d, 0.40, FusionWeights::default(), 10);
+        let out = fuse_scored_rrf(&s, &d, 0.40, &HashSet::new(), CODEX_DENSE_FLOOR, FusionWeights::default(), 10);
         let seven = out.iter().find(|r| r.entry.id == 7).unwrap();
         assert!(seven.debug.dense_cosine.is_none());
         assert!(seven.debug.dense_rank.is_none());

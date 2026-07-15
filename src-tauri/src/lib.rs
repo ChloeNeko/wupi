@@ -1,4 +1,5 @@
 pub mod chat_format;
+pub mod codex;
 pub mod engine;
 pub mod kv_buffer;
 pub mod llm;
@@ -302,6 +303,37 @@ pub fn run() {
                 Ok(engine) => {
                     let _ = state.memory.set(Arc::new(engine));
                     tracing::info!(db = %memory_db_path.display(), "memory engine initialized");
+
+                    // ── Codex seed (Codex v1, 2026-07-14) ──────────────────────
+                    // Reconcile authored `.md` files in `codex/` against the
+                    // Codex-tagged entries already stored in memory.sqlite.
+                    // Idempotent (hash-based): re-runs against an unchanged
+                    // source set do zero writes. Best-effort — a failed seed
+                    // is logged-and-dropped, never fatal (same contract as the
+                    // embedder fallback). Runs synchronously here (setup is
+                    // allowed to block — it already blocks on the embedder
+                    // readiness channel above).
+                    if let Some(codex_dir) = resolve_codex_dir(app.handle()) {
+                        if let Some(engine) = state.memory.get() {
+                            match tauri::async_runtime::block_on(
+                                codex::seed_codex(engine, &codex_dir, memory::WUPI_OS_CARD_ID),
+                            ) {
+                                Ok(report) => tracing::info!(
+                                    seeded = report.seeded,
+                                    updated = report.updated,
+                                    purged = report.purged,
+                                    unchanged = report.unchanged,
+                                    "codex seeded"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    error = %format!("{e:#}"),
+                                    "codex seed failed; continuing without authored lore"
+                                ),
+                            }
+                        }
+                    } else {
+                        tracing::info!("no codex/ dir found; skipping codex seed");
+                    }
                 }
                 Err(e) => {
                     // DB open failure is fatal for memory but must not kill
@@ -495,6 +527,41 @@ fn resolve_card_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     None
 }
 
+/// Resolve the `codex/` directory (Codex v1, 2026-07-14). Mirrors
+/// [`resolve_card_path`] — same 5-candidate walk — but joins `"codex"` and
+/// returns the *directory* (not a single file), since the codex dir holds a
+/// set of `*.md` files. Returns `None` if no `codex/` dir exists in any
+/// candidate location (graceful — the Codex is optional; the seed loader
+/// treats a missing dir as "nothing to seed").
+fn resolve_codex_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(d) = app.path().resource_dir().ok() {
+        candidates.push(d.join("codex"));
+    }
+    if let Some(exe) = std::env::current_exe().ok() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("codex"));
+            if let Some(grand) = parent.parent().and_then(|g| g.parent()) {
+                candidates.push(grand.join("codex"));
+            }
+            if let Some(gg) = parent.parent().and_then(|g| g.parent()).and_then(|g| g.parent()) {
+                candidates.push(gg.join("codex"));
+            }
+        }
+    }
+    if let Some(data) = app.path().app_data_dir().ok() {
+        candidates.push(data.join("codex"));
+    }
+
+    for dir in &candidates {
+        if dir.is_dir() {
+            tracing::info!("resolved codex dir: {}", dir.display());
+            return Some(dir.clone());
+        }
+    }
+    None
+}
+
 #[tauri::command]
 async fn chat_send(
     text: String,
@@ -571,6 +638,17 @@ async fn chat_send(
             }
         }
     };
+
+    // ── Echo-skip signal (Codex v1, 2026-07-14) ──────────────────────────
+    // Capture BEFORE `memory_block` is moved into `.stream()` below. If the
+    // block contained a Codex reference, the post-turn archiver skips saving
+    // the assistant's reply (which would otherwise echo authored lore back
+    // into retrieval — the self-contamination loop, §2N landmine #5). The
+    // marker is shared with `render_memory_block` via `CODEX_FRAME_MARKER`.
+    let codex_was_injected = memory_block
+        .as_deref()
+        .map(|b| b.contains(memory::CODEX_FRAME_MARKER))
+        .unwrap_or(false);
 
     // ── World-state schema injection (Component D) ──────────────────────
     // Render the current schema into the inter-turn region as a sibling
@@ -678,6 +756,17 @@ async fn chat_send(
         // Salience flat 1.0 for v1 (the field is stored but unused by
         // retrieval today; a heuristic is a later concern). chunk_index stays
         // 0 (whole-message; no chunking yet).
+        //
+        // ── Echo-skip (Codex v1, 2026-07-14) ──────────────────────────────
+        // `codex_was_injected` was captured before `memory_block` was moved
+        // into `.stream()`. If true, skip archiving the assistant's reply —
+        // it's a paraphrase of authored Codex lore, and saving it would
+        // pollute retrieval with echoes of the Codex itself (the self-
+        // contamination loop, §2N landmine #5).
+        if codex_was_injected {
+            tracing::debug!("codex echo-skip: archiving suppressed (codex reference was injected this turn)");
+        }
+        if !codex_was_injected {
         if let Some(engine) = state.memory.get() {
             // The user message is the second-to-last (last is the assistant
             // turn we just appended). checked_sub(2) guards the cold-start
@@ -701,6 +790,7 @@ async fn chat_send(
                 }
             });
         }
+        } // end echo-skip gate (if !codex_was_injected)
     }
 
     // ── State-Delta fire (Component D) ──────────────────────────────────
