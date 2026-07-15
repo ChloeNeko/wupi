@@ -13,9 +13,11 @@
 }
 
 :root {
-  /* Void + aurora palette */
+  /* Void + aurora palette. --void-deep is the OS canvas base — it matches the
+     aurora's light-trail fade (rgba(2,1,17,…)) so the moving curtains leave
+     trails that dissolve into the screen material, not into a different hue. */
   --void: #06050c;
-  --void-deep: #030208;
+  --void-deep: #020111;
 
   /* Pastels */
   --pink: #ff9ecf;
@@ -58,6 +60,8 @@ body {
 
 body {
   font-family: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", sans-serif;
+  /* Deep night-sky base for the canvas aurora to glow against. A flat,
+     near-black blue — no gradients (the aurora is painted on canvas). */
   background: var(--void-deep);
   color: var(--text);
   -webkit-font-smoothing: antialiased;
@@ -70,75 +74,19 @@ button {
   color: inherit;
 }
 
-/* ── Layer 0: Aurora Borealis ──────────────────────────────────
-   Large soft radial-gradient blobs, slow GPU drift. Fixed full-screen,
-   pointer-events:none. Only transform/opacity animate (composited). */
-#aurora {
+/* ── Layer 0: Aurora Borealis (Canvas) ─────────────────────────
+   A realistic, flowing curtain of light painted onto #aurora-canvas by
+   script.js: multiple overlapping sine waves, additive ('lighter')
+   compositing, and a neon green/cyan glow via shadowBlur. The deep night
+   sky is the body background — NO CSS gradients are used for the aurora.
+   The canvas is the lowest layer; pointer-events:none so it never
+   intercepts the UI. */
+#aurora-canvas {
   position: fixed;
   inset: 0;
   z-index: var(--z-aurora);
-  overflow: hidden;
   pointer-events: none;
-  background:
-    radial-gradient(ellipse at 50% 120%, rgba(176, 140, 255, 0.10), transparent 55%),
-    radial-gradient(ellipse at 50% -10%, rgba(217, 107, 255, 0.06), transparent 50%);
-}
-
-.aurora-blob {
-  position: absolute;
   display: block;
-  border-radius: 50%;
-  filter: blur(60px);
-  opacity: 0.55;
-  will-change: transform;
-  mix-blend-mode: screen;
-}
-
-.blob-pink {
-  width: 60vw;
-  height: 60vw;
-  left: -10vw;
-  top: -15vw;
-  background: radial-gradient(circle, var(--pink) 0%, transparent 68%);
-  animation: drift-a 26s var(--ease) infinite alternate;
-}
-.blob-magenta {
-  width: 55vw;
-  height: 55vw;
-  right: -12vw;
-  top: 10vh;
-  background: radial-gradient(circle, var(--magenta) 0%, transparent 68%);
-  animation: drift-b 32s var(--ease) infinite alternate;
-}
-.blob-purple {
-  width: 65vw;
-  height: 65vw;
-  left: 15vw;
-  bottom: -25vw;
-  background: radial-gradient(circle, var(--purple) 0%, transparent 68%);
-  animation: drift-c 38s var(--ease) infinite alternate;
-}
-.blob-haze {
-  width: 80vw;
-  height: 50vh;
-  left: 10vw;
-  top: 35vh;
-  background: radial-gradient(ellipse, var(--pink-soft) 0%, transparent 70%);
-  opacity: 0.22;
-  animation: drift-d 44s var(--ease) infinite alternate;
-}
-
-@keyframes drift-a {
-  to { transform: translate3d(8vw, 6vh, 0) scale(1.15); }
-}
-@keyframes drift-b {
-  to { transform: translate3d(-10vw, 12vh, 0) scale(1.1) rotate(8deg); }
-}
-@keyframes drift-c {
-  to { transform: translate3d(12vw, -14vh, 0) scale(1.2); }
-}
-@keyframes drift-d {
-  to { transform: translate3d(-6vw, -8vh, 0) scale(1.08); }
 }
 
 /* ── Layer 1: Sakura petals canvas ───────────────────────────── */
@@ -186,13 +134,28 @@ button {
   min-width: 140px;
 }
 
-.paw {
-  filter: drop-shadow(0 0 6px rgba(255, 158, 207, 0.85))
-          drop-shadow(0 0 14px rgba(217, 107, 255, 0.5));
+/* ── Standalone geometric paw logo ──────────────────────────────
+   Raw inline SVG — no container, no border, no background, no drop shadow in
+   its resting state. Just the sharp polygonal facets floating on the void.
+   Scales up + blooms a pink drop-shadow on hover; presses in on :active. */
+.os-logo {
+  width: 35px;
+  height: 35px;
+  cursor: pointer;
+  outline: none;
+  transition: transform 0.2s var(--ease), filter 0.2s var(--ease);
 }
-.paw-toes,
-.paw-pad {
-  fill: var(--pink-soft);
+.os-logo:hover {
+  transform: scale(1.1);
+  filter: drop-shadow(0 0 8px rgba(233, 64, 87, 0.8));
+}
+.os-logo:active {
+  transform: scale(0.95);
+}
+/* Keyboard focus keeps the hover bloom so it's reachable without a mouse. */
+.os-logo:focus-visible {
+  transform: scale(1.1);
+  filter: drop-shadow(0 0 8px rgba(233, 64, 87, 0.8));
 }
 
 .topbar-center {
@@ -251,8 +214,18 @@ button {
   stroke-linecap: round;
   stroke-linejoin: round;
 }
-.batt-fill {
-  fill: rgba(255, 255, 255, 0.7);
+/* Battery fill — width set live by script.js (navigator.getBattery).
+   Green>50%, amber>20%, red below. */
+#battery-fill {
+  fill: #7cf28a;
+  width: 13px; /* overwritten by JS to reflect real level */
+  transition: width 0.4s var(--ease), fill 0.4s var(--ease);
+}
+#battery-fill.low {
+  fill: #ff6b6b;
+}
+#battery-fill.mid {
+  fill: #ffd166;
 }
 
 /* Stacked clock: time over date */
@@ -499,10 +472,10 @@ button {
 }
 
 /* ── Accessibility: reduced motion ─────────────────────────────
-   Honor the OS-level preference: freeze aurora drift, brand breathing,
-   and the petal canvas (script.js also pauses its rAF). */
+   Honor the OS-level preference: freeze brand breathing and window-in,
+   and snap dock transitions. The aurora + petal canvases also pause their
+   requestAnimationFrame loops in script.js when reduced motion is set. */
 @media (prefers-reduced-motion: reduce) {
-  .aurora-blob,
   .brand,
   .window {
     animation: none !important;
