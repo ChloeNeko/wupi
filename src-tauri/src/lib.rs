@@ -14,6 +14,7 @@ pub mod session;
 pub mod sim_card;
 pub mod stream_filter;
 pub mod system_menu;
+pub mod terminal;
 pub mod theme;
 pub mod user_profile;
 
@@ -138,6 +139,7 @@ pub fn run() {
     tracing::info!("=== WUPI OS starting ===");
     tauri::Builder::default()
         .manage(AppState::new())
+        .manage(terminal::new_registry())
         .setup(|app| {
             tracing::info!("setup hook entered");
             let data_dir = app
@@ -436,6 +438,11 @@ pub fn run() {
             system_menu::power_sleep_cmd,
             theme_get,
             theme_set,
+            terminal::terminal_create_window,
+            terminal::terminal_init,
+            terminal::terminal_input,
+            terminal::terminal_resize,
+            terminal::terminal_close,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

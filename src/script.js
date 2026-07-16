@@ -247,6 +247,16 @@ document.addEventListener('DOMContentLoaded', () => {
     invoke('power_sleep_cmd');
   });
 
+  // ── Paw menu: Terminal ──────────────────────────────────────────────────
+  // Opens (or focuses) the borderless glassmorphism terminal window. The
+  // window's own terminal.js then spawns the PTY via terminal_init.
+  document.querySelector('.terminal-item')?.addEventListener('click', () => {
+    closePawMenu();
+    invoke('terminal_create_window').catch((e) =>
+      console.error('[Wupi] terminal_create_window failed', e)
+    );
+  });
+
   // ── Theme cascade (paw → theme → color code) ────────────────────────────
   // Three aligned panels. Clicking Theme opens panel 2; clicking a theme opens
   // panel 3 (color codes); clicking a color code persists + applies live. The

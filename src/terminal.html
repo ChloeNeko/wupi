@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WUPI Terminal</title>
+    <link rel="stylesheet" href="terminal.css">
+    <!-- Drag region: the whole window is draggable by this top strip. -->
+</head>
+<body data-tauri-drag-region>
+    <!-- Magenta X — hides the window (does NOT kill the PTY). -->
+    <button class="term-close" id="termClose" aria-label="Hide terminal" title="Hide (shell keeps running)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+        </svg>
+    </button>
+
+    <div id="term" class="term-mount"></div>
+
+    <script type="module" src="terminal.js"></script>
+</body>
+</html>
