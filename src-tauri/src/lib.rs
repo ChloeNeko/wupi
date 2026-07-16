@@ -457,6 +457,7 @@ pub fn run() {
             hardware::bluetooth::bluetooth_get_state,
             hardware::bluetooth::bluetooth_toggle_radio,
             hardware::bluetooth::bluetooth_list_devices,
+            hardware::bluetooth::bluetooth_discover,
             hardware::bluetooth::bluetooth_pair,
         ])
         .run(tauri::generate_context!())

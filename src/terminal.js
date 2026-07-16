@@ -34,10 +34,10 @@ const term = new Terminal({
   cursorStyle: 'bar',
   allowProposedApi: true,
   theme: {
-    background: 'rgba(0,0,0,0)',
+    background: '#1a0a2e',
     foreground: '#f3e9ff',
     cursor: '#ff66b2',
-    cursorAccent: 'rgba(0,0,0,0)',
+    cursorAccent: '#1a0a2e',
     selectionBackground: 'rgba(181, 52, 250, 0.35)',
     black:   '#1a0f2e',
     red:     '#ff6b9d',

@@ -92,8 +92,13 @@ pub fn terminal_create_window<R: Runtime>(
         .inner_size(900.0, 560.0)
         .min_inner_size(420.0, 280.0)
         .decorations(false)
-        .transparent(true)
-        .shadow(false)
+        // NOT transparent: per-pixel window transparency on Windows + WebView2
+        // can render the window completely invisible (nothing paints, or the
+        // GPU compositor drops the alpha). The glassmorphism comes from the
+        // body's CSS background + backdrop-filter, which needs a normal
+        // (opaque) window to composite against. Keep shadow on so the window
+        // has a visible edge against the desktop.
+        .shadow(true)
         .resizable(true)
         .always_on_top(true)
         .center()

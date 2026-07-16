@@ -263,13 +263,13 @@ html, body {
    NOTE: must outrank `.menu-container .dropdown-menu { left: 0 }` in
    specificity, hence the explicit `.menu-container .cascade-panel` selectors. */
 .menu-container .cascade-panel {
-    left: 178px;
+    left: 196px;
     top: 56px;
 }
 
 .menu-container #colorCodePanel {
     /* Second cascade level: one panel-width further right than the theme panel. */
-    left: 356px;
+    left: 392px;
 }
 
 /* Theme/color-code swatches */

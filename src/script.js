@@ -182,9 +182,12 @@ listen('canvas-resume', () => { startLoop(); }).catch(() => {});
 
 animate();
 
-document.addEventListener('DOMContentLoaded', () => {
-  const pawBtn = document.getElementById('pawBtn');
-  const dropdownMenu = document.getElementById('dropdownMenu');
+// NOTE: this file is loaded as type="module", which defers execution until
+// after the DOM is parsed — so DOMContentLoaded has ALREADY fired by the time
+// we run. Do NOT wrap the wiring in a DOMContentLoaded listener (it would
+// never execute). The elements below all exist at module-eval time.
+const pawBtn = document.getElementById('pawBtn');
+const dropdownMenu = document.getElementById('dropdownMenu');
   const clockBtn = document.getElementById('clockBtn');
   const clockDropdownMenu = document.getElementById('clockDropdownMenu');
   const digitalTimeEl = document.getElementById('digitalTime');
@@ -462,6 +465,63 @@ document.addEventListener('DOMContentLoaded', () => {
     }, 0);
   });
 
+  // "Add Device" — discover in-range unpaired BT devices and list them under
+  // the button. Clicking one calls bluetooth_pair (Windows shows the native
+  // PIN/confirmation UI for devices that need it).
+  document.getElementById('btAddBtn')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const existing = bluetoothDropdownMenu.querySelector('.bt-discover-list');
+    if (existing) {
+      existing.remove();
+      return;
+    }
+    const list = document.createElement('div');
+    list.className = 'bt-discover-list';
+    const loading = document.createElement('div');
+    loading.className = 'dropdown-status-title';
+    loading.textContent = 'Searching…';
+    list.appendChild(loading);
+    bluetoothDropdownMenu.appendChild(list);
+    invoke('bluetooth_discover')
+      .then((devs) => {
+        list.innerHTML = '';
+        if (!devs || !devs.length) {
+          const empty = document.createElement('div');
+          empty.className = 'dropdown-status-title';
+          empty.textContent = 'No devices found';
+          list.appendChild(empty);
+          return;
+        }
+        const header = document.createElement('div');
+        header.className = 'dropdown-status-title';
+        header.textContent = 'Available Devices';
+        list.appendChild(header);
+        for (const d of devs) {
+          const btn = document.createElement('button');
+          btn.className = 'dropdown-item';
+          btn.innerHTML = `<span class="status-dot"></span>${d.name}`;
+          btn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            btn.textContent = 'Pairing…';
+            invoke('bluetooth_pair', { deviceId: d.id })
+              .then((ok) => {
+                if (ok) refreshBluetooth();
+                else btn.textContent = `${d.name} (failed)`;
+              })
+              .catch((err) => {
+                console.error('[Wupi] bluetooth_pair failed', err);
+                btn.textContent = `${d.name} (error)`;
+              });
+          });
+          list.appendChild(btn);
+        }
+      })
+      .catch((err) => {
+        console.warn('[Wupi] bluetooth_discover failed', err);
+        list.remove();
+      });
+  });
+
   const volumeSlider = document.getElementById('volumeSlider');
   const volumePercent = document.getElementById('volumePercent');
   const audioIcon = audioBtn.querySelector('.status-icon');
@@ -625,4 +685,3 @@ document.addEventListener('DOMContentLoaded', () => {
 
   updateClocks();
   setInterval(updateClocks, 1000);
-});

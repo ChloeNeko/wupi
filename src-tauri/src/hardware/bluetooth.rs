@@ -145,6 +145,42 @@ pub fn bluetooth_list_devices() -> Result<Vec<BluetoothDevice>, String> {
     })
 }
 
+/// Discover in-range, unpaired Bluetooth devices (for the "Add Device" flow).
+/// Same AQS filter as bluetooth_list_devices but returns UNPAIRED entries —
+/// these are devices actively advertising and available to pair. Windows
+/// handles the actual PIN/confirmation handshake when bluetooth_pair is called.
+#[tauri::command]
+pub fn bluetooth_discover() -> Result<Vec<BluetoothDevice>, String> {
+    with_winrt(|| {
+        let aqs = HSTRING::from(
+            "System.Devices.Aep.ProtocolId:=\"{e0cbf06c-cd8b-4647-bb8a-263b43f0f974}\"",
+        );
+        let op = DeviceInformation::FindAllAsyncAqsFilter(&aqs)
+            .map_err(|e| format!("FindAllAsyncAqsFilter: {e}"))?;
+        let coll = op.get().map_err(|e| format!("FindAllAsync.get: {e}"))?;
+        let mut out = Vec::new();
+        let size = coll.Size().map_err(|e| format!("Size: {e}"))?;
+        for i in 0..size {
+            let dev = coll.GetAt(i).map_err(|e| format!("GetAt: {e}"))?;
+            let name = dev.Name().map_err(|e| format!("Name: {e}"))?.to_string();
+            let id = dev.Id().map_err(|e| format!("Id: {e}"))?.to_string();
+            let pairing = dev.Pairing().map_err(|e| format!("Pairing: {e}"))?;
+            let paired = pairing.IsPaired().map_err(|e| format!("IsPaired: {e}"))?;
+            // Discover = unpaired + named (filter empty placeholder names).
+            if paired || name.trim().is_empty() {
+                continue;
+            }
+            out.push(BluetoothDevice {
+                id,
+                name,
+                connected: false,
+                paired,
+            });
+        }
+        Ok(out)
+    })
+}
+
 #[tauri::command]
 pub fn bluetooth_pair(device_id: String) -> Result<bool, String> {
     with_winrt(move || {
