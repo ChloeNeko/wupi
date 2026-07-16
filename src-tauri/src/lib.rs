@@ -450,6 +450,9 @@ pub fn run() {
             hardware::audio::audio_set_volume,
             hardware::audio::audio_list_outputs,
             hardware::audio::audio_set_default_output,
+            hardware::wifi::wifi_get_current,
+            hardware::wifi::wifi_scan,
+            hardware::wifi::wifi_connect,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

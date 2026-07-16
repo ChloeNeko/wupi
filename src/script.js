@@ -325,20 +325,61 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const wifiToggle = document.querySelector('.wifi-toggle-row');
   const wifiIcon = wifiBtn.querySelector('.status-icon');
-  wifiToggle.addEventListener('click', (e) => {
-    e.stopPropagation();
-    wifiIcon.classList.toggle('disabled');
-    const isOff = wifiIcon.classList.contains('disabled');
-    wifiToggle.querySelector('.toggle-text').textContent = isOff ? "Connect WUPI-NET" : "Disconnect WUPI-NET";
-    const dot = wifiDropdownMenu.querySelector('.status-dot');
-    const netOpt = wifiDropdownMenu.querySelector('.network-opt');
-    if (isOff) {
-      dot.classList.remove('connected');
-      netOpt.style.opacity = '0.3';
-    } else {
-      dot.classList.add('connected');
-      netOpt.style.opacity = '1';
-    }
+
+  // ── Wi-Fi dropdown: real current network + scan list ────────────────────
+  function refreshWifi() {
+    // Current connection.
+    invoke('wifi_get_current')
+      .then((s) => {
+        const dot = wifiDropdownMenu.querySelector('.status-dot');
+        const toggleText = wifiToggle.querySelector('.toggle-text');
+        if (s && s.connected) {
+          dot.classList.add('connected');
+          wifiIcon.classList.remove('disabled');
+          toggleText.textContent = `Connected: ${s.ssid || '(unnamed)'} · ${s.signal_pct}%`;
+        } else {
+          dot.classList.remove('connected');
+          toggleText.textContent = 'Wi-Fi Off / Disconnected';
+        }
+      })
+      .catch((e) => console.warn('[Wupi] wifi_get_current failed', e));
+
+    // Network list (replaces the static Guest_Network placeholder).
+    const existingList = wifiDropdownMenu.querySelector('.scan-list');
+    if (existingList) existingList.remove();
+    invoke('wifi_scan')
+      .then((nets) => {
+        if (!nets || !nets.length) return;
+        const list = document.createElement('div');
+        list.className = 'scan-list';
+        const header = document.createElement('div');
+        header.className = 'dropdown-status-title';
+        header.textContent = 'Available';
+        list.appendChild(header);
+        for (const n of nets) {
+          const btn = document.createElement('button');
+          btn.className = 'dropdown-item wifi-network';
+          const lock = n.secure ? '🔒 ' : '';
+          btn.innerHTML = `<span class="status-dot"></span>${lock}${n.ssid} · ${n.signal_pct}%`;
+          btn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            // For secured networks we'd prompt for a password; for now connect
+            // with no password (open networks). Password UI is a follow-up.
+            invoke('wifi_connect', { ssid: n.ssid, password: n.secure ? prompt(`Password for ${n.ssid}:`) || null : null })
+              .then(() => refreshWifi())
+              .catch((err) => console.error('[Wupi] wifi_connect failed', err));
+          });
+          list.appendChild(btn);
+        }
+        wifiDropdownMenu.appendChild(list);
+      })
+      .catch((e) => console.warn('[Wupi] wifi_scan failed', e));
+  }
+
+  wifiBtn.addEventListener('click', () => {
+    setTimeout(() => {
+      if (wifiDropdownMenu.classList.contains('show')) refreshWifi();
+    }, 0);
   });
 
   const btToggle = document.querySelector('.bt-toggle-row');

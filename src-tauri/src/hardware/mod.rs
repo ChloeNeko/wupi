@@ -7,6 +7,8 @@
 
 #[cfg(windows)]
 pub mod audio;
+#[cfg(windows)]
+pub mod wifi;
 
 #[cfg(windows)]
 pub use audio::{
