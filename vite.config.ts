@@ -4,6 +4,11 @@ import { resolve } from "path";
 export default defineConfig({
   root: "src",
   publicDir: "../public",
+  // Relative base so multi-page assets resolve correctly under Tauri's custom
+  // protocol (tauri://localhost / https://tauri.localhost). An absolute "/base"
+  // breaks the secondary terminal.html window — its <script src="/assets/...">
+  // resolves to the protocol root and 404s, leaving the window unstyled/white.
+  base: "./",
   clearScreen: false,
   server: {
     port: 1420,

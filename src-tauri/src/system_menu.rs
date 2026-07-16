@@ -64,15 +64,18 @@ pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 
 // ── Power actions ──────────────────────────────────────────────────────────
 
-/// Full shutdown: terminate the process immediately. We emit the canvas-pause
-/// event for cleanliness, then call `app.exit(0)` — which kills the process
-/// and every window/webview/PTY affiliated with it in one shot. We deliberately
-/// do NOT call `win.close()` per window: that requests a graceful close which
-/// fires `CloseRequested` and waits on webview teardown, and on some WebView2
-/// builds that stalls (the user had to Alt+F4). `exit(0)` is the force-kill.
+/// Full shutdown: terminate the process unconditionally. We use
+/// `std::process::exit(0)` — an immediate OS-level process kill that bypasses
+/// Tauri's exit flow entirely. `app.exit(0)` runs the graceful window/webview
+/// teardown, which STALLS when a secondary window (e.g. the terminal) is open
+/// or wedged — the user couldn't shut down at all with the terminal open and
+/// had to use Task Manager. `std::process::exit` kills every window, webview,
+/// and PTY affiliated with the process in one shot, no waiting.
 pub fn power_shutdown<R: Runtime>(app: &AppHandle<R>) {
     let _ = app.emit(EVT_CANVAS_PAUSE, ());
-    app.exit(0);
+    // Flush the emit above before the hard kill so the frontend gets it.
+    // (The emit is best-effort; if it doesn't land, the kill still happens.)
+    std::process::exit(0);
 }
 
 /// Restart: spawn a fresh copy of this executable, then shut down.
