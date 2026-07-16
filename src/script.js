@@ -1,11 +1,24 @@
 const canvas = document.getElementById('aurora-canvas');
 const ctx = canvas.getContext('2d');
 
+// CSS-pixel dimensions (all drawing math uses these). The backing store is
+// scaled by devicePixelRatio so stars/curtains render at physical-pixel
+// resolution on high-DPI / 4K / ultrawide displays instead of being upscaled
+// and blurry. This is the "resolution loss" fix.
 let width, height;
 
 function resize() {
-  width = canvas.width = window.innerWidth;
-  height = canvas.height = window.innerHeight;
+  const dpr = window.devicePixelRatio || 1;
+  width = window.innerWidth;
+  height = window.innerHeight;
+  canvas.width = Math.floor(width * dpr);
+  canvas.height = Math.floor(height * dpr);
+  canvas.style.width = width + 'px';
+  canvas.style.height = height + 'px';
+  // Reset transform then re-apply — resize() can fire repeatedly, and the
+  // scale accumulates if not reset first.
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.scale(dpr, dpr);
 }
 window.addEventListener('resize', resize);
 resize();
