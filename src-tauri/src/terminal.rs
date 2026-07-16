@@ -81,6 +81,7 @@ pub fn terminal_create_window<R: Runtime>(
     // Reuse a single terminal window: if it exists (visible or hidden), show
     // + focus it instead of opening a second.
     if let Some(win) = app.get_webview_window(label) {
+        let _ = win.set_always_on_top(true);
         let _ = win.show();
         let _ = win.set_focus();
         return Ok(label.to_string());
@@ -94,6 +95,7 @@ pub fn terminal_create_window<R: Runtime>(
         .transparent(true)
         .shadow(false)
         .resizable(true)
+        .always_on_top(true)
         .center()
         .build()
         .map_err(|e| format!("build terminal window: {e}"))?;

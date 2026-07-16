@@ -331,20 +331,21 @@ document.addEventListener('DOMContentLoaded', () => {
     // Current connection.
     invoke('wifi_get_current')
       .then((s) => {
-        const dot = wifiDropdownMenu.querySelector('.status-dot');
+        const dot = wifiDropdownMenu.querySelector('.wifi-toggle-row .status-dot');
         const toggleText = wifiToggle.querySelector('.toggle-text');
         if (s && s.connected) {
-          dot.classList.add('connected');
+          dot?.classList.add('connected');
           wifiIcon.classList.remove('disabled');
-          toggleText.textContent = `Connected: ${s.ssid || '(unnamed)'} · ${s.signal_pct}%`;
+          toggleText.textContent = `Connected: ${s.ssid || '(unnamed)'}`;
         } else {
-          dot.classList.remove('connected');
-          toggleText.textContent = 'Wi-Fi Off / Disconnected';
+          dot?.classList.remove('connected');
+          toggleText.textContent = 'Turn Wi-Fi On';
         }
       })
       .catch((e) => console.warn('[Wupi] wifi_get_current failed', e));
 
-    // Network list (replaces the static Guest_Network placeholder).
+    // Network list (deduped backend-side by SSID now). Rebuild only if absent
+    // to avoid flicker; the toggle row above updates independently.
     const existingList = wifiDropdownMenu.querySelector('.scan-list');
     if (existingList) existingList.remove();
     invoke('wifi_scan')
@@ -360,11 +361,11 @@ document.addEventListener('DOMContentLoaded', () => {
           const btn = document.createElement('button');
           btn.className = 'dropdown-item wifi-network';
           const lock = n.secure ? '🔒 ' : '';
-          btn.innerHTML = `<span class="status-dot"></span>${lock}${n.ssid} · ${n.signal_pct}%`;
+          // No signal % — it was noisy and the same network appeared multiple
+          // times at different strengths. SSID-only now (backend dedups).
+          btn.innerHTML = `<span class="status-dot"></span>${lock}${n.ssid}`;
           btn.addEventListener('click', (ev) => {
             ev.stopPropagation();
-            // For secured networks we'd prompt for a password; for now connect
-            // with no password (open networks). Password UI is a follow-up.
             invoke('wifi_connect', { ssid: n.ssid, password: n.secure ? prompt(`Password for ${n.ssid}:`) || null : null })
               .then(() => refreshWifi())
               .catch((err) => console.error('[Wupi] wifi_connect failed', err));
@@ -375,6 +376,18 @@ document.addEventListener('DOMContentLoaded', () => {
       })
       .catch((e) => console.warn('[Wupi] wifi_scan failed', e));
   }
+
+  // The Wi-Fi toggle row: disconnects when connected, connects (toggles radio)
+  // when off. Windows exposes Wi-Fi radio via the WinRT Radio API (same as
+  // Bluetooth), so we route through wifi_toggle_radio.
+  wifiToggle.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const dot = wifiToggle.querySelector('.status-dot');
+    const isOn = dot?.classList.contains('connected');
+    invoke('wifi_toggle_radio', { on: !isOn })
+      .then(() => refreshWifi())
+      .catch((err) => console.error('[Wupi] wifi_toggle_radio failed', err));
+  });
 
   wifiBtn.addEventListener('click', () => {
     setTimeout(() => {
@@ -492,19 +505,25 @@ document.addEventListener('DOMContentLoaded', () => {
     }, 60);
   });
 
-  // Populate the dropdown with real state + devices. Called on open.
-  let audioPollTimer = null;
-  function refreshAudio() {
+  // ── Audio dropdown: live volume + output list ───────────────────────────
+  // Split into two pieces to kill the flicker: the volume/mute is polled every
+  // 1s (slider/percent/icon only — no DOM rebuild), and the output-device list
+  // is built ONCE when the dropdown opens (it almost never changes mid-session).
+  // The previous version rebuilt the whole list each tick → flicker.
+
+  function refreshAudioVolume() {
     invoke('audio_get_state')
       .then((s) => {
         if (!s) return;
+        // Only touch the slider/percent/icon — never rebuild the device list.
         volumeSlider.value = s.volume;
         volumePercent.textContent = `${s.volume}%`;
         setAudioIcon(s.muted ? 0 : s.volume);
       })
       .catch((e) => console.warn('[Wupi] audio_get_state failed', e));
+  }
 
-    // Output device list under the slider.
+  function buildAudioOutputs() {
     const existingList = audioDropdownMenu.querySelector('.output-list');
     if (existingList) existingList.remove();
     invoke('audio_list_outputs')
@@ -524,7 +543,7 @@ document.addEventListener('DOMContentLoaded', () => {
             btn.addEventListener('click', (ev) => {
               ev.stopPropagation();
               invoke('audio_set_default_output', { id: o.id })
-                .then(() => refreshAudio())
+                .then(() => buildAudioOutputs())
                 .catch((err) => console.error('[Wupi] audio_set_default_output failed', err));
             });
           }
@@ -535,14 +554,15 @@ document.addEventListener('DOMContentLoaded', () => {
       .catch((e) => console.warn('[Wupi] audio_list_outputs failed', e));
   }
 
-  // When the dropdown opens, load state + poll for external volume changes
-  // (volume keys, other apps). Stop polling when it closes.
+  let audioPollTimer = null;
   audioBtn.addEventListener('click', () => {
     setTimeout(() => {
       if (audioDropdownMenu.classList.contains('show')) {
-        refreshAudio();
+        // Opened: build the device list once + load volume, then poll volume only.
+        buildAudioOutputs();
+        refreshAudioVolume();
         clearInterval(audioPollTimer);
-        audioPollTimer = setInterval(refreshAudio, 1000);
+        audioPollTimer = setInterval(refreshAudioVolume, 1000);
       } else {
         clearInterval(audioPollTimer);
         audioPollTimer = null;

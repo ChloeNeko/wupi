@@ -18,7 +18,7 @@ use windows::core::GUID;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::WiFi::{
     WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory, WlanGetNetworkBssList, WlanOpenHandle,
-    WlanQueryInterface, DOT11_BSS_TYPE, WLAN_BSS_ENTRY, WLAN_BSS_LIST,
+    WlanQueryInterface, DOT11_BSS_TYPE, WLAN_BSS_LIST,
     WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO_LIST, WLAN_INTF_OPCODE,
     WLAN_OPCODE_VALUE_TYPE,
 };
@@ -190,20 +190,83 @@ pub fn wifi_scan() -> Result<Vec<WifiNetwork>, String> {
                 list.wlanBssEntries.as_ptr(),
                 list.dwNumberOfItems as usize,
             );
-            entries
-                .iter()
-                .map(|e: &WLAN_BSS_ENTRY| WifiNetwork {
-                    ssid: ssid_to_string(&e.dot11Ssid.ucSSID, e.dot11Ssid.uSSIDLength),
-                    signal_pct: signal_rssi_to_pct(e.lRssi),
-                    secure: e.dot11BssType.0 != 2 || e.uPhyId != 0, // heuristic
-                    connected: false,
-                })
-                .filter(|n| !n.ssid.is_empty())
-                .collect::<Vec<_>>()
+            // One BSS entry PER ACCESS POINT — a mesh/multi-AP network like a
+            // home Wi-Fi produces 3-6 entries for the SAME SSID. Collapse to
+            // one network per SSID, keeping the strongest signal. This is why
+            // the panel showed "MyNet 85%, MyNet 90%, MyNet 85%" etc.
+            let mut by_ssid: std::collections::HashMap<String, WifiNetwork> =
+                std::collections::HashMap::new();
+            for e in entries {
+                let ssid = ssid_to_string(&e.dot11Ssid.ucSSID, e.dot11Ssid.uSSIDLength);
+                if ssid.is_empty() {
+                    continue;
+                }
+                let sig = signal_rssi_to_pct(e.lRssi);
+                let secure = e.dot11BssType.0 != 2 || e.uPhyId != 0; // heuristic
+                by_ssid
+                    .entry(ssid.clone())
+                    .and_modify(|existing| {
+                        // Keep the strongest signal across APs sharing this SSID.
+                        if sig > existing.signal_pct {
+                            existing.signal_pct = sig;
+                        }
+                    })
+                    .or_insert(WifiNetwork {
+                        ssid,
+                        signal_pct: sig,
+                        secure,
+                        connected: false,
+                    });
+            }
+            // Sort strongest-first so the usable networks rise to the top.
+            let mut out: Vec<WifiNetwork> = by_ssid.into_values().collect();
+            out.sort_by(|a, b| b.signal_pct.cmp(&a.signal_pct));
+            out
         };
         unsafe { WlanFreeMemory(bss_ptr as *mut _) };
         Ok(networks)
     })
+}
+
+/// Toggle the Wi-Fi radio on/off via the WinRT Radio API. The Win32 WLAN API
+/// (wlanapi.dll) has no clean radio on/off — Windows exposes that through the
+/// same `Devices::Radios::Radio` interface Bluetooth uses. Run on a worker
+/// thread with MTA CoInitializeEx + block on the IAsyncOperation via `.get()`.
+#[tauri::command]
+pub fn wifi_toggle_radio(on: bool) -> Result<(), String> {
+    use windows::Devices::Radios::{Radio, RadioKind, RadioState};
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let init =
+            unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED) };
+        let init_ok = init.is_ok();
+        let result = (|| {
+            let op = Radio::GetRadiosAsync().map_err(|e| format!("GetRadiosAsync: {e}"))?;
+            let radios = op.get().map_err(|e| format!("GetRadiosAsync.get: {e}"))?;
+            let target = if on { RadioState::On } else { RadioState::Off };
+            let mut found = false;
+            for radio in radios {
+                let kind = radio.Kind().map_err(|e| format!("Radio.Kind: {e}"))?;
+                if kind == RadioKind::WiFi {
+                    found = true;
+                    let sop = radio
+                        .SetStateAsync(target)
+                        .map_err(|e| format!("SetStateAsync: {e}"))?;
+                    sop.get().map_err(|e| format!("SetStateAsync.get: {e}"))?;
+                }
+            }
+            if !found {
+                return Err("no Wi-Fi radio found".into());
+            }
+            Ok(())
+        })();
+        if init_ok {
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
+        }
+        let _ = tx.send(result);
+    });
+    rx.recv().map_err(|e| format!("wifi_toggle_radio worker: {e}"))?
 }
 
 #[tauri::command]

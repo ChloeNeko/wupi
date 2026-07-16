@@ -259,17 +259,17 @@ html, body {
 
 /* ── Theme cascade panels (paw → theme → color code) ──────────────────────
    Each panel is a sibling of the paw dropdown, anchored to its right edge so
-   all three align horizontally. top matches the paw dropdown (56px). */
-.cascade-panel {
-    /* Offset by the paw dropdown's width (~170px) + a small gap. Subsequent
-       cascade panels stack further right via incremental --cascade-level. */
+   all three align horizontally. top matches the paw dropdown (56px).
+   NOTE: must outrank `.menu-container .dropdown-menu { left: 0 }` in
+   specificity, hence the explicit `.menu-container .cascade-panel` selectors. */
+.menu-container .cascade-panel {
     left: 178px;
     top: 56px;
 }
 
-#colorCodePanel {
+.menu-container #colorCodePanel {
     /* Second cascade level: one panel-width further right than the theme panel. */
-    left: calc(178px + 178px);
+    left: 356px;
 }
 
 /* Theme/color-code swatches */
@@ -463,7 +463,7 @@ html, body {
 .volume-slider {
     -webkit-appearance: none;
     appearance: none;
-    width: 90px;
+    width: 180px;
     height: 4px;
     border-radius: 2px;
     background: rgba(255, 255, 255, 0.2);
@@ -473,8 +473,8 @@ html, body {
 .volume-slider::-webkit-slider-thumb {
     -webkit-appearance: none;
     appearance: none;
-    width: 12px;
-    height: 12px;
+    width: 14px;
+    height: 14px;
     border-radius: 50%;
     background: #b534fa;
     cursor: pointer;
@@ -490,6 +490,7 @@ html, body {
     font-size: 13px;
     font-weight: 600;
     color: #fff;
-    min-width: 32px;
+    min-width: 36px;
     text-align: right;
+    font-variant-numeric: tabular-nums;
 }

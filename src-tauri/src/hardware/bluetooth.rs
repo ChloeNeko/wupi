@@ -105,8 +105,17 @@ pub fn bluetooth_toggle_radio(on: bool) -> Result<(), String> {
 #[tauri::command]
 pub fn bluetooth_list_devices() -> Result<Vec<BluetoothDevice>, String> {
     with_winrt(|| {
-        let op = DeviceInformation::FindAllAsync()
-            .map_err(|e| format!("FindAllAsync: {e}"))?;
+        // DeviceClass has no Bluetooth variant, so use the canonical Bluetooth
+        // AQS selector via FindAllAsyncAqsFilter. The GUID
+        // {e0cbf06c-cd8b-4647-bb8a-263b43f0f974} is the Bluetooth device
+        // interface class — this returns ONLY Bluetooth devices, not the whole
+        // PnP tree (which is why the panel previously showed "a million
+        // devices": FindAllAsync returns every HID/USB/audio/etc. device).
+        let aqs = HSTRING::from(
+            "System.Devices.Aep.ProtocolId:=\"{e0cbf06c-cd8b-4647-bb8a-263b43f0f974}\"",
+        );
+        let op = DeviceInformation::FindAllAsyncAqsFilter(&aqs)
+            .map_err(|e| format!("FindAllAsyncAqsFilter: {e}"))?;
         let coll = op.get().map_err(|e| format!("FindAllAsync.get: {e}"))?;
         let mut out = Vec::new();
         let size = coll.Size().map_err(|e| format!("Size: {e}"))?;
@@ -114,17 +123,17 @@ pub fn bluetooth_list_devices() -> Result<Vec<BluetoothDevice>, String> {
             let dev = coll.GetAt(i).map_err(|e| format!("GetAt: {e}"))?;
             let name = dev.Name().map_err(|e| format!("Name: {e}"))?.to_string();
             let id = dev.Id().map_err(|e| format!("Id: {e}"))?.to_string();
-            // FindAllAsync returns ALL devices; keep only Bluetooth-class ones.
-            // The reliable signal is the id prefix (BTHENUM / Bluetooth) or
-            // a name containing Bluetooth. The full AQS selector is a follow-up.
-            if !id.contains("Bluetooth")
-                && !id.contains("BTHENUM")
-                && !name.contains("Bluetooth")
-            {
-                continue;
-            }
             let pairing = dev.Pairing().map_err(|e| format!("Pairing: {e}"))?;
             let paired = pairing.IsPaired().map_err(|e| format!("IsPaired: {e}"))?;
+            // "My Devices" = paired only. Unpaired entries are noise here;
+            // pairing new devices is a separate flow (bluetooth_pair).
+            if !paired {
+                continue;
+            }
+            // Skip empty-named placeholder entries.
+            if name.trim().is_empty() {
+                continue;
+            }
             out.push(BluetoothDevice {
                 id,
                 name,

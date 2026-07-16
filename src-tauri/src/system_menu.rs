@@ -64,14 +64,14 @@ pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 
 // ── Power actions ──────────────────────────────────────────────────────────
 
-/// Full shutdown: pause the canvas, close every webview window, exit.
-/// "Closes the application and all background apps and terminals affiliated
-/// with it" — every window goes, then the process exits.
+/// Full shutdown: terminate the process immediately. We emit the canvas-pause
+/// event for cleanliness, then call `app.exit(0)` — which kills the process
+/// and every window/webview/PTY affiliated with it in one shot. We deliberately
+/// do NOT call `win.close()` per window: that requests a graceful close which
+/// fires `CloseRequested` and waits on webview teardown, and on some WebView2
+/// builds that stalls (the user had to Alt+F4). `exit(0)` is the force-kill.
 pub fn power_shutdown<R: Runtime>(app: &AppHandle<R>) {
     let _ = app.emit(EVT_CANVAS_PAUSE, ());
-    for (_, win) in app.webview_windows() {
-        let _ = win.close();
-    }
     app.exit(0);
 }
 

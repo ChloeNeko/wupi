@@ -453,6 +453,7 @@ pub fn run() {
             hardware::wifi::wifi_get_current,
             hardware::wifi::wifi_scan,
             hardware::wifi::wifi_connect,
+            hardware::wifi::wifi_toggle_radio,
             hardware::bluetooth::bluetooth_get_state,
             hardware::bluetooth::bluetooth_toggle_radio,
             hardware::bluetooth::bluetooth_list_devices,
