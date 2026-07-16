@@ -14,6 +14,7 @@ pub mod session;
 pub mod sim_card;
 pub mod stream_filter;
 pub mod system_menu;
+pub mod theme;
 pub mod user_profile;
 
 use std::sync::Arc;
@@ -82,6 +83,14 @@ pub struct AppState {
     /// Lock-free reads after `setup`. Held as `Option<PathBuf>` so a missing
     /// profile is `None`, distinct from "not yet resolved."
     pub operator_path: Arc<std::sync::OnceLock<Option<std::path::PathBuf>>>,
+    /// The active theme + color code (defaults Aurora / Vibrant). Read by the
+    /// frontend to paint the cascade panels; written by `theme_set`. Held
+    /// under a std Mutex — never awaited across.
+    pub theme: Arc<std::sync::Mutex<theme::ThemeSettings>>,
+    /// The resolved path to `theme.json` in app data. Filled once in setup;
+    /// `theme_set` saves to it. OnceLock because it needs the Tauri app handle
+    /// to resolve app_data_dir (not available in AppState::new()).
+    pub theme_path: Arc<std::sync::OnceLock<std::path::PathBuf>>,
 }
 
 impl AppState {
@@ -100,6 +109,8 @@ impl AppState {
             )),
             active_card: Arc::new(std::sync::OnceLock::new()),
             operator_path: Arc::new(std::sync::OnceLock::new()),
+            theme: Arc::new(std::sync::Mutex::new(theme::ThemeSettings::default())),
+            theme_path: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
@@ -137,6 +148,22 @@ pub fn run() {
             tracing::info!("app data dir: {}", data_dir.display());
 
             let state: tauri::State<AppState> = app.state();
+
+            // ── Theme (persisted; defaults Aurora / Vibrant) ───────────────
+            // Resolved path cached on AppState so theme_get/theme_set don't
+            // need the app handle; load now so the frontend can read the
+            // persisted choice on boot.
+            {
+                let theme_path = theme::ThemeSettings::resolve_path(&data_dir);
+                let loaded = theme::ThemeSettings::load(&theme_path);
+                tracing::info!(
+                    theme = %loaded.theme,
+                    color_code = %loaded.color_code,
+                    "theme loaded"
+                );
+                *state.theme.lock().expect("theme mutex") = loaded;
+                let _ = state.theme_path.set(theme_path);
+            }
 
             // ── Session + schema are EPHEMERAL (2026-07-14) ───────────────
             // WUPI OS launches into a FRESH session every time — no
@@ -407,6 +434,8 @@ pub fn run() {
             system_menu::power_shutdown_cmd,
             system_menu::power_restart_cmd,
             system_menu::power_sleep_cmd,
+            theme_get,
+            theme_set,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -438,6 +467,44 @@ fn get_intro(state: tauri::State<'_, AppState>) -> Option<String> {
         .active_card
         .get()
         .and_then(|c| c.random_intro().map(|s| s.to_owned()))
+}
+
+/// Read the active theme + color code. The frontend paints the cascade
+/// panels from this and applies the palette to the aurora canvas.
+#[tauri::command]
+fn theme_get(state: tauri::State<'_, AppState>) -> serde_json::Value {
+    let t = state.theme.lock().expect("theme mutex");
+    serde_json::json!({ "theme": t.theme, "colorCode": t.color_code })
+}
+
+/// Persist a new theme + color code and return the updated value. The
+/// frontend re-paints the canvas on the next frame after the round-trip.
+#[tauri::command]
+fn theme_set(
+    theme_name: String,
+    color_code: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let path = state
+        .theme_path
+        .get()
+        .ok_or_else(|| "theme path not initialized".to_string())?
+        .clone();
+    let new_settings = theme::ThemeSettings {
+        theme: theme_name,
+        color_code,
+    };
+    new_settings.save(&path);
+    *state.theme.lock().expect("theme mutex") = new_settings.clone();
+    tracing::info!(
+        theme = %new_settings.theme,
+        color_code = %new_settings.color_code,
+        "theme updated"
+    );
+    Ok(serde_json::json!({
+        "theme": new_settings.theme,
+        "colorCode": new_settings.color_code,
+    }))
 }
 
 fn resolve_model_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {

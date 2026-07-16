@@ -7,6 +7,26 @@ import { listen } from '@tauri-apps/api/event';
 const canvas = document.getElementById('aurora-canvas');
 const ctx = canvas.getContext('2d');
 
+// ── Theme palettes ─────────────────────────────────────────────────────────
+// Each color code defines the aurora's sky gradient (top→bottom CSS color
+// stops) and the curtain hue generator (base hue ± range). The animate() loop
+// reads `currentPalette` — switching color codes re-paints on the next frame.
+//
+// "Vibrant" reproduces the original hardcoded values (the project default).
+// New color codes = add entries here + a matching swatch in styles.css.
+const COLOR_CODES = {
+  Vibrant: {
+    skyGradient: ['#02040a', '#060a17', '#150524', '#2b0b36', '#4a173d'],
+    hueBase: 305,
+    hueRange: 45,
+  },
+};
+
+// The live palette; initialized from the persisted theme at boot (see
+// `applyTheme` below). Defaults to Vibrant so the canvas paints immediately
+// even before the IPC round-trip completes.
+let currentPalette = COLOR_CODES.Vibrant;
+
 // CSS-pixel dimensions (all drawing math uses these). The backing store is
 // scaled by devicePixelRatio so stars/curtains render at physical-pixel
 // resolution on high-DPI / 4K / ultrawide displays instead of being upscaled
@@ -65,12 +85,12 @@ function animate() {
   currentY += (mouseY - currentY) * 0.25;
 
   const skyGrad = ctx.createLinearGradient(0, 0, 0, height);
-  
-  skyGrad.addColorStop(0, '#02040a');
-  skyGrad.addColorStop(0.35, '#060a17'); 
-  skyGrad.addColorStop(0.65, '#150524'); 
-  skyGrad.addColorStop(0.85, '#2b0b36'); 
-  skyGrad.addColorStop(1, '#4a173d'); 
+
+  const stops = currentPalette.skyGradient;
+  // Evenly distribute the stops across [0, 1].
+  for (let i = 0; i < stops.length; i++) {
+    skyGrad.addColorStop(i / (stops.length - 1), stops[i]);
+  }
 
   ctx.globalCompositeOperation = 'source-over';
   ctx.globalAlpha = 1.0;
@@ -132,7 +152,7 @@ function animate() {
     }
     ctx.closePath();
 
-    const hue = 305 + Math.sin(time * 1.0 + i) * 45; 
+    const hue = currentPalette.hueBase + Math.sin(time * 1.0 + i) * currentPalette.hueRange;
     
     ctx.fillStyle = `hsla(${hue}, 100%, 65%, 0.18)`;
     ctx.fill();
@@ -227,6 +247,61 @@ document.addEventListener('DOMContentLoaded', () => {
     invoke('power_sleep_cmd');
   });
 
+  // ── Theme cascade (paw → theme → color code) ────────────────────────────
+  // Three aligned panels. Clicking Theme opens panel 2; clicking a theme opens
+  // panel 3 (color codes); clicking a color code persists + applies live. The
+  // document-click dismiss handler (below) closes all three on outside click.
+  const themePanel = document.getElementById('themePanel');
+  const colorCodePanel = document.getElementById('colorCodePanel');
+
+  // Apply a theme + color code to the running canvas. Unknown color codes
+  // silently fall back to Vibrant so a stale theme.json can't break the loop.
+  function applyTheme(theme, colorCode) {
+    currentPalette = COLOR_CODES[colorCode] || COLOR_CODES.Vibrant;
+    // Mark the selected option in each panel (the `.selected` highlight).
+    document.querySelectorAll('.theme-option').forEach((el) => {
+      el.classList.toggle('selected', el.dataset.theme === theme);
+    });
+    document.querySelectorAll('.colorcode-option').forEach((el) => {
+      el.classList.toggle('selected', el.dataset.colorcode === colorCode);
+    });
+  }
+
+  // Load the persisted theme on boot and paint the cascade selection state.
+  invoke('theme_get')
+    .then((t) => { if (t) applyTheme(t.theme, t.colorCode); })
+    .catch((e) => console.warn('[Wupi] theme_get failed', e));
+
+  document.getElementById('themeBtn')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    // Toggle the theme panel; keep the paw menu open so the cascade reads as
+    // an extension of it.
+    const open = themePanel.classList.toggle('show');
+    if (!open) colorCodePanel.classList.remove('show');
+  });
+
+  document.querySelectorAll('.theme-option').forEach((el) => {
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      // Selecting a theme opens the color-code panel (cascade level 3).
+      applyTheme(el.dataset.theme,
+        document.querySelector('.colorcode-option.selected')?.dataset.colorcode || 'Vibrant');
+      colorCodePanel.classList.add('show');
+    });
+  });
+
+  document.querySelectorAll('.colorcode-option').forEach((el) => {
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const themeName = document.querySelector('.theme-option.selected')?.dataset.theme || 'Aurora';
+      const cc = el.dataset.colorcode;
+      applyTheme(themeName, cc);
+      invoke('theme_set', { themeName, colorCode: cc }).catch((err) =>
+        console.warn('[Wupi] theme_set failed', err)
+      );
+    });
+  });
+
   document.addEventListener('click', () => {
     dropdownMenu.classList.remove('show');
     clockDropdownMenu.classList.remove('show');
@@ -234,6 +309,8 @@ document.addEventListener('DOMContentLoaded', () => {
     wifiDropdownMenu.classList.remove('show');
     bluetoothDropdownMenu.classList.remove('show');
     audioDropdownMenu.classList.remove('show');
+    themePanel?.classList.remove('show');
+    colorCodePanel?.classList.remove('show');
   });
 
   const wifiToggle = document.querySelector('.wifi-toggle-row');

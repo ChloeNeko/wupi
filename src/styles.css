@@ -257,6 +257,50 @@ html, body {
     animation: fadeIn 0.12s ease-out;
 }
 
+/* ── Theme cascade panels (paw → theme → color code) ──────────────────────
+   Each panel is a sibling of the paw dropdown, anchored to its right edge so
+   all three align horizontally. top matches the paw dropdown (56px). */
+.cascade-panel {
+    /* Offset by the paw dropdown's width (~170px) + a small gap. Subsequent
+       cascade panels stack further right via incremental --cascade-level. */
+    left: 178px;
+    top: 56px;
+}
+
+#colorCodePanel {
+    /* Second cascade level: one panel-width further right than the theme panel. */
+    left: calc(178px + 178px);
+}
+
+/* Theme/color-code swatches */
+.swatch {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+/* Aurora theme swatch — a condensed slice of the aurora gradient */
+.swatch-aurora {
+    background: linear-gradient(135deg, #4a173d 0%, #b534fa 50%, #ff66b2 100%);
+    box-shadow: 0 0 6px rgba(181, 52, 250, 0.5);
+}
+
+/* Vibrant color code — saturated magenta-violet */
+.swatch-vibrant {
+    background: radial-gradient(circle at 35% 35%, #ff66b2, #b534fa 70%, #6a0dad);
+    box-shadow: 0 0 6px rgba(255, 102, 178, 0.6);
+}
+
+/* Selected state for theme/colorcode options */
+.dropdown-item.theme-option.selected,
+.dropdown-item.colorcode-option.selected {
+    background: rgba(181, 52, 250, 0.18);
+    color: #fff;
+    box-shadow: inset 2px 0 0 #b534fa;
+}
+
 .dropdown-item {
     background: none;
     border: none;
