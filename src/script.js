@@ -366,10 +366,8 @@ document.addEventListener('DOMContentLoaded', () => {
   const volumePercent = document.getElementById('volumePercent');
   const audioIcon = audioBtn.querySelector('.status-icon');
 
-  volumeSlider.addEventListener('input', (e) => {
-    const val = e.target.value;
-    volumePercent.textContent = `${val}%`;
-
+  // Set the audio icon based on a volume level (0 / low / high).
+  function setAudioIcon(val) {
     if (val == 0) {
       audioIcon.innerHTML = `
         <svg class="status-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -390,6 +388,79 @@ document.addEventListener('DOMContentLoaded', () => {
             <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
         </svg>`;
     }
+  }
+
+  // ── Audio dropdown: live volume + output list ───────────────────────────
+  // Debounced volume set so dragging the slider doesn't spam IPC calls.
+  let volTimer = null;
+  volumeSlider.addEventListener('input', (e) => {
+    const val = Number(e.target.value);
+    volumePercent.textContent = `${val}%`;
+    setAudioIcon(val);
+    clearTimeout(volTimer);
+    volTimer = setTimeout(() => {
+      invoke('audio_set_volume', { volume: val }).catch((err) =>
+        console.error('[Wupi] audio_set_volume failed', err)
+      );
+    }, 60);
+  });
+
+  // Populate the dropdown with real state + devices. Called on open.
+  let audioPollTimer = null;
+  function refreshAudio() {
+    invoke('audio_get_state')
+      .then((s) => {
+        if (!s) return;
+        volumeSlider.value = s.volume;
+        volumePercent.textContent = `${s.volume}%`;
+        setAudioIcon(s.muted ? 0 : s.volume);
+      })
+      .catch((e) => console.warn('[Wupi] audio_get_state failed', e));
+
+    // Output device list under the slider.
+    const existingList = audioDropdownMenu.querySelector('.output-list');
+    if (existingList) existingList.remove();
+    invoke('audio_list_outputs')
+      .then((outs) => {
+        if (!outs || !outs.length) return;
+        const list = document.createElement('div');
+        list.className = 'output-list';
+        const header = document.createElement('div');
+        header.className = 'dropdown-status-title';
+        header.textContent = 'Output';
+        list.appendChild(header);
+        for (const o of outs) {
+          const btn = document.createElement('button');
+          btn.className = 'dropdown-item output-option' + (o.is_default ? ' selected' : '');
+          btn.innerHTML = `<span class="status-dot ${o.is_default ? 'connected' : ''}"></span>${o.name}`;
+          if (!o.is_default) {
+            btn.addEventListener('click', (ev) => {
+              ev.stopPropagation();
+              invoke('audio_set_default_output', { id: o.id })
+                .then(() => refreshAudio())
+                .catch((err) => console.error('[Wupi] audio_set_default_output failed', err));
+            });
+          }
+          list.appendChild(btn);
+        }
+        audioDropdownMenu.appendChild(list);
+      })
+      .catch((e) => console.warn('[Wupi] audio_list_outputs failed', e));
+  }
+
+  // When the dropdown opens, load state + poll for external volume changes
+  // (volume keys, other apps). Stop polling when it closes.
+  audioBtn.addEventListener('click', () => {
+    setTimeout(() => {
+      if (audioDropdownMenu.classList.contains('show')) {
+        refreshAudio();
+        clearInterval(audioPollTimer);
+        audioPollTimer = setInterval(refreshAudio, 1000);
+      } else {
+        clearInterval(audioPollTimer);
+        audioPollTimer = null;
+      }
+    }, 0);
   });
 
   function updateClocks() {

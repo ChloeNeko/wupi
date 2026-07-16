@@ -1,6 +1,8 @@
 pub mod chat_format;
 pub mod codex;
 pub mod engine;
+#[cfg(windows)]
+pub mod hardware;
 pub mod kv_buffer;
 pub mod llm;
 pub mod memory;
@@ -140,6 +142,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(AppState::new())
         .manage(terminal::new_registry())
+        .manage(hardware::AudioRegistry)
         .setup(|app| {
             tracing::info!("setup hook entered");
             let data_dir = app
@@ -443,6 +446,10 @@ pub fn run() {
             terminal::terminal_input,
             terminal::terminal_resize,
             terminal::terminal_close,
+            hardware::audio::audio_get_state,
+            hardware::audio::audio_set_volume,
+            hardware::audio::audio_list_outputs,
+            hardware::audio::audio_set_default_output,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

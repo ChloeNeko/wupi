@@ -50,3 +50,20 @@ rand = "0.9"
 # menu item runs a real, interactive shell piped to an xterm.js frontend.
 # Cross-platform, but only the Windows ConPTY path is exercised in practice.
 portable-pty = "0.8"
+# Windows API bindings — official Microsoft crate (Win32 + WinRT). Used for
+# the hardware integrations: Core Audio (volume + output switching), WLAN
+# (Wi-Fi scan/connect), and Bluetooth (radio + device enumeration). Feature
+# gates are additive per phase so unused API surface isn't compiled in.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_System_Variant",
+] }
+# Direct dep so the windows::core::interface macro can resolve windows_core
+# (the macro expands to paths through the windows_core crate root).
+windows-core = "0.58"
