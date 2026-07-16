@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "clear:webview2": "node scripts/clear-webview2-cache.cjs",
+    "build": "npm run clear:webview2 && vite build",
     "preview": "vite preview",
     "tauri": "tauri"
   },
