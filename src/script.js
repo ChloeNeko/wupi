@@ -384,23 +384,69 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const btToggle = document.querySelector('.bt-toggle-row');
   const btIcon = bluetoothBtn.querySelector('.status-icon');
+
+  // ── Bluetooth dropdown: real radio state + device list ──────────────────
+  function refreshBluetooth() {
+    invoke('bluetooth_get_state')
+      .then((s) => {
+        const dot = bluetoothDropdownMenu.querySelector('.bt-toggle-row .status-dot');
+        const toggleText = btToggle.querySelector('.toggle-text');
+        if (s && s.radio_on) {
+          dot?.classList.add('connected');
+          btIcon.classList.remove('disabled');
+          toggleText.textContent = 'Turn Bluetooth Off';
+        } else {
+          dot?.classList.remove('connected');
+          btIcon.classList.add('disabled');
+          toggleText.textContent = 'Turn Bluetooth On';
+        }
+      })
+      .catch((e) => console.warn('[Wupi] bluetooth_get_state failed', e));
+
+    const existingList = bluetoothDropdownMenu.querySelector('.bt-device-list');
+    if (existingList) existingList.remove();
+    invoke('bluetooth_list_devices')
+      .then((devs) => {
+        if (!devs || !devs.length) return;
+        const list = document.createElement('div');
+        list.className = 'bt-device-list';
+        const header = document.createElement('div');
+        header.className = 'dropdown-status-title devices-header';
+        header.textContent = 'My Devices';
+        list.appendChild(header);
+        for (const d of devs) {
+          const btn = document.createElement('button');
+          btn.className = 'dropdown-item device-opt';
+          const state = d.connected ? '🟢 ' : (d.paired ? '⚪ ' : '');
+          btn.innerHTML = `<span class="status-dot ${d.paired ? 'connected' : ''}"></span>${state}${d.name}`;
+          if (!d.paired) {
+            btn.addEventListener('click', (ev) => {
+              ev.stopPropagation();
+              invoke('bluetooth_pair', { deviceId: d.id })
+                .then((ok) => { if (ok) refreshBluetooth(); })
+                .catch((err) => console.error('[Wupi] bluetooth_pair failed', err));
+            });
+          }
+          list.appendChild(btn);
+        }
+        bluetoothDropdownMenu.appendChild(list);
+      })
+      .catch((e) => console.warn('[Wupi] bluetooth_list_devices failed', e));
+  }
+
+  // The toggle row now actually flips the radio.
   btToggle.addEventListener('click', (e) => {
     e.stopPropagation();
-    btIcon.classList.toggle('disabled');
     const isOff = btIcon.classList.contains('disabled');
-    btToggle.querySelector('.toggle-text').textContent = isOff ? "Turn Bluetooth On" : "Turn Bluetooth Off";
-    const dot = bluetoothDropdownMenu.querySelector('.status-dot');
-    const devOpt = bluetoothDropdownMenu.querySelector('.device-opt');
-    const devHeader = bluetoothDropdownMenu.querySelector('.devices-header');
-    if (isOff) {
-      dot.classList.remove('connected');
-      devOpt.style.display = 'none';
-      devHeader.style.display = 'none';
-    } else {
-      dot.classList.add('connected');
-      devOpt.style.display = 'flex';
-      devHeader.style.display = 'block';
-    }
+    invoke('bluetooth_toggle_radio', { on: isOff })
+      .then(() => refreshBluetooth())
+      .catch((err) => console.error('[Wupi] bluetooth_toggle_radio failed', err));
+  });
+
+  bluetoothBtn.addEventListener('click', () => {
+    setTimeout(() => {
+      if (bluetoothDropdownMenu.classList.contains('show')) refreshBluetooth();
+    }, 0);
   });
 
   const volumeSlider = document.getElementById('volumeSlider');

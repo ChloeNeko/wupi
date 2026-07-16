@@ -65,6 +65,10 @@ windows = { version = "0.58", features = [
     "Win32_Media_Audio_Endpoints",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_System_Variant",
+    "Devices_Bluetooth",
+    "Devices_Enumeration",
+    "Devices_Radios",
+    "Foundation_Collections",
 ] }
 # Direct dep so the windows::core::interface macro can resolve windows_core
 # (the macro expands to paths through the windows_core crate root).
