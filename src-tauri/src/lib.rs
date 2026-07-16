@@ -13,6 +13,7 @@ pub mod schema_engine;
 pub mod session;
 pub mod sim_card;
 pub mod stream_filter;
+pub mod system_menu;
 pub mod user_profile;
 
 use std::sync::Arc;
@@ -367,6 +368,15 @@ pub fn run() {
                 }
             }
 
+            // ── System tray (paw icon) — installed once the app handle exists.
+            // Built last so an icon-build failure can't strand the earlier
+            // engine init. A failure here is non-fatal: log and continue; the
+            // app still runs, just without a tray (Sleep would then hide the
+            // window with no way back except Restart/relaunch).
+            if let Err(e) = system_menu::build_tray(&app.handle()) {
+                tracing::error!(error = %format!("{e:#}"), "tray icon build failed");
+            }
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -374,6 +384,16 @@ pub fn run() {
                 if window.app_handle().webview_windows().len() <= 1 {
                     window.app_handle().exit(0);
                 }
+            }
+        })
+        // Tray-menu item dispatch: "Wake" restores the window, "Quit" is a
+        // full shutdown. Routed through the same power actions the paw
+        // dropdown uses.
+        .on_menu_event(|app, event| {
+            match event.id().as_ref() {
+                system_menu::TRAY_WAKE => system_menu::power_wake(&app),
+                system_menu::TRAY_QUIT => system_menu::power_shutdown(&app),
+                _ => {}
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -384,6 +404,9 @@ pub fn run() {
             get_intro,
             debug_memory_query,
             debug_schema_delta,
+            system_menu::power_shutdown_cmd,
+            system_menu::power_restart_cmd,
+            system_menu::power_sleep_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

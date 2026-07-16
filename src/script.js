@@ -1,3 +1,9 @@
+// Tauri 2 IPC + event APIs. Imported as ES modules now that script.js is
+// `type="module"` (Vite bundles these; withGlobalTauri is off so the
+// `window.__TAURI__` global is NOT injected — the import is the source of truth).
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+
 const canvas = document.getElementById('aurora-canvas');
 const ctx = canvas.getContext('2d');
 
@@ -133,9 +139,26 @@ function animate() {
   }
 
   ctx.filter = 'none';
-  time += 0.0025; 
-  requestAnimationFrame(animate);
+  time += 0.0025;
+  // Don't schedule the next frame while sleeping — the canvas RAF is the
+  // app's dominant idle CPU/GPU cost, and pausing it is what makes Sleep
+  // "barely noticeable." Wake (canvas-resume event) restarts the loop.
+  if (!paused) requestAnimationFrame(animate);
 }
+
+// Render loop control: starts running, suspended on `canvas-pause`,
+// resumed on `canvas-resume`. Both events come from the Rust side
+// (system_menu power_sleep / power_wake).
+let paused = false;
+
+function startLoop() {
+  if (paused) { paused = false; requestAnimationFrame(animate); }
+}
+
+// Tauri emits these from system_menu power_sleep / power_wake. Guard with
+// .catch so a dev preview outside Tauri doesn't throw on the listener.
+listen('canvas-pause', () => { paused = true; }).catch(() => {});
+listen('canvas-resume', () => { startLoop(); }).catch(() => {});
 
 animate();
 
@@ -184,6 +207,25 @@ document.addEventListener('DOMContentLoaded', () => {
   wifiBtn.addEventListener('click', (e) => toggleDropdown(wifiDropdownMenu, e));
   bluetoothBtn.addEventListener('click', (e) => toggleDropdown(bluetoothDropdownMenu, e));
   audioBtn.addEventListener('click', (e) => toggleDropdown(audioDropdownMenu, e));
+
+  // ── Paw menu: power actions (Shutdown / Restart / Sleep) ────────────────
+  // Theme + Terminal items are wired in later phases; here we only hook the
+  // three power commands exposed by system_menu.rs. Each closes the dropdown
+  // first so it doesn't flash on the next launch.
+  const closePawMenu = () => dropdownMenu.classList.remove('show');
+
+  document.getElementById('shutdownBtn')?.addEventListener('click', () => {
+    closePawMenu();
+    invoke('power_shutdown_cmd');
+  });
+  document.getElementById('restartBtn')?.addEventListener('click', () => {
+    closePawMenu();
+    invoke('power_restart_cmd');
+  });
+  document.getElementById('sleepBtn')?.addEventListener('click', () => {
+    closePawMenu();
+    invoke('power_sleep_cmd');
+  });
 
   document.addEventListener('click', () => {
     dropdownMenu.classList.remove('show');
