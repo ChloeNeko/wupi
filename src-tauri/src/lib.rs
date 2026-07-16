@@ -16,7 +16,6 @@ pub mod session;
 pub mod sim_card;
 pub mod stream_filter;
 pub mod system_menu;
-pub mod terminal;
 pub mod theme;
 pub mod user_profile;
 
@@ -141,7 +140,6 @@ pub fn run() {
     tracing::info!("=== WUPI OS starting ===");
     tauri::Builder::default()
         .manage(AppState::new())
-        .manage(terminal::new_registry())
         .manage(hardware::AudioRegistry)
         .setup(|app| {
             tracing::info!("setup hook entered");
@@ -441,11 +439,6 @@ pub fn run() {
             system_menu::power_sleep_cmd,
             theme_get,
             theme_set,
-            terminal::terminal_create_window,
-            terminal::terminal_init,
-            terminal::terminal_input,
-            terminal::terminal_resize,
-            terminal::terminal_close,
             hardware::audio::audio_get_state,
             hardware::audio::audio_set_volume,
             hardware::audio::audio_list_outputs,

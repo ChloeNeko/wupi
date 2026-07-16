@@ -46,10 +46,6 @@ roxmltree = "0.10"
 # Randomized startup introduction selection (one pick per boot from the active
 # card's <introductions> list). The canonical RNG; not otherwise in the tree.
 rand = "0.9"
-# Terminal windows: pseudo-terminal (ConPTY on Windows 10+) so the Terminal
-# menu item runs a real, interactive shell piped to an xterm.js frontend.
-# Cross-platform, but only the Windows ConPTY path is exercised in practice.
-portable-pty = "0.8"
 # Windows API bindings — official Microsoft crate (Win32 + WinRT). Used for
 # the hardware integrations: Core Audio (volume + output switching), WLAN
 # (Wi-Fi scan/connect), and Bluetooth (radio + device enumeration). Feature

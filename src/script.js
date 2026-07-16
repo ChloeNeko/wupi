@@ -232,9 +232,8 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   audioBtn.addEventListener('click', (e) => toggleDropdown(audioDropdownMenu, e));
 
   // ── Paw menu: power actions (Shutdown / Restart / Sleep) ────────────────
-  // Theme + Terminal items are wired in later phases; here we only hook the
-  // three power commands exposed by system_menu.rs. Each closes the dropdown
-  // first so it doesn't flash on the next launch.
+  // The three power commands exposed by system_menu.rs. Each closes the
+  // dropdown first so it doesn't flash on the next launch.
   const closePawMenu = () => dropdownMenu.classList.remove('show');
 
   document.getElementById('shutdownBtn')?.addEventListener('click', () => {
@@ -248,16 +247,6 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   document.getElementById('sleepBtn')?.addEventListener('click', () => {
     closePawMenu();
     invoke('power_sleep_cmd');
-  });
-
-  // ── Paw menu: Terminal ──────────────────────────────────────────────────
-  // Opens (or focuses) the borderless glassmorphism terminal window. The
-  // window's own terminal.js then spawns the PTY via terminal_init.
-  document.querySelector('.terminal-item')?.addEventListener('click', () => {
-    closePawMenu();
-    invoke('terminal_create_window').catch((e) =>
-      console.error('[Wupi] terminal_create_window failed', e)
-    );
   });
 
   // ── Theme cascade (paw → theme → color code) ────────────────────────────
