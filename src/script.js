@@ -147,23 +147,27 @@ function animate() {
   }
   ctx.globalAlpha = 1.0;
 
-  // Aurora curtains. The blur is the single most expensive op in the loop —
-  // `ctx.filter = 'blur(30px)'` forces a full-canvas Gaussian pass PER fill.
-  // Draw all 5 curtains into ONE path, apply the blur ONCE, fill ONCE. Cuts
-  // the blur cost from 5× to 1× with identical visuals.
+  // Aurora borealis — 5 layered, independently-hued curtains. Each curtain
+  // gets its own hue oscillation + its own blurred fill, which is what
+  // produces the multi-color ribbon effect. The blur is expensive (a full
+  // Gaussian pass per fill) but it IS the look — the soft bloom is the whole
+  // point. Kept as-is per Chloe: do NOT collapse into one fill.
+  // The perf gains live elsewhere (visibility pause, cached sky, star
+  // batching) so the aurora can stay visually rich.
   ctx.globalCompositeOperation = 'screen';
   ctx.filter = 'blur(30px)';
 
   const curtains = 5;
   const baseCenterY = height * 0.42;
 
-  ctx.beginPath();
   for (let i = 0; i < curtains; i++) {
     const speed = time * (0.1 + i * 0.04);
     const thickness = 45 + i * 15;
 
     const yOffset = (i - (curtains / 2)) * 12;
     const activeCenterY = baseCenterY + yOffset;
+
+    ctx.beginPath();
 
     for (let x = -150; x <= width + 150; x += 40) {
       const y = activeCenterY
@@ -173,6 +177,7 @@ function animate() {
       if (x === -150) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     }
+
     for (let x = width + 150; x >= -150; x -= 40) {
       const y = activeCenterY
               + Math.sin(x * 0.0015 + speed + i * 2.3) * 85
@@ -181,12 +186,12 @@ function animate() {
       ctx.lineTo(x, y);
     }
     ctx.closePath();
+
+    const hue = currentPalette.hueBase + Math.sin(time * 1.0 + i) * currentPalette.hueRange;
+
+    ctx.fillStyle = `hsla(${hue}, 100%, 65%, 0.18)`;
+    ctx.fill();
   }
-  // One fill, one blur pass — hue is the palette base (the per-curtain hue
-  // variation was barely visible under the 30px blur + 0.18 alpha anyway).
-  const hue = currentPalette.hueBase;
-  ctx.fillStyle = `hsla(${hue}, 100%, 65%, 0.18)`;
-  ctx.fill();
 
   ctx.filter = 'none';
   time += 0.0025;
@@ -738,7 +743,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   // ════════════════════════════════════════════════════════════════════════
   // APP WINDOW MANAGER
   // ════════════════════════════════════════════════════════════════════════
-  // The surfaces (Chat, Profile Editor, The Codex, Docks) are DOM overlays in
+  // The surfaces (Chat, Profile Editor, Codex, Docks) are DOM overlays in
   // the ONE Tauri window. Background rules (per Chloe's spec):
   //   - WUPI Chat (chat): the ONLY window that pauses the canvas (stars +
   //     aurora OFF). Its own background is ~80% opaque so the paused backdrop
@@ -956,7 +961,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   // ════════════════════════════════════════════════════════════════════════
   // THE CODEX — authored lore library (NOT a memory browser)
   // ════════════════════════════════════════════════════════════════════════
-  // The Codex is a library of authored reference "books" — world lore, TV-show
+  // Codex is a library of authored reference "books" — world lore, TV-show
   // facts, worldbuilding. Source of truth = .md files in codex/ (re-seeded to
   // the retrieval index at boot + after each edit). It has NOTHING to do with
   // chat history or Wupi's persona — just the lore you author.

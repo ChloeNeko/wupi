@@ -714,7 +714,7 @@ html, body {
 .profile-status.ok { color: #7eff9c; }
 .profile-status.err { color: #ff8080; }
 
-/* ── The Codex — authored lore library (two-pane) ───────────────────── */
+/* ── Codex — authored lore library (two-pane) ───────────────────── */
 /* Left: searchable list of lore entries. Right: reader / editor for the
    selected entry. The window itself is draggable + resizable (`.modal.draggable`). */
 .codex-body { padding: 0; }
