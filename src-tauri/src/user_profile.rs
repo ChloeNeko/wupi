@@ -29,51 +29,40 @@
 
 use std::path::Path;
 
-/// The parsed operator profile. All four fields are optional in the XML — a
-/// field that's absent or empty renders as nothing, and a profile with all
-/// four blank renders to an empty string (suppressed downstream by the
+/// The parsed operator profile. Both fields are optional in the XML — a
+/// field that's absent or empty renders as nothing, and a profile with both
+/// blank renders to an empty string (suppressed downstream by the
 /// `Option<&str>` gate, same empty-skip as the SIM card fallback).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct UserProfile {
     /// How Wupi should address the operator (e.g. "Chloe", "Master", "Creator").
     pub name: String,
-    /// The operator's function (e.g. "Lead Developer", "Operator").
-    pub role: String,
-    /// Who the operator is in the context of this world — freeform prose.
-    pub background: String,
-    /// How Wupi should treat the operator (relationship, tone, dynamics).
-    pub dynamics: String,
+    /// A freeform character description for Wupi to refer to the operator as —
+    /// who they are, how she should treat them, their relationship/tone, etc.
+    /// Replaces the old role/background/dynamics split (simplified 2026-07-17).
+    pub description: String,
 }
 
 impl UserProfile {
     /// Render the profile into a compact `<user_profile>` block for the system
     /// prompt. Only non-blank fields are emitted; the block is skipped
-    /// entirely (empty return) when every field is blank, so the caller's
+    /// entirely (empty return) when both fields are blank, so the caller's
     /// `Option<&str>` gate suppresses the section cleanly.
     ///
     /// XML-tagged fields match the prompt's existing aesthetic (Prime
     /// Directive §1B.3 — rigid structure exploits instruction-tuned attention).
-    /// Ordering is name → role → background → dynamics: identity first, then
-    /// the relational framing last so it lands closest to the conversation.
+    /// Ordering is name → description: identity first, then the character
+    /// framing last so it lands closest to the conversation.
     pub fn render_for_prompt(&self) -> String {
         let mut sections = Vec::new();
 
         if !self.name.trim().is_empty() {
             sections.push(format!("name: {}", self.name.trim()));
         }
-        if !self.role.trim().is_empty() {
-            sections.push(format!("role: {}", self.role.trim()));
-        }
-        if !self.background.trim().is_empty() {
+        if !self.description.trim().is_empty() {
             sections.push(format!(
-                "background:\n{}\n",
-                indent(self.background.trim())
-            ));
-        }
-        if !self.dynamics.trim().is_empty() {
-            sections.push(format!(
-                "dynamics:\n{}\n",
-                indent(self.dynamics.trim())
+                "description:\n{}\n",
+                indent(self.description.trim())
             ));
         }
 
@@ -85,8 +74,8 @@ impl UserProfile {
 }
 
 /// Indent every non-empty line of a block by two spaces, mirroring the SIM
-/// card's `indent` helper so multi-line prose (background, dynamics) nests
-/// cleanly inside its parent field.
+/// card's `indent` helper so multi-line prose (description) nests cleanly
+/// inside its parent field.
 fn indent(block: &str) -> String {
     block
         .lines()
@@ -132,7 +121,7 @@ pub fn load(path: Option<&Path>) -> Option<UserProfile> {
 
 /// Serialize a profile back to `Operator.xml` and write it atomically.
 ///
-/// The inverse of [`load`]: renders the four fields as `<user_profile>` XML
+/// The inverse of [`load`]: renders both fields as `<user_profile>` XML
 /// with every field CDATA-wrapped (so prose containing quotes, angle brackets,
 /// or smart quotes round-trips with zero escape handling — same contract the
 /// parser already assumes). The on-disk format is byte-stable: an unchanged
@@ -186,27 +175,32 @@ pub fn save(path: &Path, profile: &UserProfile) -> anyhow::Result<()> {
 
 /// Render the profile to its canonical on-disk XML form. Separated from
 /// [`save`] so a round-trip unit test can exercise it without touching disk.
-/// Every field is emitted (even when blank) so the file shape is stable; blank
-/// fields render as an empty CDATA section and parse back to an empty string.
+/// Both fields are emitted (even when blank) so the file shape is stable;
+/// blank fields render as an empty CDATA section and parse back to an empty
+/// string.
 fn render_xml(profile: &UserProfile) -> String {
     fn field(tag: &str, value: &str) -> String {
         format!("  <{tag}><![CDATA[{}]]></{tag}>", value)
     }
     format!(
-        "<user_profile>\n{}\n{}\n{}\n{}\n</user_profile>\n",
+        "<user_profile>\n{}\n{}\n</user_profile>\n",
         field("name", &profile.name),
-        field("role", &profile.role),
-        field("background", &profile.background),
-        field("dynamics", &profile.dynamics),
+        field("description", &profile.description),
     )
 }
 
 /// Parse a `Operator.xml` profile from its XML text. Separated from `load` so
 /// the unit tests exercise the parser without touching the filesystem. Root
-/// must be `<user_profile>`; the four child tags are all optional and default
+/// must be `<user_profile>`; the two child tags are both optional and default
 /// to empty strings. CDATA is already merged into `.text()` by roxmltree, so
 /// prose with smart quotes or literal angle brackets parses with zero escape
 /// handling (same contract as the SIM card).
+///
+/// **Backward compat (2026-07-17 simplification):** the old 4-field format
+/// (name/role/background/dynamics) is silently tolerated — `role` is dropped,
+/// and `background` + `dynamics` (if present) are concatenated into
+/// `description` so an old Operator.xml isn't lost on first load. The next
+/// save rewrites it in the new 2-field shape.
 fn parse(xml: &str) -> anyhow::Result<UserProfile> {
     let doc = roxmltree::Document::parse(xml)
         .map_err(|e| anyhow::anyhow!("parsing operator profile XML: {e}"))?;
@@ -216,12 +210,33 @@ fn parse(xml: &str) -> anyhow::Result<UserProfile> {
         .then_some(doc.root_element())
         .ok_or_else(|| anyhow::anyhow!("root element must be <user_profile>"))?;
 
-    Ok(UserProfile {
-        name: child_text(root, "name").unwrap_or_default(),
-        role: child_text(root, "role").unwrap_or_default(),
-        background: child_text(root, "background").unwrap_or_default(),
-        dynamics: child_text(root, "dynamics").unwrap_or_default(),
-    })
+    // New format: name + description. Description is the sole prose field.
+    let name = child_text(root, "name").unwrap_or_default();
+    let mut description = child_text(root, "description").unwrap_or_default();
+
+    // Backward compat: if the old 4-field tags are present (and the new
+    // description is absent), fold background + dynamics into description so
+    // the old prose isn't lost. `role` is intentionally dropped — it was the
+    // least useful field and Chloe's simplification explicitly removes it.
+    if description.trim().is_empty() {
+        let background = child_text(root, "background").unwrap_or_default();
+        let dynamics = child_text(root, "dynamics").unwrap_or_default();
+        let mut folded = String::new();
+        if !background.trim().is_empty() {
+            folded.push_str(background.trim());
+        }
+        if !dynamics.trim().is_empty() {
+            if !folded.is_empty() {
+                folded.push_str("\n\n");
+            }
+            folded.push_str(dynamics.trim());
+        }
+        if !folded.is_empty() {
+            description = folded;
+        }
+    }
+
+    Ok(UserProfile { name, description })
 }
 
 // ── XML traversal helpers ──────────────────────────────────────────────────
@@ -251,14 +266,24 @@ mod tests {
     const SAMPLE: &str = r#"<?xml version="1.0"?>
 <user_profile>
   <name>Chloe</name>
+  <description><![CDATA[
+The operator. Wupi's Master — direct, ambitious, wants an honest engineering
+partner, not a yes-man. Build WUPI OS alongside her.
+  ]]></description>
+</user_profile>"#;
+
+    /// The pre-2026-07-17 4-field shape (name/role/background/dynamics). The
+    /// parser must tolerate it: background + dynamics fold into `description`,
+    /// `role` is dropped. An old Operator.xml isn't lost on first load.
+    const LEGACY_4FIELD: &str = r#"<?xml version="1.0"?>
+<user_profile>
+  <name>Chloe</name>
   <role>Lead Developer</role>
   <background><![CDATA[
 - Builds WUPI OS from the ground up.
-- Wants an honest engineering partner, not a yes-man.
   ]]></background>
   <dynamics><![CDATA[
 - Wupi is intensely devoted to her Master.
-- Direct communication is prized over flattery.
   ]]></dynamics>
 </user_profile>"#;
 
@@ -266,9 +291,16 @@ mod tests {
     fn parse_extracts_all_fields() {
         let p = parse(SAMPLE).expect("sample parses");
         assert_eq!(p.name, "Chloe");
-        assert_eq!(p.role, "Lead Developer");
-        assert!(p.background.contains("Builds WUPI OS"));
-        assert!(p.dynamics.contains("devoted to her Master"));
+        assert!(p.description.contains("honest engineering"));
+    }
+
+    #[test]
+    fn parse_legacy_4field_folds_into_description() {
+        // The old format still loads: background + dynamics → description.
+        let p = parse(LEGACY_4FIELD).expect("legacy parses");
+        assert_eq!(p.name, "Chloe");
+        assert!(p.description.contains("Builds WUPI OS"));
+        assert!(p.description.contains("devoted to her Master"));
     }
 
     #[test]
@@ -279,9 +311,7 @@ mod tests {
 </user_profile>"#;
         let p = parse(minimal).expect("parses");
         assert_eq!(p.name, "Guest");
-        assert_eq!(p.role, "");
-        assert_eq!(p.background, "");
-        assert_eq!(p.dynamics, "");
+        assert_eq!(p.description, "");
     }
 
     #[test]
@@ -304,11 +334,8 @@ mod tests {
         let rendered = p.render_for_prompt();
         assert!(rendered.starts_with("<user_profile>"));
         assert!(rendered.contains("name: Chloe"));
-        assert!(rendered.contains("role: Lead Developer"));
-        assert!(rendered.contains("background:"));
-        assert!(rendered.contains("Builds WUPI OS"));
-        assert!(rendered.contains("dynamics:"));
-        assert!(rendered.contains("devoted to her Master"));
+        assert!(rendered.contains("description:"));
+        assert!(rendered.contains("honest engineering"));
     }
 
     #[test]
@@ -335,6 +362,20 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_preserves_both_fields() {
+        // save → load round-trip via render_xml → parse. Guards the byte-
+        // stable contract (an unchanged profile re-saves identically).
+        let original = UserProfile {
+            name: "Chloe".to_owned(),
+            description: "Master of Wupi.\nDirect and ambitious.".to_owned(),
+        };
+        let xml = render_xml(&original);
+        let reloaded = parse(&xml).expect("round-trip parses");
+        assert_eq!(reloaded.name, original.name);
+        assert_eq!(reloaded.description, original.description);
+    }
+
+    #[test]
     fn shipped_operator_xml_parses_and_renders() {
         // Integration check against the REAL seed profile shipped in the repo.
         // Guards against hand-edits to cards/Operator.xml breaking the parse
@@ -358,14 +399,11 @@ mod tests {
         let p = parse(&xml).expect("shipped Operator.xml must parse cleanly");
         let rendered = p.render_for_prompt();
         assert!(rendered.starts_with("<user_profile>"), "rendered: {rendered}");
-        // The shipped seed has all four fields populated.
-        assert!(p.name.contains("Chloe"));
-        assert!(!p.role.is_empty());
-        assert!(!p.background.is_empty());
-        assert!(!p.dynamics.is_empty());
-        // CDATA content (background, dynamics) must survive — if it were
-        // escaped instead of CDATA-wrapped, the prose wouldn't parse as text.
-        assert!(rendered.contains("background:"));
-        assert!(rendered.contains("dynamics:"));
+        // The shipped seed ships both fields. CDATA content (description) must
+        // survive — if it were escaped instead of CDATA-wrapped, the prose
+        // wouldn't parse as text.
+        assert!(!p.name.trim().is_empty());
+        assert!(!p.description.trim().is_empty());
+        assert!(rendered.contains("description:"));
     }
 }

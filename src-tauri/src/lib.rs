@@ -1345,9 +1345,7 @@ async fn operator_profile_get(
 #[tauri::command]
 async fn operator_profile_set(
     name: String,
-    role: String,
-    background: String,
-    dynamics: String,
+    description: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     // `operator_path` is `Arc<OnceLock<Option<PathBuf>>>`. `.get()` yields
@@ -1358,12 +1356,7 @@ async fn operator_profile_set(
         .get()
         .and_then(|o| o.clone())
         .ok_or_else(|| "no operator profile path resolved".to_string())?;
-    let profile = user_profile::UserProfile {
-        name,
-        role,
-        background,
-        dynamics,
-    };
+    let profile = user_profile::UserProfile { name, description };
     tokio::task::spawn_blocking(move || user_profile::save(&path, &profile))
         .await
         .map_err(|e| format!("profile set join: {e}"))?

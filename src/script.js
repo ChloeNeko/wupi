@@ -680,7 +680,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   // ════════════════════════════════════════════════════════════════════════
   // The surfaces (Chat, Profile Editor, The Codex, Docks) are DOM overlays in
   // the ONE Tauri window. Background rules (per Chloe's spec):
-  //   - WUPI Chat (winChat): the ONLY window that pauses the canvas (stars +
+  //   - WUPI Chat (chat): the ONLY window that pauses the canvas (stars +
   //     aurora OFF). Its own background is ~80% opaque so the paused backdrop
   //     doesn't show through. Closing it resumes the canvas.
   //   - Everything else (Codex, Profile, Docks home): canvas keeps running —
@@ -817,37 +817,37 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   // ── Dock wiring ──────────────────────────────────────────────────────────
   document.getElementById('dockChat')?.addEventListener('click', (e) => {
     e.stopPropagation();
-    openWindow('winChat');
+    openWindow('chat');
   });
   document.getElementById('dockProfile')?.addEventListener('click', (e) => {
     e.stopPropagation();
-    openWindow('winProfile');
+    openWindow('profile');
   });
   document.getElementById('dockCodex')?.addEventListener('click', (e) => {
     e.stopPropagation();
-    openWindow('winCodex');
+    openWindow('codex');
   });
   document.getElementById('dockGames')?.addEventListener('click', (e) => {
     e.stopPropagation();
-    openWindow('winGames');
+    openWindow('games');
   });
   document.getElementById('dockApps')?.addEventListener('click', (e) => {
     e.stopPropagation();
     // Docks = "home": close any open surface windows and show the launcher
-    // grid. (winApps itself is the full-screen home overlay.)
-    closeWindow('winChat');
-    closeWindow('winProfile');
-    closeWindow('winCodex');
-    closeWindow('winGames');
-    openWindow('winApps');
+    // grid. (apps itself is the full-screen home overlay.)
+    closeWindow('chat');
+    closeWindow('profile');
+    closeWindow('codex');
+    closeWindow('games');
+    openWindow('apps');
   });
 
-  // Home-grid launcher icons (inside winApps): open the matching surface.
+  // Home-grid launcher icons (inside apps): open the matching surface.
   document.querySelectorAll('.home-app[data-open]').forEach((icon) => {
     icon.addEventListener('click', (e) => {
       e.stopPropagation();
       const target = icon.dataset.open;
-      closeWindow('winApps'); // leave home, open the app
+      closeWindow('apps'); // leave home, open the app
       openWindow(target);
     });
   });
@@ -857,9 +857,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   // ════════════════════════════════════════════════════════════════════════
   (function profileEditor() {
     const nameEl = document.getElementById('profName');
-    const roleEl = document.getElementById('profRole');
-    const bgEl = document.getElementById('profBackground');
-    const dynEl = document.getElementById('profDynamics');
+    const descEl = document.getElementById('profDescription');
     const saveBtn = document.getElementById('profSaveBtn');
     const statusEl = document.getElementById('profStatus');
     if (!nameEl) return;
@@ -871,17 +869,15 @@ const dropdownMenu = document.getElementById('dropdownMenu');
 
     // Load fresh every time the window opens — cheap, and guarantees the editor
     // reflects disk state (someone could have hand-edited Operator.xml).
-    windowOpenHooks.set('winProfile', () => {
+    windowOpenHooks.set('profile', () => {
       setStatus('Loading…');
       invoke('operator_profile_get')
         .then((profile) => {
           if (profile) {
             nameEl.value = profile.name || '';
-            roleEl.value = profile.role || '';
-            bgEl.value = profile.background || '';
-            dynEl.value = profile.dynamics || '';
+            descEl.value = profile.description || '';
           } else {
-            nameEl.value = ''; roleEl.value = ''; bgEl.value = ''; dynEl.value = '';
+            nameEl.value = ''; descEl.value = '';
           }
           setStatus('');
         })
@@ -893,9 +889,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       setStatus('Saving…');
       invoke('operator_profile_set', {
         name: nameEl.value,
-        role: roleEl.value,
-        background: bgEl.value,
-        dynamics: dynEl.value,
+        description: descEl.value,
       })
         .then(() => setStatus('Saved — applies next message', 'ok'))
         .catch((err) => setStatus('Save failed: ' + err, 'err'))
@@ -1061,7 +1055,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     // + New opens a blank editor.
     addBtn?.addEventListener('click', () => showEditor(null));
 
-    windowOpenHooks.set('winCodex', () => { loadAll(); showEmptyReader(); });
+    windowOpenHooks.set('codex', () => { loadAll(); showEmptyReader(); });
   })();
 
   // ════════════════════════════════════════════════════════════════════════
@@ -1228,6 +1222,6 @@ const dropdownMenu = document.getElementById('dropdownMenu');
           showEmpty();
         });
     }
-    windowOpenHooks.set('winChat', loadIntro);
+    windowOpenHooks.set('chat', loadIntro);
     loadIntro();
   })();

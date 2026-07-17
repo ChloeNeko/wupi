@@ -219,10 +219,10 @@
          `.app-window` is hidden unless `.show`. -->
 
     <!-- WUPI Chat — small movable/resizable window, centered -->
-    <div class="app-window chat draggable" id="winChat" aria-hidden="true">
+    <div class="app-window chat draggable" id="chat" aria-hidden="true">
         <div class="app-window-header">
             <span class="app-window-title">WUPI Chat</span>
-            <button class="app-window-close" data-close="winChat" aria-label="Close">✕</button>
+            <button class="app-window-close" data-close="chat" aria-label="Close">✕</button>
         </div>
         <div class="app-window-body chat-body">
             <div class="chat-messages" id="chatMessages"></div>
@@ -237,21 +237,17 @@
     </div>
 
     <!-- Profile Editor — centered modal, draggable + resizable -->
-    <div class="app-window modal draggable" id="winProfile" aria-hidden="true">
+    <div class="app-window modal draggable" id="profile" aria-hidden="true">
         <div class="app-window-header">
             <span class="app-window-title">Profile Editor</span>
-            <button class="app-window-close" data-close="winProfile" aria-label="Close">✕</button>
+            <button class="app-window-close" data-close="profile" aria-label="Close">✕</button>
         </div>
         <div class="app-window-body profile-body">
             <p class="profile-hint">Who Wupi is talking to. Saved live — applies on the next message.</p>
             <label class="field-label">Name</label>
             <input type="text" id="profName" class="field-input" placeholder="How Wupi should address you" />
-            <label class="field-label">Role</label>
-            <input type="text" id="profRole" class="field-input" placeholder="e.g. Lead Developer, Operator" />
-            <label class="field-label">Background</label>
-            <textarea id="profBackground" class="field-textarea" rows="4" placeholder="Who you are in this world…"></textarea>
-            <label class="field-label">Dynamics</label>
-            <textarea id="profDynamics" class="field-textarea" rows="4" placeholder="How Wupi should treat you (tone, relationship)…"></textarea>
+            <label class="field-label">Description</label>
+            <textarea id="profDescription" class="field-textarea" rows="6" placeholder="A character description for Wupi to refer to you as — who you are, how she should treat you, your relationship…"></textarea>
             <div class="profile-actions">
                 <span class="profile-status" id="profStatus"></span>
                 <button id="profSaveBtn" class="field-btn primary">Save</button>
@@ -260,10 +256,10 @@
     </div>
 
     <!-- The Codex — memory browser, centered modal, larger, draggable + resizable -->
-    <div class="app-window modal codex draggable" id="winCodex" aria-hidden="true">
+    <div class="app-window modal codex draggable" id="codex" aria-hidden="true">
         <div class="app-window-header">
             <span class="app-window-title">The Codex</span>
-            <button class="app-window-close" data-close="winCodex" aria-label="Close">✕</button>
+            <button class="app-window-close" data-close="codex" aria-label="Close">✕</button>
         </div>
         <div class="app-window-body codex-body">
             <div class="codex-layout">
@@ -287,10 +283,10 @@
     </div>
 
     <!-- Games — launcher surface for WUPI OS simulation/game scenarios. -->
-    <div class="app-window modal games draggable" id="winGames" aria-hidden="true">
+    <div class="app-window modal games draggable" id="games" aria-hidden="true">
         <div class="app-window-header">
             <span class="app-window-title">Games</span>
-            <button class="app-window-close" data-close="winGames" aria-label="Close">✕</button>
+            <button class="app-window-close" data-close="games" aria-label="Close">✕</button>
         </div>
         <div class="app-window-body games-body">
             <div class="games-empty">No scenarios installed.</div>
@@ -298,10 +294,10 @@
     </div>
 
     <!-- Docks — full-screen "home" launcher grid. Background stays active. -->
-    <div class="app-window home" id="winApps" aria-hidden="true">
-        <button class="app-window-close home-close" data-close="winApps" aria-label="Close">✕</button>
+    <div class="app-window home" id="apps" aria-hidden="true">
+        <button class="app-window-close home-close" data-close="apps" aria-label="Close">✕</button>
         <div class="home-grid">
-            <div class="home-app" data-open="winChat">
+            <div class="home-app" data-open="chat">
                 <div class="home-app-icon">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
@@ -309,7 +305,7 @@
                 </div>
                 <span class="home-app-label">WUPI Chat</span>
             </div>
-            <div class="home-app" data-open="winProfile">
+            <div class="home-app" data-open="profile">
                 <div class="home-app-icon">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
@@ -318,7 +314,7 @@
                 </div>
                 <span class="home-app-label">Profile Editor</span>
             </div>
-            <div class="home-app" data-open="winCodex">
+            <div class="home-app" data-open="codex">
                 <div class="home-app-icon">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
@@ -327,7 +323,7 @@
                 </div>
                 <span class="home-app-label">The Codex</span>
             </div>
-            <div class="home-app" data-open="winGames">
+            <div class="home-app" data-open="games">
                 <div class="home-app-icon">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                         <line x1="6" y1="11" x2="10" y2="11"></line>
