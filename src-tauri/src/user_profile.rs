@@ -33,7 +33,7 @@ use std::path::Path;
 /// field that's absent or empty renders as nothing, and a profile with all
 /// four blank renders to an empty string (suppressed downstream by the
 /// `Option<&str>` gate, same empty-skip as the SIM card fallback).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct UserProfile {
     /// How Wupi should address the operator (e.g. "Chloe", "Master", "Creator").
     pub name: String,
@@ -128,6 +128,77 @@ pub fn load(path: Option<&Path>) -> Option<UserProfile> {
             None
         }
     }
+}
+
+/// Serialize a profile back to `Operator.xml` and write it atomically.
+///
+/// The inverse of [`load`]: renders the four fields as `<user_profile>` XML
+/// with every field CDATA-wrapped (so prose containing quotes, angle brackets,
+/// or smart quotes round-trips with zero escape handling — same contract the
+/// parser already assumes). The on-disk format is byte-stable: an unchanged
+/// profile re-saves to byte-identical text, so it stays cache-friendly for the
+/// §2F guard.
+///
+/// **Atomic write** (temp file → fsync → rename over the target) so a crash or
+/// power loss mid-write can never truncate `Operator.xml` — mirrors the atomic
+/// pattern in `session.rs` (AGENTS.md §2E). The temp lives next to the target
+/// (same volume → `rename` is atomic; on Windows it uses
+/// `MOVEFILE_REPLACE_EXISTING`).
+///
+/// Hot-reload is automatic: `chat_send` re-reads the file every turn, so the
+/// saved values take effect on the next message with zero extra wiring.
+pub fn save(path: &Path, profile: &UserProfile) -> anyhow::Result<()> {
+    let xml = render_xml(profile);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("operator profile path has no parent: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| anyhow::anyhow!("create operator profile dir: {e:?}"))?;
+
+    // Write to a sibling temp, fsync, then atomic-rename over the target.
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!(
+        ".wupi-operator-{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("xml")
+    ));
+    // Place the temp NEXT TO the target (same volume) so rename is atomic.
+    let tmp = parent.join(
+        tmp.file_name()
+            .ok_or_else(|| anyhow::anyhow!("bad temp file name"))?,
+    );
+
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| anyhow::anyhow!("create operator temp: {e:?}"))?;
+        f.write_all(xml.as_bytes())
+            .map_err(|e| anyhow::anyhow!("write operator temp: {e:?}"))?;
+        f.sync_all()
+            .map_err(|e| anyhow::anyhow!("fsync operator temp: {e:?}"))?;
+    }
+
+    std::fs::rename(&tmp, path)
+        .map_err(|e| anyhow::anyhow!("rename operator temp → target: {e:?}"))?;
+    Ok(())
+}
+
+/// Render the profile to its canonical on-disk XML form. Separated from
+/// [`save`] so a round-trip unit test can exercise it without touching disk.
+/// Every field is emitted (even when blank) so the file shape is stable; blank
+/// fields render as an empty CDATA section and parse back to an empty string.
+fn render_xml(profile: &UserProfile) -> String {
+    fn field(tag: &str, value: &str) -> String {
+        format!("  <{tag}><![CDATA[{}]]></{tag}>", value)
+    }
+    format!(
+        "<user_profile>\n{}\n{}\n{}\n{}\n</user_profile>\n",
+        field("name", &profile.name),
+        field("role", &profile.role),
+        field("background", &profile.background),
+        field("dynamics", &profile.dynamics),
+    )
 }
 
 /// Parse a `Operator.xml` profile from its XML text. Separated from `load` so

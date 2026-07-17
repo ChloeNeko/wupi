@@ -85,6 +85,11 @@ pub struct AppState {
     /// Lock-free reads after `setup`. Held as `Option<PathBuf>` so a missing
     /// profile is `None`, distinct from "not yet resolved."
     pub operator_path: Arc<std::sync::OnceLock<Option<std::path::PathBuf>>>,
+    /// The resolved `docs/` directory (Codex lore library; renamed from
+    /// `codex/` 2026-07-17). Filled once in setup; the codex_* IPC commands
+    /// read/write `.md` files here. `None` when no docs/ dir resolved — the
+    /// Codex UI shows empty.
+    pub codex_dir: Arc<std::sync::OnceLock<Option<std::path::PathBuf>>>,
     /// The active theme + color code (defaults Aurora / Vibrant). Read by the
     /// frontend to paint the cascade panels; written by `theme_set`. Held
     /// under a std Mutex — never awaited across.
@@ -111,6 +116,7 @@ impl AppState {
             )),
             active_card: Arc::new(std::sync::OnceLock::new()),
             operator_path: Arc::new(std::sync::OnceLock::new()),
+            codex_dir: Arc::new(std::sync::OnceLock::new()),
             theme: Arc::new(std::sync::Mutex::new(theme::ThemeSettings::default())),
             theme_path: Arc::new(std::sync::OnceLock::new()),
         }
@@ -361,7 +367,7 @@ pub fn run() {
                     tracing::info!(db = %memory_db_path.display(), "memory engine initialized");
 
                     // ── Codex seed (Codex v1, 2026-07-14) ──────────────────────
-                    // Reconcile authored `.md` files in `codex/` against the
+                    // Reconcile authored `.md` files in `docs/` against the
                     // Codex-tagged entries already stored in memory.sqlite.
                     // Idempotent (hash-based): re-runs against an unchanged
                     // source set do zero writes. Best-effort — a failed seed
@@ -370,6 +376,8 @@ pub fn run() {
                     // allowed to block — it already blocks on the embedder
                     // readiness channel above).
                     if let Some(codex_dir) = resolve_codex_dir(app.handle()) {
+                        // Cache the resolved path for the codex_* IPC (file CRUD).
+                        let _ = state.codex_dir.set(Some(codex_dir.clone()));
                         if let Some(engine) = state.memory.get() {
                             match tauri::async_runtime::block_on(
                                 codex::seed_codex(engine, &codex_dir, memory::WUPI_OS_CARD_ID),
@@ -388,7 +396,7 @@ pub fn run() {
                             }
                         }
                     } else {
-                        tracing::info!("no codex/ dir found; skipping codex seed");
+                        tracing::info!("no docs/ dir found; skipping codex seed");
                     }
                 }
                 Err(e) => {
@@ -434,6 +442,15 @@ pub fn run() {
             get_intro,
             debug_memory_query,
             debug_schema_delta,
+            memory_list,
+            memory_update,
+            memory_delete,
+            memory_wipe_card,
+            codex_list,
+            codex_save,
+            codex_delete,
+            operator_profile_get,
+            operator_profile_set,
             system_menu::power_shutdown_cmd,
             system_menu::power_restart_cmd,
             system_menu::power_sleep_cmd,
@@ -706,35 +723,36 @@ fn resolve_operator_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Resolve the `codex/` directory (Codex v1, 2026-07-14). Mirrors
-/// [`resolve_card_path`] — same 5-candidate walk — but joins `"codex"` and
-/// returns the *directory* (not a single file), since the codex dir holds a
-/// set of `*.md` files. Returns `None` if no `codex/` dir exists in any
-/// candidate location (graceful — the Codex is optional; the seed loader
-/// treats a missing dir as "nothing to seed").
+/// Resolve the `docs/` directory — the Codex lore source (renamed from
+/// `codex/` 2026-07-17, after the `.md` files moved there). Mirrors
+/// [`resolve_card_path`] — same 5-candidate walk — but joins `"docs"` and
+/// returns the *directory* (not a single file), since it holds a set of
+/// `*.md` files. Returns `None` if no `docs/` dir exists in any candidate
+/// location (graceful — the Codex is optional; the seed loader treats a
+/// missing dir as "nothing to seed").
 fn resolve_codex_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Some(d) = app.path().resource_dir().ok() {
-        candidates.push(d.join("codex"));
+        candidates.push(d.join("docs"));
     }
     if let Some(exe) = std::env::current_exe().ok() {
         if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("codex"));
+            candidates.push(parent.join("docs"));
             if let Some(grand) = parent.parent().and_then(|g| g.parent()) {
-                candidates.push(grand.join("codex"));
+                candidates.push(grand.join("docs"));
             }
             if let Some(gg) = parent.parent().and_then(|g| g.parent()).and_then(|g| g.parent()) {
-                candidates.push(gg.join("codex"));
+                candidates.push(gg.join("docs"));
             }
         }
     }
     if let Some(data) = app.path().app_data_dir().ok() {
-        candidates.push(data.join("codex"));
+        candidates.push(data.join("docs"));
     }
 
     for dir in &candidates {
         if dir.is_dir() {
-            tracing::info!("resolved codex dir: {}", dir.display());
+            tracing::info!("resolved codex (docs/) dir: {}", dir.display());
             return Some(dir.clone());
         }
     }
@@ -1131,6 +1149,224 @@ async fn debug_memory_query(
     engine
         .search(&query, &card_id, top_k.unwrap_or(10), dense_floor)
         .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+// ── Memory browser IPC (The Codex surface) ─────────────────────────────────
+// The Codex UI lists / searches / edits / removes memories and can hard-reset
+// the active card's episodic store. `debug_memory_query` above is the search
+// path (reused by the Codex search box); these four commands cover enumerate /
+// mutate / wipe. All scope to the active card id exactly as the search does.
+
+/// Enumerate memories in the active card, newest first. The Codex browser's
+/// default view. `limit` defaults to 200 (the per-card corpus is small); an
+/// explicit `0` is clamped to 1 so the UI always gets at least the head row.
+#[tauri::command]
+async fn memory_list(
+    limit: Option<usize>,
+    offset: Option<usize>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<memory::MemoryEntry>, String> {
+    let engine = state
+        .memory
+        .get()
+        .ok_or_else(|| "memory engine not initialized".to_string())?;
+    let card_id = state
+        .active_card_id
+        .lock()
+        .expect("active_card_id mutex")
+        .clone();
+    let limit = limit.unwrap_or(200).max(1);
+    let offset = offset.unwrap_or(0);
+    engine
+        .list_memories(&card_id, limit, offset)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Edit one memory's text in place (re-embeds + rewrites all three tables).
+/// Silent no-op if `id` doesn't exist. Used by the Codex browser's inline
+/// editor.
+#[tauri::command]
+async fn memory_update(
+    id: i64,
+    text: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let engine = state
+        .memory
+        .get()
+        .ok_or_else(|| "memory engine not initialized".to_string())?;
+    engine
+        .update_memory(id, text)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Delete one memory by id (all three tables). Used by the Codex browser's
+/// per-row Remove button. Wraps the existing engine method; lifted to IPC so
+/// the frontend doesn't need a separate delete surface.
+#[tauri::command]
+async fn memory_delete(id: i64, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let engine = state
+        .memory
+        .get()
+        .ok_or_else(|| "memory engine not initialized".to_string())?;
+    engine
+        .delete_memory(id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Hard reset: wipe every EPISODIC memory in the active card, preserving
+/// authored Codex lore. Returns the deleted count so the UI can confirm.
+/// The Codex browser's "Hard Reset" button (confirm-gated on the frontend).
+#[tauri::command]
+async fn memory_wipe_card(state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    let engine = state
+        .memory
+        .get()
+        .ok_or_else(|| "memory engine not initialized".to_string())?;
+    let card_id = state
+        .active_card_id
+        .lock()
+        .expect("active_card_id mutex")
+        .clone();
+    engine
+        .wipe_episodic_card(&card_id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+// ── Codex IPC (the Codex lore-library surface) ─────────────────────────────
+// The Codex is a library of authored reference "books" (world lore, TV/wiki
+// facts, worldbuilding). Source of truth = `.md` files in the resolved
+// `docs/` dir; the DB is a derived retrieval index re-seeded at boot. These
+// three commands operate on the FILES directly, then re-seed so retrieval
+// stays in sync within the running session. Nothing here touches episodic
+// chat memory — the Codex is a separate, authored-only surface.
+
+/// List every Codex entry (filename, title, tags, body). The Codex UI's
+/// library view. Returns an empty Vec when no docs/ dir resolved.
+#[tauri::command]
+fn codex_list(state: tauri::State<'_, AppState>) -> Result<Vec<codex::CodexFile>, String> {
+    let dir = state.codex_dir.get().and_then(|o| o.as_ref());
+    let Some(dir) = dir else { return Ok(Vec::new()); };
+    codex::list_files(dir).map_err(|e| format!("{e:#}"))
+}
+
+/// Create or overwrite a Codex `.md` file, then re-seed so retrieval sees the
+/// change this session. `filename` is the stem (sanitized on disk). Returns
+/// the (possibly-sanitized) filename so the UI can track the real key.
+#[tauri::command]
+async fn codex_save(
+    filename: String,
+    title: String,
+    tags: Vec<String>,
+    body: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    let dir = state
+        .codex_dir
+        .get()
+        .and_then(|o| o.as_ref().cloned())
+        .ok_or_else(|| "no codex dir resolved".to_string())?;
+    // Write the file off the tokio worker (synchronous FS I/O). `save_file`
+    // returns the sanitized stem it actually wrote — echo it back so the UI
+    // tracks the entry by its real on-disk key.
+    let saved_name = tokio::task::spawn_blocking(move || codex::save_file(&dir, &filename, &title, &tags, &body))
+        .await
+        .map_err(|e| format!("codex save join: {e}"))?
+        .map_err(|e| format!("{e:#}"))?;
+    // Re-seed so the retrieval index reflects the edit without a reboot.
+    if let (Some(engine), Some(dir)) = (state.memory.get(), state.codex_dir.get().and_then(|o| o.as_ref())) {
+        let card_id = state.active_card_id.lock().expect("active_card_id mutex").clone();
+        let _ = codex::seed_codex(engine, dir, &card_id).await;
+    }
+    Ok(saved_name)
+}
+
+/// Delete a Codex `.md` file by stem, then re-seed. Silent no-op if missing.
+#[tauri::command]
+async fn codex_delete(
+    filename: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let dir = state
+        .codex_dir
+        .get()
+        .and_then(|o| o.as_ref().cloned())
+        .ok_or_else(|| "no codex dir resolved".to_string())?;
+    tokio::task::spawn_blocking(move || codex::delete_file(&dir, &filename))
+        .await
+        .map_err(|e| format!("codex delete join: {e}"))?
+        .map_err(|e| format!("{e:#}"))?;
+    if let (Some(engine), Some(dir)) = (state.memory.get(), state.codex_dir.get().and_then(|o| o.as_ref())) {
+        let card_id = state.active_card_id.lock().expect("active_card_id mutex").clone();
+        let _ = codex::seed_codex(engine, dir, &card_id).await;
+    }
+    Ok(())
+}
+
+// ── Operator Profile IPC (the Profile Editor surface) ──────────────────────
+// Two commands mirror the theme get/set pattern: read fresh from the cached
+// path, write atomically back. Hot-reload is automatic (chat_send re-reads
+// every turn), so a saved profile applies on the next chat turn with no extra
+// wiring. `UserProfile` is Serialize/Deserialize so it crosses IPC directly.
+
+/// Read the operator profile fresh from disk. Returns `None` when no
+/// Operator.xml resolved at startup (the Profile Editor renders empty fields
+/// and a Create prompt in that case).
+#[tauri::command]
+async fn operator_profile_get(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<user_profile::UserProfile>, String> {
+    // `operator_path` is `Arc<OnceLock<Option<PathBuf>>>`. `.get()` yields
+    // `Option<&Option<PathBuf>>`; flatten + clone the inner PathBuf to an
+    // OWNED Option<PathBuf> so it can move into the 'static spawn_blocking
+    // closure (a borrow of `state` can't cross that boundary). `load` takes
+    // Option<&Path>; `.as_deref()` on the owned Option<PathBuf> at the call
+    // site yields exactly that.
+    let path = state
+        .operator_path
+        .get()
+        .and_then(|o| o.clone());
+    // spawn_blocking: load does synchronous file I/O. Cheap, but keep it off
+    // the tokio worker for consistency with the rest of the profile/memory IPC.
+    tokio::task::spawn_blocking(move || user_profile::load(path.as_deref()))
+        .await
+        .map_err(|e| format!("profile get join: {e}"))
+}
+
+/// Write the operator profile atomically to the resolved `Operator.xml` path.
+/// Creates the file (and its parent dir) if missing. Returns an error string
+/// if no path resolved at startup (shouldn't happen — `setup` always resolves
+/// the candidates; `None` means none existed, in which case we can't write).
+#[tauri::command]
+async fn operator_profile_set(
+    name: String,
+    role: String,
+    background: String,
+    dynamics: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    // `operator_path` is `Arc<OnceLock<Option<PathBuf>>>`. `.get()` yields
+    // `Option<&Option<PathBuf>>`; flatten + clone the inner PathBuf so we own
+    // it and can move it into the spawn_blocking closure.
+    let path = state
+        .operator_path
+        .get()
+        .and_then(|o| o.clone())
+        .ok_or_else(|| "no operator profile path resolved".to_string())?;
+    let profile = user_profile::UserProfile {
+        name,
+        role,
+        background,
+        dynamics,
+    };
+    tokio::task::spawn_blocking(move || user_profile::save(&path, &profile))
+        .await
+        .map_err(|e| format!("profile set join: {e}"))?
         .map_err(|e| format!("{e:#}"))
 }
 

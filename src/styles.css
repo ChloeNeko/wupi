@@ -494,3 +494,627 @@ html, body {
     text-align: right;
     font-variant-numeric: tabular-nums;
 }
+
+/* ════════════════════════════════════════════════════════════════════════ */
+/* APP WINDOWS — overlay panels layered over the canvas                       */
+/* ════════════════════════════════════════════════════════════════════════ */
+/* One Tauri window; these are DOM overlays. z-index 1000 puts them above the
+   canvas (z:1) but below the top-bar (z:9999) and dock (z:9998) so system
+   chrome stays usable. Dark-violet glassmorphism: the backdrop blur shows the
+   clean dark body bg (#02040a) once stars are culled. */
+
+.app-window {
+    position: fixed;
+    z-index: 1000;
+    display: none;
+    flex-direction: column;
+    background: rgba(20, 10, 35, 0.72);
+    backdrop-filter: blur(28px) saturate(1.3);
+    -webkit-backdrop-filter: blur(28px) saturate(1.3);
+    border: 1px solid rgba(181, 52, 250, 0.22);
+    border-radius: 18px;
+    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.55), 0 0 60px rgba(181, 52, 250, 0.08) inset;
+    color: rgba(255, 255, 255, 0.9);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    overflow: hidden;
+}
+.app-window.show {
+    display: flex;
+    animation: winOpen 0.22s cubic-bezier(0.175, 0.885, 0.32, 1.1);
+}
+@keyframes winOpen {
+    from { opacity: 0; transform: translateY(12px) scale(0.98); }
+    to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* Chat window: a small, movable, resizable rectangle (like the modals).
+   Background stays ACTIVE (no pause) and is more transparent so stars/aurora
+   show through faintly. Draggable via header + native resize handle. */
+.app-window.chat {
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 440px;
+    height: 560px;
+    max-width: 90vw;
+    max-height: 85vh;
+    background: rgba(20, 10, 35, 0.55);
+    resize: both;
+    min-width: 340px;
+    min-height: 360px;
+}
+.app-window.chat.dragged {
+    transform: none; /* JS sets left/top after a drag */
+}
+.app-window.chat.dragged.show {
+    animation: none;
+}
+.app-window.chat.show {
+    transform: translate(-50%, -50%);
+    animation: winOpenModal 0.18s ease-out;
+}
+
+/* Modal geometry: centered both axes, auto-sized with clamps.
+   Draggable modals (Profile, Codex) are also user-resizable via the native
+   resize handle (bottom-right). `.dragged` is applied by JS once the user
+   grabs the header — it drops the centering transform so left/top take over. */
+.app-window.modal {
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 560px;
+    max-width: 90vw;
+    max-height: 80vh;
+}
+.app-window.modal.codex {
+    width: 760px;
+    max-height: 82vh;
+}
+.app-window.modal.draggable {
+    resize: both;
+    min-width: 360px;
+    min-height: 280px;
+}
+.app-window.modal.dragged {
+    transform: none; /* JS sets left/top; drop the centering transform */
+}
+.app-window.modal.dragged.show {
+    animation: none; /* no transform animation once manually positioned */
+}
+.app-window.modal.show {
+    transform: translate(-50%, -50%);
+    animation: winOpenModal 0.18s ease-out;
+}
+/* Pure opacity fade — NO transform animation. Animating transform alongside
+   the `display:none→flex` flip caused a one-frame mismatch between the resting
+   `translate(-50%,-50%)` and the keyframe's start offset, which read as a
+   "flash from bottom then teleport to center." Opacity-only keeps the element
+   pinned at its resting transform the whole time. */
+@keyframes winOpenModal {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+}
+
+.app-window-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 18px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    user-select: none;
+}
+.app-window-title {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    color: #fff;
+}
+.app-window-close {
+    background: rgba(255, 255, 255, 0.08);
+    border: none;
+    color: rgba(255, 255, 255, 0.7);
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 14px;
+    line-height: 1;
+    transition: background 0.15s, color 0.15s;
+}
+.app-window-close:hover {
+    background: rgba(255, 80, 80, 0.25);
+    color: #fff;
+}
+
+.app-window-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 18px;
+}
+.app-window-body::-webkit-scrollbar { width: 8px; }
+.app-window-body::-webkit-scrollbar-track { background: transparent; }
+.app-window-body::-webkit-scrollbar-thumb {
+    background: rgba(181, 52, 250, 0.3);
+    border-radius: 4px;
+}
+.app-window-body::-webkit-scrollbar-thumb:hover { background: rgba(181, 52, 250, 0.5); }
+
+/* ── Reusable form controls (Profile + Codex) ─────────────────────────── */
+.field-label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.5);
+    margin: 14px 0 6px;
+}
+.field-label:first-child { margin-top: 0; }
+.field-input, .field-textarea {
+    width: 100%;
+    box-sizing: border-box;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 10px;
+    padding: 10px 12px;
+    color: #fff;
+    font-family: inherit;
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
+    resize: vertical;
+}
+.field-input:focus, .field-textarea:focus {
+    border-color: rgba(181, 52, 250, 0.6);
+    box-shadow: 0 0 0 3px rgba(181, 52, 250, 0.12);
+}
+.field-input::placeholder, .field-textarea::placeholder {
+    color: rgba(255, 255, 255, 0.3);
+}
+.field-btn {
+    padding: 9px 18px;
+    border-radius: 10px;
+    border: none;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform 0.1s, box-shadow 0.15s, background 0.15s;
+}
+.field-btn:active { transform: scale(0.97); }
+.field-btn.primary {
+    background: linear-gradient(135deg, #b534fa, #6a0dad);
+    color: #fff;
+    box-shadow: 0 4px 14px rgba(181, 52, 250, 0.35);
+}
+.field-btn.primary:hover { box-shadow: 0 6px 20px rgba(181, 52, 250, 0.5); }
+.field-btn.danger {
+    background: rgba(255, 60, 60, 0.15);
+    color: #ff8080;
+    border: 1px solid rgba(255, 60, 60, 0.3);
+}
+.field-btn.danger:hover { background: rgba(255, 60, 60, 0.28); }
+
+/* ── Profile Editor ───────────────────────────────────────────────────── */
+.profile-hint {
+    margin: 0 0 4px;
+    font-size: 13px;
+    color: rgba(255, 255, 255, 0.5);
+}
+.profile-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 20px;
+}
+.profile-status {
+    font-size: 13px;
+    color: rgba(255, 255, 255, 0.6);
+}
+.profile-status.ok { color: #7eff9c; }
+.profile-status.err { color: #ff8080; }
+
+/* ── The Codex — authored lore library (two-pane) ───────────────────── */
+/* Left: searchable list of lore entries. Right: reader / editor for the
+   selected entry. The window itself is draggable + resizable (`.modal.draggable`). */
+.codex-body { padding: 0; }
+.codex-layout {
+    display: flex;
+    height: 100%;
+    min-height: 360px;
+}
+.codex-sidebar {
+    width: 260px;
+    flex-shrink: 0;
+    border-right: 1px solid rgba(255, 255, 255, 0.07);
+    display: flex;
+    flex-direction: column;
+    padding: 12px;
+    gap: 10px;
+}
+.codex-toolbar {
+    display: flex;
+    gap: 8px;
+}
+.codex-search {
+    flex: 1;
+    min-width: 0;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 10px;
+    padding: 8px 11px;
+    color: #fff;
+    font-family: inherit;
+    font-size: 13px;
+    outline: none;
+}
+.codex-search:focus {
+    border-color: rgba(181, 52, 250, 0.6);
+    box-shadow: 0 0 0 3px rgba(181, 52, 250, 0.12);
+}
+.codex-add-btn { padding: 8px 12px; font-size: 12px; white-space: nowrap; }
+.codex-list {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.codex-list::-webkit-scrollbar { width: 6px; }
+.codex-list::-webkit-scrollbar-thumb { background: rgba(181, 52, 250, 0.3); border-radius: 3px; }
+.codex-row {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 10px;
+    padding: 9px 11px;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+}
+.codex-row:hover {
+    border-color: rgba(181, 52, 250, 0.35);
+    background: rgba(181, 52, 250, 0.08);
+}
+.codex-row-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.92);
+    margin-bottom: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.codex-row-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+.codex-tag {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: 5px;
+    font-size: 10px;
+    font-weight: 600;
+    background: rgba(181, 52, 250, 0.16);
+    color: #d59cff;
+}
+.codex-status {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.45);
+    text-align: center;
+    flex-shrink: 0;
+}
+.codex-status.err { color: #ff8080; }
+.codex-status.ok { color: #7eff9c; }
+.codex-empty {
+    text-align: center;
+    padding: 30px 12px;
+    color: rgba(255, 255, 255, 0.4);
+    font-size: 13px;
+}
+
+/* Right pane: reader */
+.codex-reader {
+    flex: 1;
+    min-width: 0;
+    overflow-y: auto;
+    padding: 20px 24px;
+}
+.codex-reader::-webkit-scrollbar { width: 8px; }
+.codex-reader::-webkit-scrollbar-thumb { background: rgba(181, 52, 250, 0.3); border-radius: 4px; }
+.codex-reader-empty {
+    color: rgba(255, 255, 255, 0.3);
+    font-size: 14px;
+    text-align: center;
+    margin-top: 60px;
+}
+.codex-reader-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+    margin-bottom: 18px;
+    padding-bottom: 14px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+.codex-reader-title {
+    font-size: 20px;
+    font-weight: 700;
+    color: #fff;
+    margin-bottom: 8px;
+}
+.codex-reader-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+}
+.codex-reader-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+}
+.codex-reader-body {
+    font-size: 14px;
+    line-height: 1.65;
+    color: rgba(255, 255, 255, 0.85);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+/* Right pane: editor (shared form controls + editor-specific) */
+.codex-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.codex-editor-row { display: flex; flex-direction: column; }
+.codex-editor-body {
+    min-height: 220px;
+    flex: 1;
+    font-family: inherit;
+    line-height: 1.5;
+}
+.codex-editor-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 14px;
+}
+
+/* Small action buttons (reused in reader head) */
+.codex-mini-btn {
+    padding: 5px 11px;
+    border-radius: 7px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: transparent;
+    color: rgba(255, 255, 255, 0.8);
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.codex-mini-btn:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
+.codex-mini-btn.del:hover { background: rgba(255, 60, 60, 0.22); color: #ff9090; border-color: rgba(255, 60, 60, 0.3); }
+
+/* ── Docks (full-screen home launcher grid) ──────────────────────────── */
+/* winApps is a full-screen overlay (NOT a modal) — the "desktop/home" view.
+   Background stays fully active (stars/aurora animate behind it); the overlay
+   itself is nearly transparent so the canvas shows through. App icons live in
+   a centered grid; clicking one closes home and opens that surface.
+   NOTE: the flex layout lives under `.home.show` — the base `.app-window` rule
+   sets `display:none`, and we must NOT override it here or the overlay covers
+   the whole screen invisibly on load (blocking all interaction). */
+.app-window.home {
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    transform: none;
+    border-radius: 0;
+    border: none;
+    background: transparent;
+    box-shadow: none;
+}
+.app-window.home.show {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transform: none;
+    animation: fadeIn 0.18s ease-out;
+}
+.home-close {
+    position: absolute;
+    top: 60px;
+    right: 24px;
+    z-index: 2;
+}
+.home-grid {
+    display: flex;
+    gap: 48px;
+    flex-wrap: wrap;
+    justify-content: center;
+    padding: 40px;
+}
+.home-app {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+    cursor: pointer;
+    padding: 20px 24px;
+    border-radius: 22px;
+    transition: transform 0.18s cubic-bezier(0.175, 0.885, 0.32, 1.2), background 0.18s;
+    background: rgba(255, 255, 255, 0.04);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+.home-app:hover {
+    transform: translateY(-6px) scale(1.05);
+    background: rgba(181, 52, 250, 0.12);
+    border-color: rgba(181, 52, 250, 0.35);
+    box-shadow: 0 12px 30px rgba(181, 52, 250, 0.2);
+}
+.home-app-icon {
+    width: 84px;
+    height: 84px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(135deg, rgba(181, 52, 250, 0.25), rgba(106, 13, 173, 0.25));
+    border-radius: 22px;
+    color: #fff;
+}
+.home-app-icon svg {
+    width: 44px;
+    height: 44px;
+}
+.home-app-label {
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    color: rgba(255, 255, 255, 0.9);
+}
+
+/* ── WUPI Chat ────────────────────────────────────────────────────────── */
+.chat-body {
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+}
+.chat-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+.chat-messages::-webkit-scrollbar { width: 8px; }
+.chat-messages::-webkit-scrollbar-track { background: transparent; }
+.chat-messages::-webkit-scrollbar-thumb { background: rgba(181, 52, 250, 0.3); border-radius: 4px; }
+.msg {
+    max-width: 82%;
+    padding: 10px 14px;
+    border-radius: 16px;
+    font-size: 14px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    animation: msgIn 0.18s ease-out;
+}
+@keyframes msgIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+.msg.user {
+    align-self: flex-end;
+    background: linear-gradient(135deg, #b534fa, #6a0dad);
+    color: #fff;
+    border-bottom-right-radius: 4px;
+    box-shadow: 0 4px 12px rgba(181, 52, 250, 0.3);
+}
+.msg.wupi {
+    align-self: flex-start;
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-bottom-left-radius: 4px;
+}
+.msg.wupi.streaming::after {
+    content: '▍';
+    animation: blink 0.8s infinite;
+    color: rgba(181, 52, 250, 0.8);
+}
+@keyframes blink { 50% { opacity: 0; } }
+.msg-reasoning {
+    margin-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    padding-top: 8px;
+}
+.msg-reasoning summary {
+    cursor: pointer;
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.45);
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    user-select: none;
+}
+.msg-reasoning summary:hover { color: rgba(255, 255, 255, 0.7); }
+.msg-reasoning-body {
+    margin-top: 8px;
+    font-size: 12.5px;
+    color: rgba(255, 255, 255, 0.55);
+    line-height: 1.5;
+    white-space: pre-wrap;
+    padding-left: 12px;
+    border-left: 2px solid rgba(181, 52, 250, 0.25);
+}
+.msg-error {
+    align-self: center;
+    background: rgba(255, 60, 60, 0.12);
+    border: 1px solid rgba(255, 60, 60, 0.3);
+    color: #ff9090;
+    font-size: 13px;
+    padding: 8px 14px;
+    border-radius: 10px;
+}
+.chat-empty {
+    text-align: center;
+    color: rgba(255, 255, 255, 0.3);
+    font-size: 14px;
+    margin: auto;
+    padding: 40px 20px;
+}
+.chat-input-area {
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    padding: 12px 14px;
+    background: rgba(0, 0, 0, 0.2);
+}
+.chat-input {
+    width: 100%;
+    box-sizing: border-box;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 12px;
+    padding: 10px 12px;
+    color: #fff;
+    font-family: inherit;
+    font-size: 14px;
+    outline: none;
+    resize: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
+}
+.chat-input:focus {
+    border-color: rgba(181, 52, 250, 0.6);
+    box-shadow: 0 0 0 3px rgba(181, 52, 250, 0.12);
+}
+.chat-input::placeholder { color: rgba(255, 255, 255, 0.3); }
+.chat-input:disabled { opacity: 0.5; cursor: not-allowed; }
+.chat-send-row {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 8px;
+}
+.chat-btn {
+    padding: 8px 18px;
+    border-radius: 10px;
+    border: none;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform 0.1s, box-shadow 0.15s, opacity 0.15s;
+}
+.chat-btn:active { transform: scale(0.97); }
+.chat-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.chat-send-btn {
+    background: linear-gradient(135deg, #b534fa, #6a0dad);
+    color: #fff;
+    box-shadow: 0 4px 14px rgba(181, 52, 250, 0.35);
+}
+.chat-send-btn:not(:disabled):hover { box-shadow: 0 6px 20px rgba(181, 52, 250, 0.5); }
+.chat-stop-btn {
+    background: rgba(255, 255, 255, 0.1);
+    color: rgba(255, 255, 255, 0.8);
+}
+.chat-stop-btn:not(:disabled):hover { background: rgba(255, 80, 80, 0.25); color: #fff; }

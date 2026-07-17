@@ -629,6 +629,208 @@ impl<E: Embedder> MemoryEngine<E> {
         Ok(())
     }
 
+    /// List every memory in a card partition, newest first, paginated. Returns
+    /// full [`MemoryEntry`] rows (no embedding — see the struct doc for why).
+    ///
+    /// This is the browser surface (the Codex UI), the counterpart to
+    /// [`Self::search`]: `search` runs the hybrid pipeline for recall;
+    /// `list_memories` is a plain chronological enumerate for browsing/editing.
+    /// `limit`/`offset` give cursor-style pagination; the browser defaults to
+    /// a large first page (200) since the per-card corpus is small.
+    pub async fn list_memories(
+        &self,
+        card_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let conn = self.conn.clone();
+        let card_id = card_id.to_owned();
+        Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let c = conn.lock().expect("memory conn mutex");
+            let mut stmt = c
+                .prepare(
+                    "SELECT id, text_content, timestamp, role, chunk_index, salience,
+                            metadata_json, card_id, session_id
+                     FROM memories
+                     WHERE card_id = ?1
+                     ORDER BY id DESC
+                     LIMIT ?2 OFFSET ?3",
+                )
+                .map_err(|e| anyhow::anyhow!("prepare list_memories: {e:?}"))?;
+            let rows = stmt
+                .query_map(params![card_id, limit as i64, offset as i64], row_to_entry)
+                .map_err(|e| anyhow::anyhow!("query list_memories: {e:?}"))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(|e| anyhow::anyhow!("list_memories row: {e:?}"))?);
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("list_memories join: {e}"))??)
+    }
+
+    /// Update one memory's text in place: re-embed, then rewrite the text in
+    /// all three tables inside a single transaction.
+    ///
+    /// FTS5 has no in-place row update — the idiom (used by the codex seed
+    /// reconciler, `codex.rs`) is delete-then-insert the FTS row with the same
+    /// rowid. `memories` and `memories_vec` DO update in place. The embedding
+    /// is regenerated from the new text so vector search stays consistent with
+    /// the edited content (otherwise a semantic search would still match the
+    /// OLD wording and miss the new one).
+    ///
+    /// `role`/`salience`/`metadata_json`/`card_id` are preserved — only the
+    /// text moves. Silent no-op (returns Ok) if `id` doesn't exist; the
+    /// caller's UI refresh will simply show nothing changed.
+    pub async fn update_memory(&self, id: MemoryId, text: String) -> anyhow::Result<()> {
+        let embedding = self.embedder.embed(text.clone()).await?;
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let c = conn.lock().expect("memory conn mutex");
+            let emb_bytes = embed_to_bytes(&embedding);
+            let tx = c
+                .unchecked_transaction()
+                .map_err(|e| anyhow::anyhow!("begin update txn: {e:?}"))?;
+            let changed = tx
+                .execute(
+                    "UPDATE memories SET text_content = ?1 WHERE id = ?2",
+                    params![text, id],
+                )
+                .map_err(|e| anyhow::anyhow!("update memories: {e:?}"))?;
+            if changed == 0 {
+                // Row doesn't exist — nothing to update. Roll back the empty
+                // txn and return Ok so a stale UI doesn't error.
+                let _ = tx.rollback();
+                return Ok(());
+            }
+            // FTS5: delete the old indexed row, insert the new text under the
+            // SAME rowid so keyword search sees the edit. 'INSERT INTO fts(rowid,...)'
+            // after a DELETE on the same rowid is the documented update path.
+            tx.execute(
+                "DELETE FROM memories_fts WHERE rowid = ?1",
+                params![id],
+            )
+            .map_err(|e| anyhow::anyhow!("delete memories_fts (for update): {e:?}"))?;
+            tx.execute(
+                "INSERT INTO memories_fts (rowid, text_content) VALUES (?1, ?2)",
+                params![id, text],
+            )
+            .map_err(|e| anyhow::anyhow!("re-insert memories_fts (for update): {e:?}"))?;
+            tx.execute(
+                "UPDATE memories_vec SET embedding = ?1 WHERE rowid = ?2",
+                params![emb_bytes, id],
+            )
+            .map_err(|e| anyhow::anyhow!("update memories_vec: {e:?}"))?;
+            tx.commit()
+                .map_err(|e| anyhow::anyhow!("commit update txn: {e:?}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("update_memory join: {e}"))??;
+        Ok(())
+    }
+
+    /// Hard reset: delete every EPISODIC memory in a card partition, preserving
+    /// authored Codex lore (entries whose `metadata_json` declares
+    /// `"kind":"codex"`). Returns the number of rows deleted.
+    ///
+    /// The two-stage codex-safe pattern mirrors [`Self::list_codex_entries`]:
+    /// a cheap SQL `LIKE` pre-filter narrows to rows with any metadata, then
+    /// the authoritative [`is_codex`] check runs in Rust on those candidates.
+    /// Here that means: collect the codex rowids first, then delete everything
+    /// in the card whose id is NOT in that set — across all three tables, in
+    /// one transaction. Codex lore is thus never wiped by accident; it can only
+    /// be removed by editing the source `.md` files and rebooting (re-seed).
+    pub async fn wipe_episodic_card(&self, card_id: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let card_id = card_id.to_owned();
+        Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let c = conn.lock().expect("memory conn mutex");
+            // 1. Collect codex ids to preserve. The LIKE pre-filter keeps this
+            //    cheap; is_codex is the authoritative check on the candidates.
+            let mut stmt = c
+                .prepare(
+                    "SELECT id, metadata_json FROM memories
+                     WHERE card_id = ?1 AND metadata_json IS NOT NULL",
+                )
+                .map_err(|e| anyhow::anyhow!("prepare wipe collect: {e:?}"))?;
+            let mut codex_ids: Vec<MemoryId> = Vec::new();
+            let rows = stmt
+                .query_map(params![card_id], |r| {
+                    Ok((r.get::<_, MemoryId>(0)?, r.get::<_, Option<String>>(1)?))
+                })
+                .map_err(|e| anyhow::anyhow!("query wipe collect: {e:?}"))?;
+            for row in rows {
+                let (id, metadata_json) = row?;
+                if is_codex(metadata_json.as_deref()) {
+                    codex_ids.push(id);
+                }
+            }
+            drop(stmt); // release the borrowed statement before the next txn.
+
+            let tx = c
+                .unchecked_transaction()
+                .map_err(|e| anyhow::anyhow!("begin wipe txn: {e:?}"))?;
+
+            // 2. Delete episodic rows from the core table. If codex_ids is
+            //    empty, "NOT IN ()" is invalid SQL, so branch to an unfiltered
+            //    card delete. rusqlite params![] can't expand an empty Vec into
+            //    nothing — the branch sidesteps both problems.
+            let deleted = if codex_ids.is_empty() {
+                tx.execute(
+                    "DELETE FROM memories WHERE card_id = ?1",
+                    params![card_id],
+                )
+                .map_err(|e| anyhow::anyhow!("wipe memories (no codex): {e:?}"))?
+            } else {
+                // Bind the preserved id list as `NOT IN (?1, ?2, ...)`.
+                let placeholders: String = (0..codex_ids.len())
+                    .map(|i| format!("?{}", i + 2))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "DELETE FROM memories WHERE card_id = ?1 AND id NOT IN ({placeholders})"
+                );
+                let mut params_vec: Vec<&dyn rusqlite::ToSql> =
+                    Vec::with_capacity(1 + codex_ids.len());
+                params_vec.push(&card_id);
+                for id in &codex_ids {
+                    params_vec.push(id);
+                }
+                tx.execute(&sql, params_vec.as_slice())
+                    .map_err(|e| anyhow::anyhow!("wipe memories: {e:?}"))?
+            };
+
+            // 3. Mirror the deletes on FTS5 + vec0. These tables have no
+            //    card_id column and no foreign keys, so after step 2 they hold
+            //    orphaned rows whose rowids no longer exist in `memories`.
+            //    Deleting any FTS/vec row whose rowid is absent from `memories`
+            //    clears exactly the wiped episodic entries and leaves codex
+            //    rows (which still exist in `memories`) untouched. This is
+            //    global, but step 2 is the only path that ever removes core
+            //    rows without also cleaning FTS/vec (delete_memory + the seed
+            //    reconciler both three-table-delete in lockstep), so the orphan
+            //    set == this wipe's deleted set.
+            tx.execute(
+                "DELETE FROM memories_fts WHERE rowid NOT IN (SELECT id FROM memories)",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("wipe memories_fts orphans: {e:?}"))?;
+            tx.execute(
+                "DELETE FROM memories_vec WHERE rowid NOT IN (SELECT id FROM memories)",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("wipe memories_vec orphans: {e:?}"))?;
+
+            tx.commit()
+                .map_err(|e| anyhow::anyhow!("commit wipe txn: {e:?}"))?;
+            Ok(deleted)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("wipe_episodic_card join: {e}"))??)
+    }
+
     /// List every Codex-tagged entry in a card partition. Returns
     /// `(id, metadata_json)` pairs so the seed reconciler can diff source
     /// files against stored entries (matching on `title`, comparing `hash`).
@@ -946,6 +1148,29 @@ fn vec0_top_k(
         out.push(r.map_err(|e| anyhow::anyhow!("vec0 row: {e:?}"))?);
     }
     Ok(out)
+}
+
+/// Read one `MemoryEntry` from a `memories` table row. Shared by
+/// [`fetch_entries`] (fused-search hydration) and [`MemoryEngine::list_memories`]
+/// (browser enumerate) so the column↔field mapping lives in one place.
+///
+/// Column order (must match every SELECT in this module):
+/// `id, text_content, timestamp, role, chunk_index, salience,
+///  metadata_json, card_id, session_id`.
+fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
+    let role_str: String = r.get(3)?;
+    Ok(MemoryEntry {
+        id: r.get(0)?,
+        text_content: r.get(1)?,
+        timestamp: r.get(2)?,
+        role: Role::parse(&role_str)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?,
+        chunk_index: r.get(4)?,
+        salience: r.get(5)?,
+        metadata_json: r.get(6)?,
+        card_id: r.get(7)?,
+        session_id: r.get(8)?,
+    })
 }
 
 /// Hydrate fused ids into full entries, preserving fused order + score.

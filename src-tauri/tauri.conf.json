@@ -15,9 +15,9 @@
         "title": "WUPI OS",
         "width": 1440,
         "height": 900,
-        "maximized": true,
+        "maximized": false,
         "resizable": false,
-        "fullscreen": false,
+        "fullscreen": true,
         "decorations": false
       }
     ],

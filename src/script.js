@@ -1,7 +1,7 @@
 // Tauri 2 IPC + event APIs. Imported as ES modules now that script.js is
 // `type="module"` (Vite bundles these; withGlobalTauri is off so the
 // `window.__TAURI__` global is NOT injected — the import is the source of truth).
-import { invoke } from '@tauri-apps/api/core';
+import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 
 const canvas = document.getElementById('aurora-canvas');
@@ -674,3 +674,555 @@ const dropdownMenu = document.getElementById('dropdownMenu');
 
   updateClocks();
   setInterval(updateClocks, 1000);
+
+  // ════════════════════════════════════════════════════════════════════════
+  // APP WINDOW MANAGER
+  // ════════════════════════════════════════════════════════════════════════
+  // The surfaces (Chat, Profile Editor, The Codex, Docks) are DOM overlays in
+  // the ONE Tauri window. Background rules (per Chloe's spec):
+  //   - WUPI Chat (winChat): the ONLY window that pauses the canvas (stars +
+  //     aurora OFF). Its own background is ~80% opaque so the paused backdrop
+  //     doesn't show through. Closing it resumes the canvas.
+  //   - Everything else (Codex, Profile, Docks home): canvas keeps running —
+  //     stars/aurora animate behind the translucent glass.
+  //
+  // The previous version painted a frozen gradient into the framebuffer while
+  // paused, which caused the compositor to tear/glitch and froze the loop on
+  // close. The fix: NEVER manually paint the canvas here. Only flip the
+  // `paused` flag; the RAF loop (animate) already handles start/stop cleanly
+  // via its `if (!paused) requestAnimationFrame(animate)` guard, and when
+  // un-paused it repaints fresh on the next frame. No half-painted frames.
+
+  const openWindows = new Set();
+  let zCounter = 1000;
+  // No window pauses the canvas anymore — the background stays active behind
+  // every surface (Chat is now translucent enough that stars show through).
+  // Kept as a hook in case a future surface wants to freeze the background.
+  function syncCanvasForWindows() {
+    /* no-op: background always active */
+  }
+
+  function openWindow(id) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (openWindows.has(id)) {
+      // Already open — just raise it to the top.
+      el.style.zIndex = ++zCounter;
+      return;
+    }
+    openWindows.add(id);
+    el.style.zIndex = ++zCounter;
+    el.classList.add('show');
+    el.setAttribute('aria-hidden', 'false');
+    syncCanvasForWindows();
+    // Fire an onOpen hook if the surface registered one (e.g. Profile loads
+    // its fields, Codex loads its list, Chat may show intro).
+    const hook = windowOpenHooks.get(id);
+    if (hook) hook();
+  }
+
+  function closeWindow(id) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (!openWindows.has(id)) return;
+    openWindows.delete(id);
+    el.classList.remove('show');
+    el.setAttribute('aria-hidden', 'true');
+    syncCanvasForWindows();
+  }
+
+  // Surfaces register an async onOpen hook (load data when first shown).
+  const windowOpenHooks = new Map();
+
+  // ✕ close buttons (data-close="winId").
+  document.querySelectorAll('.app-window-close[data-close]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      closeWindow(btn.dataset.close);
+    });
+  });
+
+  // Esc closes the topmost open window.
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape' || openWindows.size === 0) return;
+    // Close the highest-z open window (last added to the set isn't strictly
+    // topmost, but in practice users Esc the one they just opened). Find by
+    // max z-index for correctness.
+    let topId = null;
+    let topZ = -1;
+    for (const id of openWindows) {
+      const el = document.getElementById(id);
+      const z = parseInt(el?.style.zIndex || '0', 10);
+      if (z > topZ) { topZ = z; topId = id; }
+    }
+    if (topId) closeWindow(topId);
+  });
+
+  // Clicks inside a window must NOT bubble to the document-level handler that
+  // closes the top-bar dropdowns (that handler also doesn't close windows, but
+  // stopping propagation keeps the dropdown logic from running needlessly and
+  // prevents a window-open dock click from immediately re-closing dropdowns).
+  document.querySelectorAll('.app-window').forEach((win) => {
+    win.addEventListener('click', (e) => e.stopPropagation());
+  });
+
+  // ── Draggable windows (Profile, Codex) ───────────────────────────────────
+  // Header is the drag handle. The window is absolutely positioned; dragging
+  // updates `left`/`top`. Only windows with `.draggable` get this — Chat is
+  // fixed (immovable per spec), Docks-home is full-screen (no drag).
+  function makeDraggable(winEl) {
+    const handle = winEl.querySelector('.app-window-header');
+    if (!handle) return;
+    handle.style.cursor = 'grab';
+    let dragging = false;
+    let startX = 0, startY = 0, startLeft = 0, startTop = 0;
+
+    handle.addEventListener('mousedown', (e) => {
+      // Don't drag when clicking the close button or interactive header el.
+      if (e.target.closest('.app-window-close')) return;
+      dragging = true;
+      handle.style.cursor = 'grabbing';
+      // Switch from transform-center to absolute left/top so we can move it.
+      const rect = winEl.getBoundingClientRect();
+      winEl.style.left = rect.left + 'px';
+      winEl.style.top = rect.top + 'px';
+      winEl.style.transform = 'none';
+      winEl.classList.add('dragged'); // CSS: drop the centering transform
+      startX = e.clientX;
+      startY = e.clientY;
+      startLeft = rect.left;
+      startTop = rect.top;
+      e.preventDefault();
+    });
+    window.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      // Keep the title bar on-screen (don't let it vanish off an edge).
+      const maxX = window.innerWidth - 80;
+      const maxY = window.innerHeight - 48;
+      const nl = Math.min(Math.max(startLeft + dx, 0), maxX);
+      const nt = Math.min(Math.max(startTop + dy, 0), maxY);
+      winEl.style.left = nl + 'px';
+      winEl.style.top = nt + 'px';
+    });
+    window.addEventListener('mouseup', () => {
+      if (!dragging) return;
+      dragging = false;
+      handle.style.cursor = 'grab';
+    });
+  }
+  document.querySelectorAll('.app-window.draggable').forEach(makeDraggable);
+
+  // ── Dock wiring ──────────────────────────────────────────────────────────
+  document.getElementById('dockChat')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openWindow('winChat');
+  });
+  document.getElementById('dockProfile')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openWindow('winProfile');
+  });
+  document.getElementById('dockCodex')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openWindow('winCodex');
+  });
+  document.getElementById('dockApps')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    // Docks = "home": close any open surface windows and show the launcher
+    // grid. (winApps itself is the full-screen home overlay.)
+    closeWindow('winChat');
+    closeWindow('winProfile');
+    closeWindow('winCodex');
+    openWindow('winApps');
+  });
+
+  // Home-grid launcher icons (inside winApps): open the matching surface.
+  document.querySelectorAll('.home-app[data-open]').forEach((icon) => {
+    icon.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const target = icon.dataset.open;
+      closeWindow('winApps'); // leave home, open the app
+      openWindow(target);
+    });
+  });
+
+  // ════════════════════════════════════════════════════════════════════════
+  // PROFILE EDITOR
+  // ════════════════════════════════════════════════════════════════════════
+  (function profileEditor() {
+    const nameEl = document.getElementById('profName');
+    const roleEl = document.getElementById('profRole');
+    const bgEl = document.getElementById('profBackground');
+    const dynEl = document.getElementById('profDynamics');
+    const saveBtn = document.getElementById('profSaveBtn');
+    const statusEl = document.getElementById('profStatus');
+    if (!nameEl) return;
+
+    function setStatus(msg, kind) {
+      statusEl.textContent = msg || '';
+      statusEl.className = 'profile-status' + (kind ? ' ' + kind : '');
+    }
+
+    // Load fresh every time the window opens — cheap, and guarantees the editor
+    // reflects disk state (someone could have hand-edited Operator.xml).
+    windowOpenHooks.set('winProfile', () => {
+      setStatus('Loading…');
+      invoke('operator_profile_get')
+        .then((profile) => {
+          if (profile) {
+            nameEl.value = profile.name || '';
+            roleEl.value = profile.role || '';
+            bgEl.value = profile.background || '';
+            dynEl.value = profile.dynamics || '';
+          } else {
+            nameEl.value = ''; roleEl.value = ''; bgEl.value = ''; dynEl.value = '';
+          }
+          setStatus('');
+        })
+        .catch((err) => setStatus('Load failed: ' + err, 'err'));
+    });
+
+    saveBtn?.addEventListener('click', () => {
+      saveBtn.disabled = true;
+      setStatus('Saving…');
+      invoke('operator_profile_set', {
+        name: nameEl.value,
+        role: roleEl.value,
+        background: bgEl.value,
+        dynamics: dynEl.value,
+      })
+        .then(() => setStatus('Saved — applies next message', 'ok'))
+        .catch((err) => setStatus('Save failed: ' + err, 'err'))
+        .finally(() => { saveBtn.disabled = false; });
+    });
+  })();
+
+  // ════════════════════════════════════════════════════════════════════════
+  // THE CODEX — authored lore library (NOT a memory browser)
+  // ════════════════════════════════════════════════════════════════════════
+  // The Codex is a library of authored reference "books" — world lore, TV-show
+  // facts, worldbuilding. Source of truth = .md files in codex/ (re-seeded to
+  // the retrieval index at boot + after each edit). It has NOTHING to do with
+  // chat history or Wupi's persona — just the lore you author.
+  //
+  // UI: two panes. Left = searchable list of entries (title + tags). Right =
+  // reader for the selected entry, with an Edit mode and a New-entry mode.
+  (function codex() {
+    const listEl = document.getElementById('codexList');
+    const statusEl = document.getElementById('codexStatus');
+    const searchEl = document.getElementById('codexSearch');
+    const addBtn = document.getElementById('codexAddBtn');
+    const readerEl = document.getElementById('codexReader');
+    if (!listEl || !readerEl) return;
+
+    let allFiles = []; // cached for client-side search filter
+
+    function setStatus(msg, kind) {
+      statusEl.textContent = msg || '';
+      statusEl.className = 'codex-status' + (kind ? ' ' + kind : '');
+    }
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      }[c]));
+    }
+
+    // ── List rendering ───────────────────────────────────────────────────
+    function renderList(filter) {
+      const q = (filter || '').trim().toLowerCase();
+      const files = q
+        ? allFiles.filter((f) =>
+            f.title.toLowerCase().includes(q) ||
+            f.body.toLowerCase().includes(q) ||
+            f.tags.some((t) => t.toLowerCase().includes(q)))
+        : allFiles;
+      if (!files.length) {
+        listEl.innerHTML = `<div class="codex-empty">${q ? 'No matches.' : 'No lore yet. Click “+ New” to add your first entry.'}</div>`;
+        return;
+      }
+      listEl.innerHTML = files.map((f) => `
+        <div class="codex-row" data-filename="${escapeHtml(f.filename)}">
+          <div class="codex-row-title">${escapeHtml(f.title || f.filename)}</div>
+          <div class="codex-row-tags">${f.tags.map((t) => `<span class="codex-tag">${escapeHtml(t)}</span>`).join('')}</div>
+        </div>`).join('');
+    }
+
+    function loadAll() {
+      setStatus('Loading…');
+      return invoke('codex_list')
+        .then((files) => {
+          allFiles = Array.isArray(files) ? files : [];
+          renderList(searchEl.value);
+          setStatus(allFiles.length ? `${allFiles.length} entr${allFiles.length === 1 ? 'y' : 'ies'}` : '');
+        })
+        .catch((err) => {
+          listEl.innerHTML = `<div class="codex-empty">Failed to load.</div>`;
+          setStatus('Load failed: ' + err, 'err');
+        });
+    }
+
+    // ── Reader pane ──────────────────────────────────────────────────────
+    function showReader(file) {
+      readerEl.innerHTML = `
+        <div class="codex-reader-head">
+          <div>
+            <div class="codex-reader-title">${escapeHtml(file.title || file.filename)}</div>
+            <div class="codex-reader-tags">${file.tags.map((t) => `<span class="codex-tag">${escapeHtml(t)}</span>`).join('')}</div>
+          </div>
+          <div class="codex-reader-actions">
+            <button class="codex-mini-btn" id="crEdit">Edit</button>
+            <button class="codex-mini-btn del" id="crDelete">Delete</button>
+          </div>
+        </div>
+        <div class="codex-reader-body">${escapeHtml(file.body)}</div>`;
+      document.getElementById('crEdit').addEventListener('click', () => showEditor(file));
+      document.getElementById('crDelete').addEventListener('click', () => deleteEntry(file.filename, file.title || file.filename));
+    }
+
+    function showEmptyReader(msg) {
+      readerEl.innerHTML = `<div class="codex-reader-empty">${escapeHtml(msg || 'Select an entry to read, or add new lore.')}</div>`;
+    }
+
+    // ── Editor pane (edit existing or create new) ───────────────────────
+    function showEditor(file) {
+      const isNew = !file;
+      readerEl.innerHTML = `
+        <div class="codex-editor">
+          <div class="codex-editor-row">
+            <label class="field-label">Title</label>
+            <input type="text" id="ceTitle" class="field-input" value="${escapeHtml(file?.title || '')}" placeholder="e.g. Neo-Kyoto" />
+          </div>
+          <div class="codex-editor-row">
+            <label class="field-label">Tags (comma-separated)</label>
+            <input type="text" id="ceTags" class="field-input" value="${escapeHtml((file?.tags || []).join(', '))}" placeholder="lore, location, setting" />
+          </div>
+          <div class="codex-editor-row">
+            <label class="field-label">Body</label>
+            <textarea id="ceBody" class="field-textarea codex-editor-body" placeholder="The factual lore…">${escapeHtml(file?.body || '')}</textarea>
+          </div>
+          <div class="codex-editor-actions">
+            <button class="field-btn" id="ceCancel">Cancel</button>
+            <button class="field-btn primary" id="ceSave">${isNew ? 'Create' : 'Save'}</button>
+          </div>
+        </div>`;
+      const originalFilename = file?.filename || '';
+      document.getElementById('ceCancel').addEventListener('click', () => {
+        if (file) showReader(file); else showEmptyReader();
+      });
+      document.getElementById('ceSave').addEventListener('click', () => {
+        const title = document.getElementById('ceTitle').value.trim();
+        const tags = document.getElementById('ceTags').value.split(',').map((t) => t.trim()).filter(Boolean);
+        const body = document.getElementById('ceBody').value;
+        if (!title) { document.getElementById('ceTitle').focus(); return; }
+        // Filename derives from the title for new entries; stays stable for edits.
+        const filename = isNew ? title : originalFilename;
+        document.getElementById('ceSave').disabled = true;
+        setStatus('Saving…');
+        invoke('codex_save', { filename, title, tags, body })
+          .then((savedName) => {
+            setStatus(isNew ? 'Created.' : 'Saved.', 'ok');
+            // Re-list then open the saved entry in the reader.
+            return loadAll().then(() => {
+              const updated = allFiles.find((f) => f.filename === savedName);
+              if (updated) showReader(updated); else showEmptyReader();
+            });
+          })
+          .catch((err) => { setStatus('Save failed: ' + err, 'err'); document.getElementById('ceSave').disabled = false; });
+      });
+    }
+
+    function deleteEntry(filename, label) {
+      if (!confirm(`Delete "${label}"? This removes the lore file. This cannot be undone.`)) return;
+      setStatus('Deleting…');
+      invoke('codex_delete', { filename })
+        .then(() => { setStatus('Deleted.', 'ok'); showEmptyReader(); loadAll(); })
+        .catch((err) => setStatus('Delete failed: ' + err, 'err'));
+    }
+
+    // ── Wiring ───────────────────────────────────────────────────────────
+    // Clicking a list row opens it in the reader.
+    listEl.addEventListener('click', (e) => {
+      const row = e.target.closest('.codex-row[data-filename]');
+      if (!row) return;
+      const filename = row.dataset.filename;
+      const file = allFiles.find((f) => f.filename === filename);
+      if (file) showReader(file);
+    });
+
+    // Search filters the list client-side (the corpus is small).
+    searchEl?.addEventListener('input', () => renderList(searchEl.value));
+
+    // + New opens a blank editor.
+    addBtn?.addEventListener('click', () => showEditor(null));
+
+    windowOpenHooks.set('winCodex', () => { loadAll(); showEmptyReader(); });
+  })();
+
+  // ════════════════════════════════════════════════════════════════════════
+  // WUPI CHAT — full streaming chat surface
+  // ════════════════════════════════════════════════════════════════════════
+  (function wupiChat() {
+    const msgsEl = document.getElementById('chatMessages');
+    const inputEl = document.getElementById('chatInput');
+    const sendBtn = document.getElementById('chatSendBtn');
+    const stopBtn = document.getElementById('chatStopBtn');
+    if (!msgsEl) return;
+
+    // Tauri v2 Channel for streaming — imported statically at the top of the
+    // module, so it's always available (no race with a dynamic import).
+    let generating = false;
+    let emptyShown = true;
+
+    function showEmpty() {
+      if (!emptyShown) return;
+      msgsEl.innerHTML = `<div class="chat-empty">Say hello to Wupi.</div>`;
+    }
+    function clearEmpty() {
+      if (!emptyShown) return;
+      emptyShown = false;
+      msgsEl.innerHTML = '';
+    }
+
+    function scrollBottom() {
+      msgsEl.scrollTop = msgsEl.scrollHeight;
+    }
+
+    function addUserBubble(text) {
+      clearEmpty();
+      const div = document.createElement('div');
+      div.className = 'msg user';
+      div.textContent = text;
+      msgsEl.appendChild(div);
+      scrollBottom();
+    }
+
+    function addErrorBubble(msg) {
+      const div = document.createElement('div');
+      div.className = 'msg-error';
+      div.textContent = msg;
+      msgsEl.appendChild(div);
+      scrollBottom();
+    }
+
+    // A static (non-streaming) Wupi message — used for the randomized intro
+    // shown when Chat first opens. Mirrors the finalized bubble shape.
+    function addWupiBubble(text) {
+      clearEmpty();
+      const div = document.createElement('div');
+      div.className = 'msg wupi';
+      div.textContent = text;
+      msgsEl.appendChild(div);
+      scrollBottom();
+    }
+
+    // Returns the wupi bubble element + a text setter.
+    function startWupiBubble() {
+      clearEmpty();
+      const div = document.createElement('div');
+      div.className = 'msg wupi streaming';
+      msgsEl.appendChild(div);
+      scrollBottom();
+      return div;
+    }
+
+    function finalizeWupiBubble(div, finalText, reasoning) {
+      div.classList.remove('streaming');
+      div.textContent = finalText || '(no response)';
+      if (reasoning && reasoning.trim()) {
+        const det = document.createElement('details');
+        det.className = 'msg-reasoning';
+        const sum = document.createElement('summary');
+        sum.textContent = 'Reasoning';
+        const body = document.createElement('div');
+        body.className = 'msg-reasoning-body';
+        body.textContent = reasoning;
+        det.appendChild(sum);
+        det.appendChild(body);
+        div.appendChild(det);
+      }
+      scrollBottom();
+    }
+
+    function setGenerating(on) {
+      generating = on;
+      inputEl.disabled = on;
+      sendBtn.disabled = on;
+      stopBtn.disabled = !on;
+    }
+
+    async function send() {
+      if (generating) return;
+      const text = inputEl.value.trim();
+      if (!text) return;
+
+      inputEl.value = '';
+      addUserBubble(text);
+
+      const bubble = startWupiBubble();
+      let streamed = '';
+      setGenerating(true);
+
+      const channel = new Channel();
+      channel.onmessage = (e) => {
+        if (!e) return;
+        if (e.type === 'chunk') {
+          streamed += e.text || '';
+          bubble.textContent = streamed;
+          scrollBottom();
+        } else if (e.type === 'error') {
+          setGenerating(false);
+          // Replace the partial bubble with an error notice.
+          bubble.remove();
+          addErrorBubble(e.message || 'Generation failed.');
+        } else if (e.type === 'done') {
+          setGenerating(false);
+          finalizeWupiBubble(bubble, e.final_text != null ? e.final_text : streamed, e.reasoning || '');
+        }
+      };
+
+      invoke('chat_send', { text, onEvent: channel })
+        .catch((err) => {
+          if (generating) {
+            setGenerating(false);
+            bubble.remove();
+            addErrorBubble('Failed to send: ' + err);
+          }
+        });
+    }
+
+    sendBtn?.addEventListener('click', send);
+    stopBtn?.addEventListener('click', () => {
+      invoke('chat_stop').catch((e) => console.warn('[Wupi] chat_stop failed', e));
+    });
+
+    // Enter sends, Shift+Enter for newline.
+    inputEl?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        send();
+      }
+    });
+
+    // On each open: reset to a fresh conversation view + show Wupi's randomized
+    // intro (one per open, from the SIM card's introductions list via the
+    // get_intro IPC). The intro is UI-only — never sent to the model or archived.
+    function loadIntro() {
+      emptyShown = true;
+      msgsEl.innerHTML = '';
+      invoke('get_intro')
+        .then((intro) => {
+          if (intro) {
+            addWupiBubble(intro);
+          } else {
+            showEmpty();
+          }
+        })
+        .catch((e) => {
+          console.warn('[Wupi] get_intro failed', e);
+          showEmpty();
+        });
+    }
+    windowOpenHooks.set('winChat', loadIntro);
+    loadIntro();
+  })();

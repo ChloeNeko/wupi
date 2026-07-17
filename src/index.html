@@ -62,7 +62,7 @@
 
             <!-- Panel 3: color-code picker (only "Vibrant" for now) -->
             <div class="dropdown-menu cascade-panel" id="colorCodePanel">
-                <div class="dropdown-status-title">Color Code</div>
+                <div class="dropdown-status-title">Color</div>
                 <div class="dropdown-divider"></div>
                 <button class="dropdown-item colorcode-option" data-colorcode="Vibrant">
                     <span class="swatch swatch-vibrant"></span>
@@ -175,28 +175,135 @@
 
     <div class="dock-trigger-area">
         <div class="dock-container">
-            <div class="dock-item" aria-label="WUPI Chat">
+            <div class="dock-item" id="dockChat" aria-label="WUPI Chat">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
                 </svg>
             </div>
-            <div class="dock-item" aria-label="Profile Editor">
+            <div class="dock-item" id="dockProfile" aria-label="Profile Editor">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
                     <circle cx="12" cy="7" r="4"></circle>
                 </svg>
             </div>
-            <div class="dock-item" aria-label="The Codex">
+            <div class="dock-item" id="dockCodex" aria-label="The Codex">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
                     <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path>
                 </svg>
             </div>
             <div class="dock-separator"></div>
-            <div class="dock-item" aria-label="Docks">
+            <div class="dock-item" id="dockApps" aria-label="Docks">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
                 </svg>
+            </div>
+        </div>
+    </div>
+
+    <!-- ═════════════════ APP WINDOWS (overlay panels) ═════════════════ -->
+    <!-- One Tauri window; these are DOM overlays layered over the canvas.
+         Glassmorphism + star-culling both work because they share the same
+         render surface. z-index: 1000 (above canvas z:1, below top-bar/dock).
+         `.app-window` is hidden unless `.show`. -->
+
+    <!-- WUPI Chat — small movable/resizable window, centered -->
+    <div class="app-window chat draggable" id="winChat" aria-hidden="true">
+        <div class="app-window-header">
+            <span class="app-window-title">WUPI Chat</span>
+            <button class="app-window-close" data-close="winChat" aria-label="Close">✕</button>
+        </div>
+        <div class="app-window-body chat-body">
+            <div class="chat-messages" id="chatMessages"></div>
+            <div class="chat-input-area">
+                <textarea id="chatInput" class="chat-input" rows="2" placeholder="Message Wupi…  (Enter to send, Shift+Enter for newline)"></textarea>
+                <div class="chat-send-row">
+                    <button id="chatStopBtn" class="chat-btn chat-stop-btn" disabled>Stop</button>
+                    <button id="chatSendBtn" class="chat-btn chat-send-btn">Send</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Profile Editor — centered modal, draggable + resizable -->
+    <div class="app-window modal draggable" id="winProfile" aria-hidden="true">
+        <div class="app-window-header">
+            <span class="app-window-title">Profile Editor</span>
+            <button class="app-window-close" data-close="winProfile" aria-label="Close">✕</button>
+        </div>
+        <div class="app-window-body profile-body">
+            <p class="profile-hint">Who Wupi is talking to. Saved live — applies on the next message.</p>
+            <label class="field-label">Name</label>
+            <input type="text" id="profName" class="field-input" placeholder="How Wupi should address you" />
+            <label class="field-label">Role</label>
+            <input type="text" id="profRole" class="field-input" placeholder="e.g. Lead Developer, Operator" />
+            <label class="field-label">Background</label>
+            <textarea id="profBackground" class="field-textarea" rows="4" placeholder="Who you are in this world…"></textarea>
+            <label class="field-label">Dynamics</label>
+            <textarea id="profDynamics" class="field-textarea" rows="4" placeholder="How Wupi should treat you (tone, relationship)…"></textarea>
+            <div class="profile-actions">
+                <span class="profile-status" id="profStatus"></span>
+                <button id="profSaveBtn" class="field-btn primary">Save</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- The Codex — memory browser, centered modal, larger, draggable + resizable -->
+    <div class="app-window modal codex draggable" id="winCodex" aria-hidden="true">
+        <div class="app-window-header">
+            <span class="app-window-title">The Codex</span>
+            <button class="app-window-close" data-close="winCodex" aria-label="Close">✕</button>
+        </div>
+        <div class="app-window-body codex-body">
+            <div class="codex-layout">
+                <!-- Left pane: library list + search + add -->
+                <div class="codex-sidebar">
+                    <div class="codex-toolbar">
+                        <input type="text" id="codexSearch" class="codex-search" placeholder="Search lore…" />
+                        <button id="codexAddBtn" class="field-btn primary codex-add-btn">+ New</button>
+                    </div>
+                    <div class="codex-list" id="codexList"></div>
+                    <div class="codex-status" id="codexStatus"></div>
+                </div>
+                <!-- Right pane: reader / editor for the selected entry -->
+                <div class="codex-reader" id="codexReader">
+                    <div class="codex-reader-empty" id="codexReaderEmpty">
+                        Select an entry to read, or add new lore.
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Docks — full-screen "home" launcher grid. Background stays active. -->
+    <div class="app-window home" id="winApps" aria-hidden="true">
+        <button class="app-window-close home-close" data-close="winApps" aria-label="Close">✕</button>
+        <div class="home-grid">
+            <div class="home-app" data-open="winChat">
+                <div class="home-app-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                    </svg>
+                </div>
+                <span class="home-app-label">WUPI Chat</span>
+            </div>
+            <div class="home-app" data-open="winProfile">
+                <div class="home-app-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                        <circle cx="12" cy="7" r="4"></circle>
+                    </svg>
+                </div>
+                <span class="home-app-label">Profile Editor</span>
+            </div>
+            <div class="home-app" data-open="winCodex">
+                <div class="home-app-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
+                        <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path>
+                    </svg>
+                </div>
+                <span class="home-app-label">The Codex</span>
             </div>
         </div>
     </div>

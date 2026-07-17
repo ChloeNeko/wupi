@@ -9,16 +9,17 @@
 //! epistemic frame (factual background to internalize, NOT archival records to
 //! distrust). See AGENTS.md §2P.
 //!
-//! Source format: plain `.md` files in a `codex/` directory, each with an
-//! optional YAML-ish front-matter block (`---\ntitle: X\ntags: a, b\n---`) +
-//! a prose body. The seed loader parses each file, computes a content hash,
-//! and reconciles the source set against what's already stored — inserting new
-//! entries, updating changed ones (delete + re-insert), and purging orphans
-//! (source file deleted). This is idempotent: re-running against an unchanged
-//! source set produces no writes.
+//! Source format: plain `.md` files in a `docs/` directory (renamed from
+//! `codex/` on 2026-07-17 — `resolve_codex_dir` in `lib.rs` walks for `docs`),
+//! each with an optional YAML-ish front-matter block (`---\ntitle: X\ntags:
+//! a, b\n---`) + a prose body. The seed loader parses each file, computes a
+//! content hash, and reconciles the source set against what's already stored —
+//! inserting new entries, updating changed ones (delete + re-insert), and
+//! purging orphans (source file deleted). This is idempotent: re-running
+//! against an unchanged source set produces no writes.
 //!
 //! Design contract (mirrors `sim_card.rs` + the embedder's graceful-
-//! degradation pattern): a missing/empty `codex/` dir or a malformed file is
+//! degradation pattern): a missing/empty `docs/` dir or a malformed file is
 //! logged-and-skipped, never fatal. The Codex is best-effort; a bad source
 //! file must never kill the OS boot.
 //!
@@ -204,6 +205,122 @@ async fn insert_entry(
         .add_codex_entry(src.body.clone(), card_id, 1.0, metadata)
         .await
         .map(|_| ())
+}
+
+// ── File-backed CRUD (the Codex UI surface) ────────────────────────────────
+// The Codex UI treats the `.md` files in docs/ as the source of truth: the
+// DB is a derived retrieval index, re-seeded at boot. These functions read and
+// write the FILES directly, so edits persist across reboots and stay
+// git-trackable. After any mutation the caller re-seeds so retrieval stays in
+// sync within the running session.
+
+/// One Codex file as the UI sees it. `filename` is the stem (no `.md`, no
+/// path) — it's the stable identity of the entry across edits. A rename =
+/// delete-old + save-new (the caller's job).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CodexFile {
+    /// Stem of the `.md` file (e.g. `neo-kyoto`). The on-disk key.
+    pub filename: String,
+    pub title: String,
+    pub tags: Vec<String>,
+    /// The prose body (everything after the front-matter).
+    pub body: String,
+}
+
+/// List every Codex `.md` file in `dir`, parsed into `CodexFile` rows. Sorted
+/// by title for a stable library view. Empty Vec for a missing/empty dir.
+pub fn list_files(dir: &Path) -> anyhow::Result<Vec<CodexFile>> {
+    let read = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(anyhow::anyhow!("read codex dir {}: {e}", dir.display())),
+    };
+    let mut paths: Vec<std::path::PathBuf> = read
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()).map_or(false, |s| s.eq_ignore_ascii_case("md")))
+        .collect();
+    paths.sort();
+
+    let mut out = Vec::new();
+    for path in paths {
+        match parse_file(&path) {
+            Ok(entry) => {
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("untitled").to_owned();
+                out.push(CodexFile {
+                    filename: stem,
+                    title: entry.title,
+                    tags: entry.tags,
+                    body: entry.body,
+                });
+            }
+            Err(e) => tracing::warn!(file = %path.display(), error = %format!("{e}"), "codex file parse failed; skipping in list"),
+        }
+    }
+    // Sort by title (case-insensitive) for a clean library order.
+    out.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    Ok(out)
+}
+
+/// Sanitize a filename into a file-system-safe stem: lowercase, replace any
+/// non-alphanumeric/`-`/`_` char with `-`, trim leading/trailing `-`. Returns
+/// `None` if the result is empty. Public so the IPC layer can echo back the
+/// exact stem `save_file` will use (the UI tracks entries by this key).
+pub fn sanitize_stem(filename: &str) -> Option<String> {
+    let stem: String = filename
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let stem = stem.trim_matches('-').to_owned();
+    if stem.is_empty() { None } else { Some(stem) }
+}
+
+/// Serialize a Codex entry back to its `.md` form and write it atomically.
+/// `filename` is the stem; `.md` is appended. The front-matter is regenerated
+/// from title + tags; the body is written verbatim below it. Atomic write
+/// (temp + rename) mirrors the operator-profile save pattern. Returns the
+/// sanitized stem actually written (for the UI to track).
+pub fn save_file(dir: &Path, filename: &str, title: &str, tags: &[String], body: &str) -> anyhow::Result<String> {
+    std::fs::create_dir_all(dir).map_err(|e| anyhow::anyhow!("create codex dir: {e:?}"))?;
+
+    let safe_stem = sanitize_stem(filename)
+        .ok_or_else(|| anyhow::anyhow!("codex filename empty after sanitization"))?;
+
+    let md = render_md(title, tags, body);
+    let target = dir.join(format!("{safe_stem}.md"));
+    let tmp = dir.join(format!(".{safe_stem}.md.tmp"));
+
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp).map_err(|e| anyhow::anyhow!("create codex temp: {e:?}"))?;
+        f.write_all(md.as_bytes()).map_err(|e| anyhow::anyhow!("write codex temp: {e:?}"))?;
+        f.sync_all().map_err(|e| anyhow::anyhow!("fsync codex temp: {e:?}"))?;
+    }
+    std::fs::rename(&tmp, &target).map_err(|e| anyhow::anyhow!("rename codex temp → target: {e:?}"))?;
+    Ok(safe_stem)
+}
+
+/// Delete a Codex `.md` file by stem. Silent no-op if it doesn't exist.
+pub fn delete_file(dir: &Path, filename: &str) -> anyhow::Result<()> {
+    let path = dir.join(format!("{filename}.md"));
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::anyhow!("delete codex file {}: {e:?}", path.display())),
+    }
+}
+
+/// Render a Codex entry to its canonical `.md` form: YAML-ish front-matter
+/// (title + tags) then a blank line then the body. Separated from `save_file`
+/// so a round-trip test can exercise it without touching disk.
+fn render_md(title: &str, tags: &[String], body: &str) -> String {
+    let tags_line = tags.join(", ");
+    format!(
+        "---\ntitle: {title}\ntags: {tags_line}\n---\n\n{body}\n",
+        body = body.trim_end(),
+    )
 }
 
 // ── Source parsing ─────────────────────────────────────────────────────────

@@ -20,7 +20,6 @@ use windows::Win32::NetworkManagement::WiFi::{
     WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory, WlanGetNetworkBssList, WlanOpenHandle,
     WlanQueryInterface, DOT11_BSS_TYPE, WLAN_BSS_LIST,
     WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO_LIST, WLAN_INTF_OPCODE,
-    WLAN_OPCODE_VALUE_TYPE,
 };
 
 const WLAN_CLIENT_VERSION_XP: u32 = 1;
@@ -366,8 +365,3 @@ fn signal_rssi_to_pct(rssi: i32) -> u8 {
     let pct = ((clamped + 100) as f32 / 50.0) * 100.0;
     pct.round() as u8
 }
-
-// We reference WLAN_OPCODE_VALUE_TYPE only for the query signature; silence the
-// unused-import if the compiler doesn't see a use.
-#[allow(dead_code)]
-fn _unused(_: WLAN_OPCODE_VALUE_TYPE) {}
