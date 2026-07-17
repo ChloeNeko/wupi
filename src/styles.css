@@ -718,6 +718,20 @@ html, body {
 /* Left: searchable list of lore entries. Right: reader / editor for the
    selected entry. The window itself is draggable + resizable (`.modal.draggable`). */
 .codex-body { padding: 0; }
+
+/* Games — scenario launcher surface. Empty-state until scenarios are
+   installable; the body reuses .app-window-body, just centered content. */
+.games-body {
+    align-items: center;
+    justify-content: center;
+    display: flex;
+}
+.games-empty {
+    text-align: center;
+    padding: 30px 12px;
+    color: rgba(255, 255, 255, 0.4);
+    font-size: 13px;
+}
 .codex-layout {
     display: flex;
     height: 100%;

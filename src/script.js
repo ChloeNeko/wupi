@@ -827,6 +827,10 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     e.stopPropagation();
     openWindow('winCodex');
   });
+  document.getElementById('dockGames')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openWindow('winGames');
+  });
   document.getElementById('dockApps')?.addEventListener('click', (e) => {
     e.stopPropagation();
     // Docks = "home": close any open surface windows and show the launcher
@@ -834,6 +838,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     closeWindow('winChat');
     closeWindow('winProfile');
     closeWindow('winCodex');
+    closeWindow('winGames');
     openWindow('winApps');
   });
 
