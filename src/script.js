@@ -880,26 +880,36 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   document.querySelectorAll('.app-window.draggable').forEach(makeDraggable);
 
   // ── Dock wiring ──────────────────────────────────────────────────────────
+  // Click an open app's dock item again → closes it (toggle behavior). The
+  // quick-access dock order is fixed: Chat → Profile → Codex (NOT alphabetical
+  // — that's the Docks home grid). Apps (Docks launcher) is special: it closes
+  // any open surface windows then shows the home grid.
+  function dockToggle(id) {
+    if (openWindows.has(id)) closeWindow(id);
+    else openWindow(id);
+  }
+
   document.getElementById('dockChat')?.addEventListener('click', (e) => {
     e.stopPropagation();
-    openWindow('chat');
+    dockToggle('chat');
   });
   document.getElementById('dockProfile')?.addEventListener('click', (e) => {
     e.stopPropagation();
-    openWindow('profile');
+    dockToggle('profile');
   });
   document.getElementById('dockCodex')?.addEventListener('click', (e) => {
     e.stopPropagation();
-    openWindow('codex');
+    dockToggle('codex');
   });
   document.getElementById('dockApps')?.addEventListener('click', (e) => {
     e.stopPropagation();
     // Docks = "home": close any open surface windows and show the launcher
-    // grid. (apps itself is the full-screen home overlay.)
+    // grid. (apps itself is the full-screen home overlay.) Not a toggle —
+    // clicking Docks while home is open is a no-op (it's already home).
+    if (openWindows.has('apps')) return;
     closeWindow('chat');
     closeWindow('profile');
     closeWindow('codex');
-    closeWindow('games');
     openWindow('apps');
   });
 

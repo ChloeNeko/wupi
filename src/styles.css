@@ -350,20 +350,24 @@ html, body {
 }
 
 .dock-trigger-area {
+    /* Hugs the dock — only the visible sliver + a small hit zone above it
+       trigger the rise. Was width:100% (the whole bottom strip), which made
+       the dock pop up on any bottom-edge hover. Now the trigger is sized to
+       the dock container itself via inline-block + auto width. */
     position: fixed;
     bottom: 0;
-    left: 0;
-    width: 100%;
-    height: 30px;
+    left: 50%;
+    transform: translateX(-50%);
     z-index: 9998;
-    display: flex;
-    justify-content: center;
+    /* The container peeks ~10px above the bottom edge; give a small hover
+       margin above it so the user doesn't have to pixel-aim. */
+    padding-top: 12px;
 }
 
 .dock-container {
-    position: absolute;
-    bottom: -70px; 
-    opacity: 0.6; 
+    position: relative;
+    bottom: -70px;
+    opacity: 0.6;
     display: flex;
     align-items: center;
     gap: 12px;
@@ -379,7 +383,7 @@ html, body {
 
 .dock-trigger-area:hover .dock-container {
     bottom: 10px;
-    opacity: 1; 
+    opacity: 1;
 }
 
 .dock-item {
@@ -719,19 +723,6 @@ html, body {
    selected entry. The window itself is draggable + resizable (`.modal.draggable`). */
 .codex-body { padding: 0; }
 
-/* Games — scenario launcher surface. Empty-state until scenarios are
-   installable; the body reuses .app-window-body, just centered content. */
-.games-body {
-    align-items: center;
-    justify-content: center;
-    display: flex;
-}
-.games-empty {
-    text-align: center;
-    padding: 30px 12px;
-    color: rgba(255, 255, 255, 0.4);
-    font-size: 13px;
-}
 .codex-layout {
     display: flex;
     height: 100%;

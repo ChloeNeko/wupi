@@ -175,13 +175,8 @@
 
     <div class="dock-trigger-area">
         <div class="dock-container">
-            <!-- Alphabetical by label: Codex, WUPI Chat, Profile Editor. -->
-            <div class="dock-item" id="dockCodex" aria-label="Codex">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
-                    <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path>
-                </svg>
-            </div>
+            <!-- Quick-access order (fixed): Chat → Profile → Codex. This is NOT
+                 alphabetical — the Docks home grid is alphabetical. -->
             <div class="dock-item" id="dockChat" aria-label="WUPI Chat">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
@@ -191,6 +186,12 @@
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
                     <circle cx="12" cy="7" r="4"></circle>
+                </svg>
+            </div>
+            <div class="dock-item" id="dockCodex" aria-label="Codex">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
+                    <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path>
                 </svg>
             </div>
             <div class="dock-separator"></div>
@@ -272,16 +273,9 @@
         </div>
     </div>
 
-    <!-- Games — launcher surface for WUPI OS simulation/game scenarios. -->
-    <div class="app-window modal games draggable" id="games" aria-hidden="true">
-        <div class="app-window-header">
-            <span class="app-window-title">Games</span>
-            <button class="app-window-close" data-close="games" aria-label="Close">✕</button>
-        </div>
-        <div class="app-window-body games-body">
-            <div class="games-empty">No scenarios installed.</div>
-        </div>
-    </div>
+    <!-- Games has NO window (yet). The home-grid Games button is an inert
+         placeholder — clicking it does nothing. The scenario-launcher surface
+         + backend arrive with the roleplay-card system (different chat). -->
 
     <!-- Docks — full-screen "home" launcher grid. Background stays active. -->
     <div class="app-window home" id="apps" aria-hidden="true">
@@ -297,7 +291,10 @@
                 </div>
                 <span class="home-app-label">Codex</span>
             </div>
-            <div class="home-app" data-open="games">
+            <!-- Games: NO data-open. The button stays (visual inventory) but
+                 is inert — clicking does nothing. The scenario-launcher surface
+                 arrives with the roleplay-card system (different chat). -->
+            <div class="home-app" aria-label="Games (coming soon)">
                 <div class="home-app-icon">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                         <line x1="6" y1="11" x2="10" y2="11"></line>
