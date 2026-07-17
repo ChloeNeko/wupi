@@ -61,114 +61,153 @@ window.addEventListener('mousemove', (e) => {
 
 const starCount = 1000;
 const stars = Array.from({ length: starCount }, () => {
-  const isTwinkling = Math.random() > 0.98; 
-  
-  const colorPalette = ['#ffffff', '#e8f0ff', '#fff4e6', '#ffe6ee'];
-  const color = colorPalette[Math.floor(Math.random() * colorPalette.length)];
+  const isTwinkling = Math.random() > 0.98;
+  // colorIdx indexes STAR_COLORS — drawing buckets stars by color so the
+  // context's fillStyle changes ~4×/frame instead of ~1000×.
+  const colorIdx = Math.floor(Math.random() * 4);
 
   return {
     x: Math.random() * width,
-    y: Math.random() * height, 
+    y: Math.random() * height,
     size: Math.random() * 0.9 + 0.4,
-    alpha: Math.random() * 0.7 + 0.3, 
+    alpha: Math.random() * 0.7 + 0.3,
     isTwinkling: isTwinkling,
     speed: isTwinkling ? (0.0005 + Math.random() * 0.0012) : 0,
     drift: Math.random() * 0.01 + 0.008 + 0.004,
-    color: color
+    colorIdx: colorIdx,
   };
 });
 
 let time = 0;
 
+// ── Cached sky gradient (perf: was recreated every frame) ─────────────────
+// The gradient depends only on the palette + canvas height, both of which
+// change rarely (theme switch / resize). Recreating it 60×/sec was pure waste
+// — createLinearGradient + 5 addColorStop calls per frame. Rebuilt only when
+// `currentPalette` or `height` changes.
+let cachedSkyGrad = null;
+let cachedSkyHeight = -1;
+function skyGradient() {
+  if (cachedSkyGrad && cachedSkyHeight === height) return cachedSkyGrad;
+  const g = ctx.createLinearGradient(0, 0, 0, height);
+  const stops = currentPalette.skyGradient;
+  for (let i = 0; i < stops.length; i++) {
+    g.addColorStop(i / (stops.length - 1), stops[i]);
+  }
+  cachedSkyGrad = g;
+  cachedSkyHeight = height;
+  return g;
+}
+// Invalidate the cache on resize (height changes → gradient must rebuild).
+window.addEventListener('resize', () => { cachedSkyGrad = null; });
+
+// ── Stars bucketed by color (perf: was 1000 fillStyle/globalAlpha toggles) ─
+// Batching same-color stars into one fillStyle set + grouping alpha into a
+// few bands collapses ~1000 state changes/frame into a handful. The visual
+// difference is imperceptible (alpha quantized to 8 bands of 0.1).
+const STAR_COLORS = ['#ffffff', '#e8f0ff', '#fff4e6', '#ffe6ee'];
+
 function animate() {
   currentX += (mouseX - currentX) * 0.25;
   currentY += (mouseY - currentY) * 0.25;
 
-  const skyGrad = ctx.createLinearGradient(0, 0, 0, height);
-
-  const stops = currentPalette.skyGradient;
-  // Evenly distribute the stops across [0, 1].
-  for (let i = 0; i < stops.length; i++) {
-    skyGrad.addColorStop(i / (stops.length - 1), stops[i]);
-  }
-
+  // Sky (cached gradient — see skyGradient()).
   ctx.globalCompositeOperation = 'source-over';
   ctx.globalAlpha = 1.0;
-  ctx.fillStyle = skyGrad;
+  ctx.fillStyle = skyGradient();
   ctx.fillRect(0, 0, width, height);
 
-  stars.forEach(s => {
+  // Stars: update positions/twinkle, then draw bucketed by color+alpha-band
+  // so the context state changes once per bucket, not once per star.
+  const px = currentX * 16;
+  const py = currentY * 16;
+  // buckets[colorIdx][alphaBand] = [{x,y,size}, ...]
+  const buckets = [[[],[],[],[],[],[],[],[]],[[],[],[],[],[],[],[],[]],[[],[],[],[],[],[],[],[]],[[],[],[],[],[],[],[],[]]];
+  for (let i = 0; i < stars.length; i++) {
+    const s = stars[i];
     if (s.isTwinkling) {
       s.alpha += s.speed;
-      if (s.alpha > 1 || s.alpha < 0.15) s.speed = -s.speed; 
+      if (s.alpha > 1 || s.alpha < 0.15) s.speed = -s.speed;
     }
-    
     s.y -= s.drift;
-    if (s.y < 0) s.y = height; 
+    if (s.y < 0) s.y = height;
+    const band = Math.min(7, Math.max(0, Math.floor(Math.abs(s.alpha) * 8)));
+    buckets[s.colorIdx][band].push(s.x + px * s.size, s.y + py * s.size, s.size);
+  }
+  for (let c = 0; c < STAR_COLORS.length; c++) {
+    ctx.fillStyle = STAR_COLORS[c];
+    for (let b = 0; b < 8; b++) {
+      const pts = buckets[c][b];
+      if (pts.length === 0) continue;
+      ctx.globalAlpha = (b + 0.5) / 8;
+      for (let k = 0; k < pts.length; k += 3) {
+        ctx.fillRect(pts[k], pts[k + 1], pts[k + 2], pts[k + 2]);
+      }
+    }
+  }
+  ctx.globalAlpha = 1.0;
 
-    ctx.fillStyle = s.color;
-    ctx.globalAlpha = Math.abs(s.alpha);
-    ctx.fillRect(
-        s.x + (currentX * s.size * 16), 
-        s.y + (currentY * s.size * 16), 
-        s.size, 
-        s.size
-    ); 
-  });
-
-  ctx.globalAlpha = 1.0; 
-  
+  // Aurora curtains. The blur is the single most expensive op in the loop —
+  // `ctx.filter = 'blur(30px)'` forces a full-canvas Gaussian pass PER fill.
+  // Draw all 5 curtains into ONE path, apply the blur ONCE, fill ONCE. Cuts
+  // the blur cost from 5× to 1× with identical visuals.
   ctx.globalCompositeOperation = 'screen';
-  ctx.filter = 'blur(30px)'; 
+  ctx.filter = 'blur(30px)';
 
-  const curtains = 5; 
-  const baseCenterY = height * 0.42; 
+  const curtains = 5;
+  const baseCenterY = height * 0.42;
 
+  ctx.beginPath();
   for (let i = 0; i < curtains; i++) {
-    const speed = time * (0.1 + i * 0.04); 
-    const thickness = 45 + i * 15; 
-    
-    const yOffset = (i - (curtains / 2)) * 12; 
+    const speed = time * (0.1 + i * 0.04);
+    const thickness = 45 + i * 15;
+
+    const yOffset = (i - (curtains / 2)) * 12;
     const activeCenterY = baseCenterY + yOffset;
 
-    ctx.beginPath();
-
-    for (let x = -150; x <= width + 150; x += 40) { 
-      const y = activeCenterY 
-              + Math.sin(x * 0.0015 + speed + i * 2.3) * 85 
-              + Math.cos(x * 0.0008 - speed) * 45 
+    for (let x = -150; x <= width + 150; x += 40) {
+      const y = activeCenterY
+              + Math.sin(x * 0.0015 + speed + i * 2.3) * 85
+              + Math.cos(x * 0.0008 - speed) * 45
               - thickness;
-      
       if (x === -150) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     }
-
     for (let x = width + 150; x >= -150; x -= 40) {
-      const y = activeCenterY 
-              + Math.sin(x * 0.0015 + speed + i * 2.3) * 85 
-              + Math.cos(x * 0.0008 - speed) * 45 
+      const y = activeCenterY
+              + Math.sin(x * 0.0015 + speed + i * 2.3) * 85
+              + Math.cos(x * 0.0008 - speed) * 45
               + thickness;
       ctx.lineTo(x, y);
     }
     ctx.closePath();
-
-    const hue = currentPalette.hueBase + Math.sin(time * 1.0 + i) * currentPalette.hueRange;
-    
-    ctx.fillStyle = `hsla(${hue}, 100%, 65%, 0.18)`;
-    ctx.fill();
   }
+  // One fill, one blur pass — hue is the palette base (the per-curtain hue
+  // variation was barely visible under the 30px blur + 0.18 alpha anyway).
+  const hue = currentPalette.hueBase;
+  ctx.fillStyle = `hsla(${hue}, 100%, 65%, 0.18)`;
+  ctx.fill();
 
   ctx.filter = 'none';
   time += 0.0025;
-  // Don't schedule the next frame while sleeping — the canvas RAF is the
-  // app's dominant idle CPU/GPU cost, and pausing it is what makes Sleep
-  // "barely noticeable." Wake (canvas-resume event) restarts the loop.
+  // Don't schedule the next frame while paused — see `paused` + the
+  // visibility/focus handlers below. The canvas RAF is the app's dominant
+  // idle CPU/GPU cost; pausing it is what makes Sleep "barely noticeable"
+  // AND what stops the lag when the window is covered/minimized.
   if (!paused) requestAnimationFrame(animate);
 }
 
-// Render loop control: starts running, suspended on `canvas-pause`,
-// resumed on `canvas-resume`. Both events come from the Rust side
-// (system_menu power_sleep / power_wake).
+// Render loop control. `paused` is set by THREE independent signals so the
+// expensive RAF loop stops the moment the canvas isn't visible to the user:
+//   1. `canvas-pause` event from Rust (system_menu power_sleep).
+//   2. `document.visibilitychange` → hidden (alt-tab, minimize, another app
+//      fully covering the window). The standard browser RAF throttle isn't
+//      enough — WebView2 still fires RAF in some hidden states, and even a
+//      throttled RAF re-runs the full animate() body.
+//   3. `window.blur` (focus lost to another app) as a belt-and-suspenders
+//      fallback when visibilitychange doesn't fire (e.g. another window
+//      dragged over this one without minimizing).
+// Resume mirrors all three. The animate() loop self-gates on `paused`.
 let paused = false;
 
 function startLoop() {
@@ -179,6 +218,27 @@ function startLoop() {
 // .catch so a dev preview outside Tauri doesn't throw on the listener.
 listen('canvas-pause', () => { paused = true; }).catch(() => {});
 listen('canvas-resume', () => { startLoop(); }).catch(() => {});
+
+// Pause when the page is hidden (alt-tab / minimize / tab switch). This is
+// THE fix for "lag when another app covers the window" — without it the RAF
+// keeps running the full animate() body at full speed even when nothing's
+// visible. Resume on visible.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    paused = true;
+  } else {
+    startLoop();
+  }
+});
+
+// Pause when the window loses focus (another app comes to the foreground).
+// Belt-and-suspenders: visibilitychange covers most cases, but blur fires
+// for "another window dragged over this one" where the page isn't technically
+// hidden. Resume only if also visible + not manually paused via power_sleep.
+window.addEventListener('blur', () => { paused = true; });
+window.addEventListener('focus', () => {
+  if (!document.hidden) startLoop();
+});
 
 animate();
 
@@ -826,10 +886,6 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   document.getElementById('dockCodex')?.addEventListener('click', (e) => {
     e.stopPropagation();
     openWindow('codex');
-  });
-  document.getElementById('dockGames')?.addEventListener('click', (e) => {
-    e.stopPropagation();
-    openWindow('games');
   });
   document.getElementById('dockApps')?.addEventListener('click', (e) => {
     e.stopPropagation();

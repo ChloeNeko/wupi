@@ -952,35 +952,35 @@ html, body {
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 14px;
+    gap: 16px;
     cursor: pointer;
     padding: 20px 24px;
     border-radius: 22px;
-    transition: transform 0.18s cubic-bezier(0.175, 0.885, 0.32, 1.2), background 0.18s;
-    background: rgba(255, 255, 255, 0.04);
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
-    border: 1px solid rgba(255, 255, 255, 0.08);
+    transition: transform 0.18s cubic-bezier(0.175, 0.885, 0.32, 1.2);
+    background: transparent;
+    border: none;
 }
 .home-app:hover {
     transform: translateY(-6px) scale(1.05);
-    background: rgba(181, 52, 250, 0.12);
-    border-color: rgba(181, 52, 250, 0.35);
-    box-shadow: 0 12px 30px rgba(181, 52, 250, 0.2);
 }
 .home-app-icon {
-    width: 84px;
-    height: 84px;
+    /* No background, no border — just the bare SVG glyph, bigger. The purple
+       square around each icon was visual noise; the outline icons read
+       cleaner as pure strokes over the aurora. */
+    width: 96px;
+    height: 96px;
     display: flex;
     align-items: center;
     justify-content: center;
-    background: linear-gradient(135deg, rgba(181, 52, 250, 0.25), rgba(106, 13, 173, 0.25));
-    border-radius: 22px;
     color: #fff;
 }
 .home-app-icon svg {
-    width: 44px;
-    height: 44px;
+    width: 72px;
+    height: 72px;
+    transition: filter 0.18s;
+}
+.home-app:hover .home-app-icon svg {
+    filter: drop-shadow(0 0 12px rgba(181, 52, 250, 0.55));
 }
 .home-app-label {
     font-size: 14px;
