@@ -881,14 +881,18 @@ const dropdownMenu = document.getElementById('dropdownMenu');
 
   // ── Dock wiring ──────────────────────────────────────────────────────────
   // Click an open app's dock item again → closes it (toggle behavior). The
-  // quick-access dock order is fixed: Chat → Profile → Codex (NOT alphabetical
-  // — that's the Docks home grid). Apps (Docks launcher) is special: it closes
-  // any open surface windows then shows the home grid.
+  // quick-access dock order is fixed: API → Chat → Profile → Codex (NOT
+  // alphabetical — that's the Docks home grid). Apps (Docks launcher) is
+  // special: it closes any open surface windows then shows the home grid.
   function dockToggle(id) {
     if (openWindows.has(id)) closeWindow(id);
     else openWindow(id);
   }
 
+  document.getElementById('dockApi')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    dockToggle('api');
+  });
   document.getElementById('dockChat')?.addEventListener('click', (e) => {
     e.stopPropagation();
     dockToggle('chat');
@@ -907,6 +911,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     // grid. (apps itself is the full-screen home overlay.) Not a toggle —
     // clicking Docks while home is open is a no-op (it's already home).
     if (openWindows.has('apps')) return;
+    closeWindow('api');
     closeWindow('chat');
     closeWindow('profile');
     closeWindow('codex');
@@ -966,6 +971,229 @@ const dropdownMenu = document.getElementById('dropdownMenu');
         .catch((err) => setStatus('Save failed: ' + err, 'err'))
         .finally(() => { saveBtn.disabled = false; });
     });
+  })();
+
+  // ════════════════════════════════════════════════════════════════════════
+  // API — endpoint profiles + main chat source selector
+  // ════════════════════════════════════════════════════════════════════════
+  // Source of truth = api_config.json (loaded at boot into AppState). The
+  // panel lists saved profiles, lets you New/Edit/Delete/Test them, and pick
+  // which is the active chat source. Selecting API triggers the model swap
+  // (12B unloads, Agent.gguf spins up for schema/memory). Selecting Local
+  // reverts it.
+  (function apiPanel() {
+    const root = document.getElementById('api');
+    if (!root) return;
+    const listEl = document.getElementById('apiProfileList');
+    const editorEl = document.getElementById('apiEditor');
+    const nameEl = document.getElementById('apiName');
+    const endpointEl = document.getElementById('apiEndpoint');
+    const modelEl = document.getElementById('apiModel');
+    const keyEl = document.getElementById('apiKey');
+    const tempEl = document.getElementById('apiTemp');
+    const newBtn = document.getElementById('apiNewBtn');
+    const saveBtn = document.getElementById('apiSaveBtn');
+    const cancelBtn = document.getElementById('apiCancelBtn');
+    const testBtn = document.getElementById('apiTestBtn');
+    const statusEl = document.getElementById('apiStatus');
+    const sourceRadios = document.querySelectorAll('input[name="apiSource"]');
+    const sourceHintEl = document.getElementById('apiSourceHint');
+
+    let editingId = null; // null = creating new; string = editing existing
+    let lastConfig = null; // cached for rendering
+
+    function setStatus(msg, kind) {
+      statusEl.textContent = msg || '';
+      statusEl.className = 'profile-status' + (kind ? ' ' + kind : '');
+    }
+
+    function escapeHtml(s) {
+      return String(s || '').replace(/[&<>"']/g, (c) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      }[c]));
+    }
+
+    // Render the profile list from the cached config. Active profile gets a
+    // highlighted row + an "Active" badge; others get an "Activate" button.
+    function renderList(config) {
+      lastConfig = config;
+      if (!config.profiles || config.profiles.length === 0) {
+        listEl.innerHTML = '<div class="api-empty">No profiles yet. Click "+ New" to add your first endpoint.</div>';
+        return;
+      }
+      const activeId = config.active_profile_id;
+      const rows = config.profiles.map((p) => {
+        const isActive = p.id === activeId;
+        const meta = escapeHtml(`${p.model || '?'} · ${p.endpoint || ''}`);
+        return `<div class="api-profile-row${isActive ? ' active' : ''}" data-id="${escapeHtml(p.id)}">
+          <div class="api-profile-info">
+            <div class="api-profile-name">${escapeHtml(p.name || p.id)}</div>
+            <div class="api-profile-meta">${meta}</div>
+          </div>
+          <div class="api-profile-buttons">
+            ${isActive ? '<span class="api-mini-btn activate" disabled>Active</span>' : `<button class="api-mini-btn activate" data-act="activate">Activate</button>`}
+            <button class="api-mini-btn" data-act="edit">Edit</button>
+            <button class="api-mini-btn del" data-act="delete">Delete</button>
+          </div>
+        </div>`;
+      }).join('');
+      listEl.innerHTML = rows;
+    }
+
+    // Render the source selector state. API radio is disabled unless a profile
+    // is active. The hint explains the current state + what happens on switch.
+    function renderSource(config, extra) {
+      const source = extra?.source || config.model_source || 'local';
+      const apiReady = !!config.active_profile_id || !!extra?.apiReady;
+      sourceRadios.forEach((r) => {
+        if (r.value === 'api') {
+          r.disabled = !apiReady;
+          r.checked = source === 'api';
+        } else {
+          r.checked = source === 'local';
+        }
+      });
+      const activeName = (config.profiles.find((p) => p.id === config.active_profile_id) || {}).name;
+      if (source === 'api') {
+        sourceHintEl.textContent = `Chat via API${activeName ? ' (' + activeName + ')' : ''}. Schema + memory tracking runs on Agent.gguf locally.`;
+      } else if (apiReady) {
+        sourceHintEl.textContent = 'Chat runs on WUPI 12B locally. Switch to API to offload chat + free VRAM.';
+      } else {
+        sourceHintEl.textContent = 'Local model (WUPI 12B). Add + activate an API profile to enable the API option.';
+      }
+    }
+
+    async function refresh() {
+      setStatus('Loading…');
+      try {
+        const config = await invoke('api_profiles_list');
+        const extra = await invoke('model_source_get');
+        renderList(config);
+        renderSource(config, extra);
+        setStatus('');
+      } catch (err) {
+        setStatus('Load failed: ' + err, 'err');
+      }
+    }
+
+    // ── Profile list interactions (event delegation) ──
+    listEl.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-act]');
+      if (!btn) return;
+      const row = btn.closest('[data-id]');
+      const id = row?.dataset.id;
+      const act = btn.dataset.act;
+      if (!id) return;
+      if (act === 'edit') {
+        const p = lastConfig?.profiles.find((x) => x.id === id);
+        if (p) showEditor(p);
+      } else if (act === 'delete') {
+        const p = lastConfig?.profiles.find((x) => x.id === id);
+        if (!p) return;
+        if (!confirm(`Delete profile "${p.name || p.id}"?`)) return;
+        setStatus('Deleting…');
+        invoke('api_profile_delete', { profileId: id })
+          .then(() => { setStatus('Deleted.', 'ok'); return refresh(); })
+          .catch((err) => setStatus('Delete failed: ' + err, 'err'));
+      } else if (act === 'activate') {
+        setStatus('Activating…');
+        // Activate = set active profile AND switch source to Api (the model swap).
+        invoke('api_connect', { profileId: id })
+          .then(() => { setStatus('Connected — chat via API now.', 'ok'); return refresh(); })
+          .catch((err) => setStatus('Connect failed: ' + err, 'err'));
+      }
+    });
+
+    // ── Source radio change ──
+    sourceRadios.forEach((r) => {
+      r.addEventListener('change', () => {
+        if (r.value === 'local') {
+          setStatus('Disconnecting — reloading WUPI 12B…', '');
+          invoke('api_disconnect')
+            .then(() => { setStatus('Back to local.', 'ok'); return refresh(); })
+            .catch((err) => setStatus('Disconnect failed: ' + err, 'err'));
+        } else if (r.value === 'api') {
+          // API radio needs an active profile. If none, the button is disabled;
+          // but defensively check.
+          if (!lastConfig?.active_profile_id) {
+            setStatus('Activate a profile first.', 'err');
+            r.checked = false;
+            return;
+          }
+        }
+      });
+    });
+
+    // ── Editor (New / Edit) ──
+    function showEditor(profile) {
+      editingId = profile?.id || null;
+      nameEl.value = profile?.name || '';
+      endpointEl.value = profile?.endpoint || '';
+      modelEl.value = profile?.model || '';
+      keyEl.value = profile?.api_key || '';
+      tempEl.value = profile?.temperature != null ? profile.temperature : '';
+      editorEl.hidden = false;
+      setStatus('');
+      nameEl.focus();
+    }
+    function hideEditor() {
+      editorEl.hidden = true;
+      editingId = null;
+      setStatus('');
+    }
+
+    newBtn?.addEventListener('click', () => showEditor(null));
+    cancelBtn?.addEventListener('click', hideEditor);
+
+    saveBtn?.addEventListener('click', () => {
+      const name = nameEl.value.trim();
+      if (!name) { nameEl.focus(); return; }
+      if (!endpointEl.value.trim()) { endpointEl.focus(); return; }
+      if (!modelEl.value.trim()) { modelEl.focus(); return; }
+      const tempRaw = tempEl.value.trim();
+      const temperature = tempRaw === '' ? null : Math.max(0, Math.min(2, parseFloat(tempRaw)));
+      const profile = {
+        id: editingId || '', // backend sanitizes if empty
+        name,
+        endpoint: endpointEl.value.trim(),
+        model: modelEl.value.trim(),
+        api_key: keyEl.value,
+        temperature,
+      };
+      saveBtn.disabled = true;
+      setStatus('Saving…');
+      invoke('api_profile_save', { profile })
+        .then(() => { hideEditor(); setStatus('Saved.', 'ok'); return refresh(); })
+        .catch((err) => setStatus('Save failed: ' + err, 'err'))
+        .finally(() => { saveBtn.disabled = false; });
+    });
+
+    testBtn?.addEventListener('click', () => {
+      const profile = {
+        id: editingId || 'test',
+        name: nameEl.value.trim() || 'test',
+        endpoint: endpointEl.value.trim(),
+        model: modelEl.value.trim(),
+        api_key: keyEl.value,
+        temperature: null,
+      };
+      if (!profile.endpoint || !profile.api_key) {
+        setStatus('Endpoint + API key required to test.', 'err');
+        return;
+      }
+      testBtn.disabled = true;
+      setStatus('Testing connection…');
+      invoke('api_profile_test', { profile })
+        .then((v) => {
+          const count = (v && v.data && Array.isArray(v.data)) ? v.data.length : null;
+          setStatus(count != null ? `Connected — ${count} models available.` : 'Connected.', 'ok');
+        })
+        .catch((err) => setStatus('Connection failed: ' + err, 'err'))
+        .finally(() => { testBtn.disabled = false; });
+    });
+
+    // Load fresh every time the window opens.
+    windowOpenHooks.set('api', () => { refresh(); });
   })();
 
   // ════════════════════════════════════════════════════════════════════════

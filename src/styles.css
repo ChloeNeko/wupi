@@ -718,6 +718,113 @@ html, body {
 .profile-status.ok { color: #7eff9c; }
 .profile-status.err { color: #ff8080; }
 
+/* ── API panel — source selector + profile list + editor ─────────── */
+.api-body { min-width: 440px; }
+.api-source-row {
+    display: flex;
+    gap: 20px;
+    margin-top: 6px;
+}
+.api-radio {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    font-size: 14px;
+    color: rgba(255, 255, 255, 0.9);
+}
+.api-radio input { accent-color: #b534fa; }
+.api-radio input:disabled + span {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+.api-source-hint {
+    margin: 8px 0 0;
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.45);
+    min-height: 16px;
+}
+.api-section-divider {
+    height: 1px;
+    background: rgba(255, 255, 255, 0.08);
+    margin: 20px 0 16px;
+}
+.api-profiles-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+.api-new-btn { font-size: 12px; padding: 6px 12px; }
+.api-profile-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 10px;
+    max-height: 220px;
+    overflow-y: auto;
+}
+.api-profile-list::-webkit-scrollbar { width: 8px; }
+.api-profile-list::-webkit-scrollbar-thumb {
+    background: rgba(181, 52, 250, 0.3);
+    border-radius: 4px;
+}
+.api-profile-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 12px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 10px;
+    gap: 8px;
+}
+.api-profile-row.active {
+    border-color: rgba(181, 52, 250, 0.5);
+    background: rgba(181, 52, 250, 0.08);
+}
+.api-profile-info { min-width: 0; flex: 1; }
+.api-profile-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.95);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.api-profile-meta {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.45);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.api-profile-buttons { display: flex; gap: 6px; flex-shrink: 0; }
+.api-mini-btn {
+    background: rgba(255, 255, 255, 0.08);
+    border: none;
+    color: rgba(255, 255, 255, 0.8);
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: background 0.15s;
+}
+.api-mini-btn:hover { background: rgba(255, 255, 255, 0.18); }
+.api-mini-btn.activate { background: rgba(181, 52, 250, 0.25); }
+.api-mini-btn.activate:hover { background: rgba(181, 52, 250, 0.4); }
+.api-mini-btn.del:hover { background: rgba(255, 60, 60, 0.25); }
+.api-empty {
+    text-align: center;
+    padding: 20px 12px;
+    color: rgba(255, 255, 255, 0.4);
+    font-size: 13px;
+}
+.api-editor {
+    margin-top: 16px;
+    padding-top: 16px;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
 /* ── Codex — authored lore library (two-pane) ───────────────────── */
 /* Left: searchable list of lore entries. Right: reader / editor for the
    selected entry. The window itself is draggable + resizable (`.modal.draggable`). */

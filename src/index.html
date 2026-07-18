@@ -175,8 +175,18 @@
 
     <div class="dock-trigger-area">
         <div class="dock-container">
-            <!-- Quick-access order (fixed): Chat → Profile → Codex. This is NOT
-                 alphabetical — the Docks home grid is alphabetical. -->
+            <!-- Quick-access order (fixed): API → Chat → Profile → Codex. API
+                 is first per Chloe's call. This is NOT alphabetical — the
+                 Docks home grid is alphabetical. -->
+            <div class="dock-item" id="dockApi" aria-label="API">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="4" y="8" width="16" height="12" rx="3"></rect>
+                    <path d="M12 8V4M9 4h6"></path>
+                    <circle cx="9" cy="14" r="1.2"></circle>
+                    <circle cx="15" cy="14" r="1.2"></circle>
+                    <path d="M2 13v4M22 13v4"></path>
+                </svg>
+            </div>
             <div class="dock-item" id="dockChat" aria-label="WUPI Chat">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
@@ -246,6 +256,59 @@
         </div>
     </div>
 
+    <!-- API — endpoint profiles + main chat source selector. The source radio
+         picks Local (WUPI.gguf 12B) vs API; selecting API unloads the 12B and
+         runs Agent.gguf as the schema/memory engine (chunk 4 swap). -->
+    <div class="app-window modal api draggable" id="api" aria-hidden="true">
+        <div class="app-window-header">
+            <span class="app-window-title">API</span>
+            <button class="app-window-close" data-close="api" aria-label="Close">✕</button>
+        </div>
+        <div class="app-window-body api-body">
+            <!-- ── Main chat source ── -->
+            <label class="field-label">Main chat source</label>
+            <div class="api-source-row">
+                <label class="api-radio">
+                    <input type="radio" name="apiSource" value="local" />
+                    <span>WUPI 12B (local)</span>
+                </label>
+                <label class="api-radio">
+                    <input type="radio" name="apiSource" value="api" />
+                    <span>API</span>
+                </label>
+            </div>
+            <p class="api-source-hint" id="apiSourceHint"></p>
+
+            <!-- ── Saved profiles ── -->
+            <div class="api-section-divider"></div>
+            <div class="api-profiles-header">
+                <label class="field-label">Endpoint profiles</label>
+                <button id="apiNewBtn" class="field-btn primary api-new-btn">+ New</button>
+            </div>
+            <div class="api-profile-list" id="apiProfileList"></div>
+
+            <!-- ── Editor (hidden until New/Edit) ── -->
+            <div class="api-editor" id="apiEditor" hidden>
+                <label class="field-label">Name</label>
+                <input type="text" id="apiName" class="field-input" placeholder="e.g. Z.AI personal, NanoGPT" />
+                <label class="field-label">Endpoint URL</label>
+                <input type="text" id="apiEndpoint" class="field-input" placeholder="https://api.z.ai/api/coding/paas/v4" />
+                <label class="field-label">Model</label>
+                <input type="text" id="apiModel" class="field-input" placeholder="glm-4.6, gpt-4o-mini, …" />
+                <label class="field-label">API key</label>
+                <input type="password" id="apiKey" class="field-input" placeholder="sk-…" autocomplete="off" />
+                <label class="field-label">Temperature (optional)</label>
+                <input type="number" id="apiTemp" class="field-input" placeholder="0.7" step="0.1" min="0" max="2" />
+                <div class="profile-actions">
+                    <span class="profile-status" id="apiStatus"></span>
+                    <button id="apiTestBtn" class="field-btn">Test</button>
+                    <button id="apiSaveBtn" class="field-btn primary">Save</button>
+                    <button id="apiCancelBtn" class="field-btn">Cancel</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Codex — memory browser, centered modal, larger, draggable + resizable -->
     <div class="app-window modal codex draggable" id="codex" aria-hidden="true">
         <div class="app-window-header">
@@ -281,7 +344,19 @@
     <div class="app-window home" id="apps" aria-hidden="true">
         <button class="app-window-close home-close" data-close="apps" aria-label="Close">✕</button>
         <div class="home-grid">
-            <!-- Alphabetical by label: Codex, Games, Profile Editor, WUPI Chat. -->
+            <!-- Alphabetical by label: API, Codex, Games, Profile Editor, WUPI Chat. -->
+            <div class="home-app" data-open="api">
+                <div class="home-app-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="4" y="8" width="16" height="12" rx="3"></rect>
+                        <path d="M12 8V4M9 4h6"></path>
+                        <circle cx="9" cy="14" r="1.2"></circle>
+                        <circle cx="15" cy="14" r="1.2"></circle>
+                        <path d="M2 13v4M22 13v4"></path>
+                    </svg>
+                </div>
+                <span class="home-app-label">API</span>
+            </div>
             <div class="home-app" data-open="codex">
                 <div class="home-app-icon">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
