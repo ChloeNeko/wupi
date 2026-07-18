@@ -1,18 +1,27 @@
 //! The background state-delta schema engine.
 //!
 //! A dedicated `std::thread` ("wupi-schema") owning an ISOLATED
-//! `LlamaContext<'static>` on the same leaked model the chat engine uses.
+//! `LlamaContext<'static>` on a model it loads ITSELF (not the chat model).
 //! After each chat turn, `chat_send` posts a [`SchemaRequest`] here; the
 //! thread generates a micro-delta JSON (only the changed keys), parses it,
 //! and replies. The chat KV cache is never touched — true context isolation.
 //!
+//! # Independent model loading (2026-07-17, API feature)
+//!
+//! Previously this engine shared the chat model via `shared_model()`. That
+//! coupling broke the moment chat could move to an HTTP API (no local model
+//! to share). The engine now loads its OWN model by path — mirroring the
+//! embedder (`memory_embedder_llama.rs`). In Local mode it loads `WUPI.gguf`;
+//! in API mode it loads `Agent.gguf` (4B Gemma4, the dedicated agent). The
+//! Gemma4 turn markers in the delta prompt work for both — Agent.gguf is
+//! Gemma4 family.
+//!
 //! # Why a separate context (the load-bearing isolation requirement)
 //!
 //! The schema pass MUST NOT pollute the chat engine's rolling KV cache. A
-//! second `LlamaContext` on the same `&'static LlamaModel` achieves this:
-//! the two contexts share model weights (one VRAM copy) but have independent
-//! KV state. This is the same pattern as the embedder (§3B, memory_embedder_
-//! llama.rs) — proven architecture.
+//! second `LlamaContext` on the schema's own `&'static LlamaModel` achieves
+//! this: independent KV state, no cross-contamination. This is the same
+//! pattern as the embedder (§3B) — proven architecture.
 //!
 //! # The micro-delta contract
 //!
@@ -27,15 +36,17 @@
 //! replies `Err` and the schema is left unchanged for that turn (graceful —
 //! chat proceeds with stale schema).
 
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 
-use crate::llm::{shared_backend, shared_model};
+use crate::llm::shared_backend;
 use crate::schema::{SchemaDelta, WorldSchema};
 
 /// The schema context's token budget. Smaller than chat's 4000 — the delta
@@ -114,14 +125,21 @@ impl SchemaEngine {
     /// The readiness receiver yields `Ok(())` once the schema context is live
     /// (or `Err` if init failed). The caller SHOULD `recv()` before treating
     /// the engine as ready, same contract as `ChatEngine::spawn` (Bug #6).
-    pub fn spawn() -> (Self, mpsc::Receiver<Result<(), String>>) {
+    ///
+    /// `path` is the model file this engine loads as ITS OWN model — no longer
+    /// `shared_model()`. In Local mode pass WUPI.gguf; in API mode pass
+    /// Agent.gguf. Mirrors `LlamaCppEmbedder::spawn_load`.
+    pub fn spawn_load(
+        path: PathBuf,
+        n_gpu_layers: u32,
+    ) -> (Self, mpsc::Receiver<Result<(), String>>) {
         let (tx, rx) = mpsc::channel::<SchemaMsg>();
         let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
 
         std::thread::Builder::new()
             .name("wupi-schema".into())
             .spawn(move || {
-                let mut runtime = match Self::init_runtime() {
+                let mut runtime = match Self::init_runtime(&path, n_gpu_layers) {
                     Ok(rt) => {
                         let _ = init_tx.send(Ok(()));
                         rt
@@ -244,13 +262,21 @@ impl SchemaEngine {
         }
     }
 
-    /// Initialize the schema runtime: create an isolated context on the
-    /// shared model. Runs on the schema thread.
-    fn init_runtime() -> anyhow::Result<SchemaRuntime> {
+    /// Initialize the schema runtime: load the model by path (this engine's
+    /// OWN model — no `shared_model()`), leak it to `&'static`, create an
+    /// isolated context. Mirrors `memory_embedder_llama.rs::init_runtime`.
+    /// Runs on the schema thread.
+    fn init_runtime(path: &Path, n_gpu_layers: u32) -> anyhow::Result<SchemaRuntime> {
         let backend = shared_backend();
-        let model = shared_model().ok_or_else(|| {
-            anyhow::anyhow!("no shared model loaded — schema engine cannot start")
-        })?;
+
+        let params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
+        let model = LlamaModel::load_from_file(backend, path, &params)
+            .map_err(|e| anyhow::anyhow!("schema model load {}: {e:?}", path.display()))?;
+        tracing::info!(path = %path.display(), "schema model loaded");
+
+        // Leak the model to &'static so the context can borrow it for its
+        // whole life. Same rationale as llm.rs::into_static + the embedder.
+        let model_ref: &'static LlamaModel = Box::leak(Box::new(model));
 
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(SCHEMA_CTX))
@@ -259,12 +285,12 @@ impl SchemaEngine {
             // Match the chat engine's KV quantization for consistency.
             .with_type_k(KvCacheType::Q8_0)
             .with_type_v(KvCacheType::Q8_0);
-        let ctx = model
+        let ctx = model_ref
             .new_context(backend, ctx_params)
             .map_err(|e| anyhow::anyhow!("schema context init: {e:?}"))?;
         tracing::info!(n_ctx = SCHEMA_CTX, "schema context created (isolated)");
 
-        Ok(SchemaRuntime { ctx, model })
+        Ok(SchemaRuntime { ctx, model: model_ref })
     }
 }
 
@@ -632,4 +658,41 @@ mod tests {
         // 3 words, no pronoun, not action-shaped → filler, skip.
         assert!(!should_fire_delta("lol that's funny", "Glad you enjoyed it."));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Model discovery (mirrors memory_embedder_llama.rs)
+// ---------------------------------------------------------------------------
+
+/// Find a named `.gguf` model in `dir` (case-insensitive exact-name match).
+/// Used by [`resolve_schema_model`] to locate either `WUPI.gguf` (Local mode)
+/// or `Agent.gguf` (API mode) for the schema engine's own model load.
+fn pick_named_model(dir: &Path, name: &str) -> Option<PathBuf> {
+    let target = name.to_lowercase();
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .find(|e| {
+            e.path().extension().and_then(|x| x.to_str()).map_or(false, |x| x.eq_ignore_ascii_case("gguf"))
+                && e.file_name().to_string_lossy().to_lowercase() == target
+        })
+        .map(|e| e.path())
+}
+
+/// Resolve the schema engine's model across the standard candidate dirs.
+/// `name` is `"WUPI.gguf"` in Local mode or `"Agent.gguf"` in API mode.
+/// Mirrors `memory_embedder_llama::resolve_embed_model` + the candidate walk
+/// in `lib.rs::resolve_model_path`. Returns `None` if no matching file exists
+/// — the caller falls back to running without schema deltas (graceful).
+pub fn resolve_schema_model(dirs: &[PathBuf], name: &str) -> Option<PathBuf> {
+    for dir in dirs {
+        if dir.exists() {
+            if let Some(p) = pick_named_model(dir, name) {
+                tracing::info!("resolved schema model ({name}): {}", p.display());
+                return Some(p);
+            }
+        }
+    }
+    tracing::warn!("no {name} found — schema engine will not start (no world-state deltas)");
+    None
 }

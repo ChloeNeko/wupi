@@ -282,7 +282,7 @@ pub fn run() {
                     let s = state.settings.lock().expect("settings mutex");
                     s.context_size
                 };
-                let backend = llm::LlamaCppBackend::spawn_load(path, 99, context_size, Box::new(move |result| {
+                let backend = llm::LlamaCppBackend::spawn_load(path.clone(), 99, context_size, Box::new(move |result| {
                     match &result {
                         Ok(name) => {
                             let _ = app_handle.emit(
@@ -290,19 +290,19 @@ pub fn run() {
                                 serde_json::json!({ "status": "ready", "model": name }),
                             );
 
-                            // ── Eager schema-engine spawn (Component E) ────
-                            // The chat model is loaded → shared_model() is now
-                            // Some. Spawn the schema delta engine so it's ready
-                            // before the first chat turn (Component D's queue
-                            // assumes it exists). Mirrors the embedder's block-
-                            // on-readiness pattern. Runs on the loader thread
-                            // (disposable background thread) — blocking recv is
-                            // fine here. The schema context alloc is just KV
-                            // allocation (ms, reuses the leaked model), so the
-                            // delay before "ready" is negligible.
+                            // ── Eager schema-engine spawn ──────────────────
+                            // The schema engine loads its OWN model now (no
+                            // shared_model() coupling). In Local mode it reuses
+                            // the same WUPI.gguf path the chat engine just
+                            // loaded. Spawned here (after chat model ready) so
+                            // the two loads don't compete for VRAM during boot;
+                            // runs on the loader thread, blocking recv is fine.
                             let app_state = app_handle.state::<AppState>();
                             if app_state.schema_engine.get().is_none() {
-                                let (engine, init_rx) = schema_engine::SchemaEngine::spawn();
+                                let (engine, init_rx) = schema_engine::SchemaEngine::spawn_load(
+                                    path.clone(),
+                                    99,
+                                );
                                 match init_rx.recv() {
                                     Ok(Ok(())) => {
                                         tracing::info!(
@@ -1699,35 +1699,17 @@ async fn debug_schema_delta(
     apply: Option<bool>,
     state: tauri::State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    // Lazy-spawn the schema engine on first call. `get_or_init` is race-safe
-    // if two debug calls land concurrently.
-    let engine = if let Some(e) = state.schema_engine.get() {
-        Arc::clone(e)
-    } else {
-        // The chat model must be loaded first — shared_model() is None until
-        // the loader thread finishes + hands back the &'static LlamaModel.
-        if llm::shared_model().is_none() {
-            return Err("chat model not loaded yet — schema engine cannot start".into());
-        }
-        let (engine, init_rx) = schema_engine::SchemaEngine::spawn();
-        // Block on the readiness channel (Bug #6 contract). This recv runs on
-        // the tokio worker — fine, setup-style blocking, not a hot path.
-        let ready = tokio::task::spawn_blocking(move || init_rx.recv())
-            .await
-            .map_err(|e| format!("init join: {e}"))?
-            .map_err(|e| format!("init channel: {e}"))?;
-        match ready {
-            Ok(()) => {
-                tracing::info!("schema engine ready (lazy spawn via debug IPC)");
-            }
-            Err(msg) => {
-                return Err(format!("schema engine init failed: {msg}"));
-            }
-        }
-        let engine = Arc::new(engine);
-        let _ = state.schema_engine.set(Arc::clone(&engine));
-        engine
-    };
+    // The schema engine is eager-spawned at chat-model-ready in setup(). This
+    // debug command requires it to already be running — the lazy-spawn fallback
+    // was removed when the engine stopped using shared_model() (it now loads
+    // its own model by path, which needs the app handle for resolution — not
+    // worth threading through a debug-only path). If the eager spawn failed at
+    // boot, surface that here.
+    let engine = state
+        .schema_engine
+        .get()
+        .cloned()
+        .ok_or_else(|| "schema engine not running (eager spawn failed at boot, or no model found)".to_string())?;
 
     // Snapshot the current schema (the delta pass diffs against this).
     let current = state.schema.lock().await.clone();
