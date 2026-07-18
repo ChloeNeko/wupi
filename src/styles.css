@@ -40,6 +40,14 @@ html, body {
     user-select: none;
 }
 
+/* ── "WUPI OS" title — live AI-status indicator ──────────────────────
+   The title never pulses on its own. It is one of three states, driven
+   by the title-state controller in script.js:
+     - idle/boot: steady medium white glow, no animation
+     - is-offline: ominous dark red, fast steady ~1Hz alarm flash
+     - is-typing: no CSS animation; the JS toggles .title-flicker on a
+                  randomized timer to simulate organic "thinking" spurts.
+   No 8s breathing pulse exists anymore (that was the old pulseGlow). */
 .os-title {
     position: absolute;
     left: 50%;
@@ -51,18 +59,36 @@ html, body {
     text-transform: uppercase;
     color: #ffffff;
     white-space: nowrap;
-    animation: pulseGlow 8s ease-in-out infinite;
+    text-shadow: 0 0 10px rgba(255, 255, 255, 0.45);
+    opacity: 0.95;
+    transition: color 0.35s ease, text-shadow 0.35s ease;
 }
 
-@keyframes pulseGlow {
-    0%, 100% {
-        text-shadow: 0 0 8px rgba(255, 255, 255, 0.3);
-        opacity: 0.8;
-    }
-    50% {
-        text-shadow: 0 0 22px rgba(255, 255, 255, 0.85), 0 0 30px rgba(255, 255, 255, 0.4);
-        opacity: 1;
-    }
+/* OFFLINE — fast steady red alarm flash. Speed mirrors a one-note fire
+   alarm: ~1Hz, sharp transitions (not eased), full-range opacity. */
+.os-title.is-offline {
+    color: #ff3b3b;
+    animation: titleAlarm 1s steps(1, end) infinite;
+}
+.os-title.is-offline.title-flicker {
+    /* Typing-flicker class is ignored while offline. */
+    text-shadow: 0 0 12px rgba(255, 59, 59, 0.65);
+}
+@keyframes titleAlarm {
+    0%, 49%   { opacity: 1;   text-shadow: 0 0 14px rgba(255, 59, 59, 0.85), 0 0 22px rgba(255, 59, 59, 0.4); }
+    50%, 100% { opacity: 0.3; text-shadow: 0 0 4px rgba(255, 59, 59, 0.2); }
+}
+
+/* TYPING — JS-toggled flicker class. The base .is-typing state is just
+   the idle white; .title-flicker gets added/removed on a randomized
+   timer to produce subtle organic "typing" spurts. */
+.os-title.is-typing,
+.os-title.title-flicker {
+    color: #ffffff;
+}
+.os-title.title-flicker {
+    text-shadow: 0 0 22px rgba(255, 255, 255, 0.95), 0 0 36px rgba(255, 255, 255, 0.5);
+    opacity: 1;
 }
 
 .menu-container, .clock-wrapper, .wifi-wrapper, .bluetooth-wrapper, .audio-wrapper {
@@ -574,6 +600,12 @@ html, body {
     width: 760px;
     max-height: 82vh;
 }
+/* AI panel — fixed compact width matching its body. No resize handle, no
+   movement, just centered content. */
+.app-window.modal.api {
+    width: 500px;
+    max-width: 90vw;
+}
 .app-window.modal.draggable {
     resize: both;
     min-width: 360px;
@@ -672,6 +704,13 @@ html, body {
     border-color: rgba(181, 52, 250, 0.6);
     box-shadow: 0 0 0 3px rgba(181, 52, 250, 0.12);
 }
+/* The native password-reveal "eye" glyph on Windows/WebView2 (::-ms-reveal)
+   defaults to a dark gray that's nearly invisible against the dark field
+   background. Force it white so the affordance reads. */
+input[type="password"]::-ms-reveal,
+input[type="password"]::-webkit-credentials-auto-fill-button {
+    filter: invert(1) brightness(2);
+}
 .field-input::placeholder, .field-textarea::placeholder {
     color: rgba(255, 255, 255, 0.3);
 }
@@ -718,56 +757,330 @@ html, body {
 .profile-status.ok { color: #7eff9c; }
 .profile-status.err { color: #ff8080; }
 
-/* ── API panel — source selector + profile list + editor ─────────── */
-.api-body { min-width: 440px; }
-.api-source-row {
+/* ── AI panel — mode selector (LOCAL | ONLINE) + local model + online
+   profile list + editor. Replaces the old radio + "+ New" layout. ─── */
+/* The AI panel is non-scrollable + non-resizable — content is compact and
+   must fit without a scrollbar. Let the body fill the panel width (the panel
+   itself is sized by .app-window.modal.api); don't hardcode a narrower body
+   width or content shifts left with dead space on the right. */
+.api-body {
+    width: auto;
+    overflow: hidden;
     display: flex;
-    gap: 20px;
-    margin-top: 6px;
+    flex-direction: column;
+    align-items: stretch;
+    box-sizing: border-box;
 }
-.api-radio {
+.api-body > * { width: auto; box-sizing: border-box; }
+
+/* Mode boxes: two large click targets side-by-side. Clicking highlights
+   the box (magenta border + faint bg) and swaps the section below. */
+.ai-mode-row {
     display: flex;
+    gap: 14px;
+    margin-top: 4px;
+}
+.ai-mode-box {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
     align-items: center;
-    gap: 8px;
+    justify-content: center;
+    gap: 10px;
+    padding: 22px 12px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1.5px solid rgba(255, 255, 255, 0.12);
+    border-radius: 14px;
+    color: rgba(255, 255, 255, 0.65);
     cursor: pointer;
-    font-size: 14px;
+    transition: border-color 0.15s, background 0.15s, color 0.15s, box-shadow 0.2s;
+    font-family: inherit;
+}
+.ai-mode-box svg {
+    width: 34px;
+    height: 34px;
+    opacity: 0.7;
+    transition: opacity 0.15s;
+}
+.ai-mode-label {
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 2px;
+}
+.ai-mode-box:hover {
+    border-color: rgba(255, 255, 255, 0.3);
     color: rgba(255, 255, 255, 0.9);
 }
-.api-radio input { accent-color: #b534fa; }
-.api-radio input:disabled + span {
-    opacity: 0.4;
-    cursor: not-allowed;
+.ai-mode-box:hover svg { opacity: 0.95; }
+.ai-mode-box.active {
+    border-color: rgba(181, 52, 250, 0.65);
+    background: rgba(181, 52, 250, 0.1);
+    color: #ffffff;
+    box-shadow: 0 0 18px rgba(181, 52, 250, 0.25), inset 0 0 12px rgba(181, 52, 250, 0.08);
 }
-.api-source-hint {
-    margin: 8px 0 0;
+.ai-mode-box.active svg { opacity: 1; }
+
+/* LOCAL section — a single centered glowing bubble. Only one local model
+   exists today, so it's a list-of-one; the active look is permanent. */
+.ai-local-section {
+    margin-top: 22px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+.ai-local-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    width: 100%;
+    align-items: center;
+}
+.ai-local-bubble {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 18px 36px;
+    border: 1.5px solid rgba(181, 52, 250, 0.5);
+    border-radius: 999px;
+    background: rgba(181, 52, 250, 0.1);
+    box-shadow: 0 0 22px rgba(181, 52, 250, 0.4), inset 0 0 14px rgba(181, 52, 250, 0.12);
+    color: #ffffff;
+    user-select: none;
+    transition: transform 0.12s, box-shadow 0.12s;
+}
+/* The bubble is a runtime disconnect affordance when the backend is on API.
+   The JS adds .can-disconnect (and the cursor) only in that state; in normal
+   LOCAL runtime the bubble is informational and not clickable. */
+.ai-local-bubble.can-disconnect {
+    cursor: pointer;
+}
+.ai-local-bubble.can-disconnect:hover {
+    transform: scale(1.03);
+    box-shadow: 0 0 30px rgba(181, 52, 250, 0.65), inset 0 0 18px rgba(181, 52, 250, 0.2);
+}
+.ai-local-bubble.active {
+    animation: localGlow 3.5s ease-in-out infinite;
+}
+.ai-local-name {
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+}
+.ai-local-size {
+    font-size: 13px;
+    font-weight: 500;
+    color: #555;
+    letter-spacing: 1px;
+}
+@keyframes localGlow {
+    0%, 100% { box-shadow: 0 0 16px rgba(181, 52, 250, 0.35), inset 0 0 10px rgba(181, 52, 250, 0.1); }
+    50%      { box-shadow: 0 0 28px rgba(181, 52, 250, 0.6), inset 0 0 16px rgba(181, 52, 250, 0.18); }
+}
+.ai-local-hint {
+    margin: 14px 0 0;
     font-size: 12px;
-    color: rgba(255, 255, 255, 0.45);
-    min-height: 16px;
+    color: rgba(255, 255, 255, 0.4);
+    text-align: center;
 }
-.api-section-divider {
+
+/* ONLINE section — hidden unless ONLINE mode is active. */
+.ai-online-section {
+    margin-top: 22px;
+    display: none;
+}
+.ai-online-section.visible { display: block; }
+.ai-local-section.hidden { display: none; }
+
+/* Vertical stack: profile dropdown → model dropdown → bubble → Connect. */
+.ai-online-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    align-items: center;
+}
+.ai-online-stack .field-label {
+    align-self: flex-start;
+    margin-top: 6px;
+}
+.ai-online-stack .field-label:first-child { margin-top: 0; }
+
+/* Generic select styling — replaces .ai-model-select. Same look as text
+   inputs but with a dropdown indicator. */
+.ai-select {
+    cursor: pointer;
+    width: 100%;
+    box-sizing: border-box;
+}
+.ai-select:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Dropdown LIST (the popup that opens when you click the select). The
+   default OS/Chrome rendering is stark white with gray text — clashes
+   badly with the dark Aurora UI. These rules style the popup itself so
+   it matches the panel's dark theme. */
+.ai-select option {
+    background: #1a1a1f;
+    color: rgba(255, 255, 255, 0.9);
+    padding: 6px 10px;
+}
+.ai-select option:checked,
+.ai-select option:hover {
+    background: rgba(181, 52, 250, 0.35);
+    color: #ffffff;
+}
+
+/* Online bubble — mirrors the LOCAL 12B bubble shape. Inactive = muted gray;
+   .active = same magenta glow treatment as the local bubble so the visual
+   language matches. */
+.ai-online-bubble {
+    display: flex;
+    align-items: baseline;
+    justify-content: center;
+    gap: 10px;
+    padding: 14px 28px;
+    border: 1.5px solid rgba(255, 255, 255, 0.12);
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.03);
+    color: rgba(255, 255, 255, 0.4);
+    margin-top: 14px;
+    user-select: none;
+    transition: border-color 0.2s, background 0.2s, color 0.2s, box-shadow 0.3s;
+}
+.ai-online-bubble.active {
+    border-color: rgba(181, 52, 250, 0.5);
+    background: rgba(181, 52, 250, 0.1);
+    color: #ffffff;
+    box-shadow: 0 0 22px rgba(181, 52, 250, 0.4), inset 0 0 14px rgba(181, 52, 250, 0.12);
+    animation: localGlow 3.5s ease-in-out infinite;
+}
+/* Pending = profile + model picked in the dropdowns but not yet connected.
+   Preview state — subdued white, no glow, no animation. */
+.ai-online-bubble.pending {
+    border-color: rgba(255, 255, 255, 0.25);
+    background: rgba(255, 255, 255, 0.05);
+    color: rgba(255, 255, 255, 0.85);
+}
+.ai-online-bubble.pending .ai-online-bubble-model { color: rgba(255, 255, 255, 0.55); }
+.ai-online-bubble-text {
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+}
+.ai-online-bubble-sep {
+    color: rgba(255, 255, 255, 0.5);
+    font-weight: 400;
+}
+.ai-online-bubble-model {
+    font-size: 13px;
+    font-weight: 500;
+    color: #555;
+    letter-spacing: 1px;
+}
+.ai-online-bubble.active .ai-online-bubble-model { color: rgba(255, 255, 255, 0.7); }
+
+/* Connect button — pink/magenta primary action, full-width pill. */
+.ai-connect-btn {
+    margin-top: 16px;
+    padding: 12px 28px;
+    border: none;
+    border-radius: 999px;
+    background: linear-gradient(135deg, #b534fa 0%, #d358ff 100%);
+    color: #ffffff;
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    cursor: pointer;
+    box-shadow: 0 0 18px rgba(181, 52, 250, 0.4);
+    transition: transform 0.12s, box-shadow 0.15s, opacity 0.15s;
+}
+.ai-connect-btn:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 0 26px rgba(181, 52, 250, 0.65);
+}
+.ai-connect-btn:active:not(:disabled) {
+    transform: translateY(0);
+}
+.ai-connect-btn:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+    box-shadow: none;
+}
+
+/* Section divider between the connect stack and the profile editor. */
+.ai-section-divider {
     height: 1px;
     background: rgba(255, 255, 255, 0.08);
-    margin: 20px 0 16px;
+    margin: 22px 0 16px;
 }
-.api-profiles-header {
+
+/* PROFILE header — label on the left, edit + trash tools on the far right. */
+.ai-profile-header {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    width: 100%;
+    margin-bottom: 6px;
 }
-.api-new-btn { font-size: 12px; padding: 6px 12px; }
-.api-profile-list {
+.ai-profile-tools {
     display: flex;
-    flex-direction: column;
-    gap: 8px;
-    margin-top: 10px;
-    max-height: 220px;
-    overflow-y: auto;
+    gap: 6px;
 }
-.api-profile-list::-webkit-scrollbar { width: 8px; }
-.api-profile-list::-webkit-scrollbar-thumb {
-    background: rgba(181, 52, 250, 0.3);
+.ai-tool-btn {
+    background: none;
+    border: none;
+    font-family: inherit;
+    font-size: 19px;
+    cursor: pointer;
+    padding: 3px 7px;
     border-radius: 4px;
+    line-height: 1;
+    transition: background 0.15s, transform 0.12s;
 }
+.ai-tool-btn:disabled {
+    opacity: 0.25;
+    cursor: not-allowed;
+}
+.ai-tool-btn.edit { color: #d358ff; }
+.ai-tool-btn.edit:hover:not(:disabled) {
+    background: rgba(181, 52, 250, 0.2);
+    transform: scale(1.18);
+}
+.ai-tool-btn.del { color: #ff6b6b; }
+.ai-tool-btn.del:hover:not(:disabled) {
+    background: rgba(255, 77, 77, 0.2);
+    transform: scale(1.18);
+}
+
+/* The centered glowing + button — replaces Save. Big, bold, borderless,
+   magenta glow. Errors (via the status line) if fields are incomplete. */
+.ai-add-btn {
+    display: block;
+    margin: 18px auto 4px;
+    width: 56px;
+    height: 56px;
+    border: none;
+    border-radius: 50%;
+    background: transparent;
+    color: #ffffff;
+    font-family: inherit;
+    font-size: 38px;
+    font-weight: 800;
+    line-height: 1;
+    cursor: pointer;
+    text-shadow: 0 0 14px rgba(181, 52, 250, 0.9), 0 0 22px rgba(181, 52, 250, 0.5);
+    transition: transform 0.15s, text-shadow 0.2s;
+}
+.ai-add-btn:hover {
+    transform: scale(1.12);
+    text-shadow: 0 0 18px rgba(181, 52, 250, 1), 0 0 30px rgba(181, 52, 250, 0.75), 0 0 44px rgba(181, 52, 250, 0.4);
+}
+.ai-add-btn:active {
+    transform: scale(0.96);
+}
+
+/* Orphaned .api-profile-list rules removed (the dropdown UI replaced the
+   row list — see #aiProfileSelect). */
 .api-profile-row {
     display: flex;
     align-items: center;
@@ -777,6 +1090,12 @@ html, body {
     border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: 10px;
     gap: 8px;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+}
+.api-profile-row:hover {
+    border-color: rgba(255, 255, 255, 0.2);
+    background: rgba(255, 255, 255, 0.07);
 }
 .api-profile-row.active {
     border-color: rgba(181, 52, 250, 0.5);
@@ -821,8 +1140,37 @@ html, body {
 }
 .api-editor {
     margin-top: 16px;
-    padding-top: 16px;
-    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    padding: 16px;
+    border: 1.5px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.02);
+    transition: border-color 0.2s;
+}
+/* Edit mode — subtle flashing red border so the user can tell their edits
+   target an existing profile (Save overwrites, Cancel reverts). */
+.api-editor.editing {
+    animation: editorEditPulse 1.6s ease-in-out infinite;
+}
+@keyframes editorEditPulse {
+    0%, 100% { border-color: rgba(255, 59, 59, 0.35); }
+    50%      { border-color: rgba(255, 59, 59, 0.85); }
+}
+.ai-model-select {
+    cursor: not-allowed;
+    opacity: 0.65;
+}
+.ai-model-select:disabled { opacity: 0.5; }
+.ai-model-select:not(:disabled) {
+    cursor: pointer;
+    opacity: 1;
+}
+
+/* Action row — Save bottom-left, Cancel bottom-right. */
+.ai-actions {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: 16px;
 }
 
 /* ── Codex — authored lore library (two-pane) ───────────────────── */

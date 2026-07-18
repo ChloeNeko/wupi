@@ -41,6 +41,29 @@ pub struct SimCard {
     /// One greeting string per line in `<introductions>`. Empty if the card
     /// omits the block. Used by [`random_intro`] for the boot flourish.
     pub introductions: Vec<String>,
+    // ── Roleplay-only fields (added 2026-07-18, Games app Seam 1) ──────────
+    // All `None` / empty for the system card (Wupi). A roleplay scenario card
+    // carries a `<scenario>` block that populates these. The parser already
+    // handles optional elements via `nested_text` returning `None` for absent
+    // parents, so adding fields here is non-breaking — `Wupi.sim` parses as
+    // before with every field below at its default.
+    /// The world/setting premise. Injected into the narrator's system prompt
+    /// as the ground-truth scenario context. `None` for system cards.
+    pub setting: Option<String>,
+    /// Narrative tone directive ("grim, atmospheric, slow-burn"). Guides the
+    /// narrator's voice. `None` for system cards.
+    pub tone: Option<String>,
+    /// Seed text for the first narrator turn (the opening scene). The
+    /// GameEngine uses this to prime the first generation if the conversation
+    /// is empty. `None` for system cards.
+    pub opening_scene: Option<String>,
+    /// Stable NPC ids present at scene start. Used by the Phase 2 NPC runtime
+    /// to spawn the initial cast. Empty for system cards.
+    pub start_npc_ids: Vec<String>,
+    /// Activities this card activates (e.g. `["combat","crafting"]`). Phase
+    /// 2+ hint — the engine registry will match these against available
+    /// activity modules. Empty for system cards.
+    pub declared_activities: Vec<String>,
 }
 
 impl SimCard {
@@ -152,6 +175,12 @@ pub fn fallback() -> SimCard {
         conversational_rules: String::new(),
         technical_rules: String::new(),
         introductions: Vec::new(),
+        // Roleplay-only fields — all empty for the system-card fallback.
+        setting: None,
+        tone: None,
+        opening_scene: None,
+        start_npc_ids: Vec::new(),
+        declared_activities: Vec::new(),
     }
 }
 
@@ -268,6 +297,31 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         })
         .unwrap_or_default();
 
+    // ── Roleplay-only `<scenario>` block (Games app Seam 1, 2026-07-18) ────
+    // All fields optional; absent on system cards (Wupi). `setting`/`tone`/
+    // `opening_scene` are nested text children; `start_npcs`/`activities` are
+    // CDATA bullet lists parsed the same way as `introductions`. A missing
+    // `<scenario>` block leaves every field at its default (None / empty) —
+    // `Wupi.sim` parses unchanged.
+    let scenario = first_child(root, "scenario");
+    let setting = scenario
+        .and_then(|n| child_text(n, "setting"))
+        .filter(|s| !s.is_empty());
+    let tone = scenario
+        .and_then(|n| child_text(n, "tone"))
+        .filter(|s| !s.is_empty());
+    let opening_scene = scenario
+        .and_then(|n| child_text(n, "opening_scene"))
+        .filter(|s| !s.is_empty());
+    let start_npc_ids = scenario
+        .and_then(|n| first_child(n, "start_npcs"))
+        .map(|n| parse_bullet_list(&text_content(n)))
+        .unwrap_or_default();
+    let declared_activities = scenario
+        .and_then(|n| first_child(n, "activities"))
+        .map(|n| parse_bullet_list(&text_content(n)))
+        .unwrap_or_default();
+
     Ok(SimCard {
         id,
         name,
@@ -280,7 +334,25 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         conversational_rules,
         technical_rules,
         introductions,
+        setting,
+        tone,
+        opening_scene,
+        start_npc_ids,
+        declared_activities,
     })
+}
+
+/// Parse a CDATA bullet list (`- item one\n- item two`) into owned Strings.
+/// Shared by `<introductions>`, `<scenario><start_npcs>`, and
+/// `<scenario><activities>`. Strips the leading `- ` and trims each line;
+/// empty lines drop. Factored out so the three callers don't duplicate the
+/// same line-walk.
+fn parse_bullet_list(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| l.strip_prefix("- ").unwrap_or(l).trim().to_owned())
+        .collect::<Vec<_>>()
 }
 
 // ── XML traversal helpers ──────────────────────────────────────────────────
@@ -416,6 +488,11 @@ mod tests {
             conversational_rules: String::new(),
             technical_rules: String::new(),
             introductions: Vec::new(),
+            setting: None,
+            tone: None,
+            opening_scene: None,
+            start_npc_ids: Vec::new(),
+            declared_activities: Vec::new(),
         };
         assert!(card.random_intro().is_none());
     }
@@ -456,5 +533,68 @@ mod tests {
         assert_eq!(card.name, "Wupi");
         assert_eq!(card.id, "wupi");
         assert_eq!(card.card_type, "system");
+    }
+
+    /// A roleplay scenario card (Games app Seam 1). Same strict-XML + CDATA
+    /// format as `Wupi.sim`, but with a `<scenario>` block holding setting,
+    /// tone, opening_scene, start_npcs, and activities. The system card
+    /// (Wupi) omits this block entirely — those fields stay at their default
+    /// (None / empty). The dungeon card below is also the §2L-test seed
+    /// (the dungeon half of the cross-topic memory rejection test).
+    #[test]
+    fn parse_roleplay_scenario_block() {
+        let roleplay = r#"<?xml version="1.0"?>
+<sim_card>
+  <metadata>
+    <id>dungeon_tavern</id>
+    <name>The Rusty Tankard</name>
+    <type>roleplay</type>
+  </metadata>
+  <identity>
+    <name>The Rusty Tankard</name>
+    <core_persona>A one-shot dungeon scenario.</core_persona>
+  </identity>
+  <scenario>
+    <setting><![CDATA[
+A remote frontier tavern at the edge of the Goblinwood. Travellers
+shelter here before braving the ruined keep to the north.
+    ]]></setting>
+    <tone>grim, atmospheric, slow-burn</tone>
+    <opening_scene><![CDATA[
+Rain lashes the shutters of the Rusty Tankard. The barkeeper polishes
+a mug and watches the door. A goblin was seen in the back room an hour
+ago. A locked iron chest sits under a table by the hearth.
+    ]]></opening_scene>
+    <start_npcs><![CDATA[
+- barkeeper
+- goblin
+    ]]></start_npcs>
+    <activities><![CDATA[
+- combat
+    ]]></activities>
+  </scenario>
+</sim_card>"#;
+        let card = parse(roleplay).expect("roleplay card parses");
+        assert_eq!(card.id, "dungeon_tavern");
+        assert_eq!(card.card_type, "roleplay");
+        assert!(card.setting.as_deref().unwrap().contains("frontier tavern"));
+        assert_eq!(card.tone.as_deref(), Some("grim, atmospheric, slow-burn"));
+        assert!(card.opening_scene.as_deref().unwrap().contains("Rain lashes"));
+        assert_eq!(card.start_npc_ids, vec!["barkeeper".to_string(), "goblin".to_string()]);
+        assert_eq!(card.declared_activities, vec!["combat".to_string()]);
+    }
+
+    /// The system card (Wupi.sim) has NO `<scenario>` block. Every roleplay
+    /// field stays at its default. This guards against the additive fields
+    /// accidentally picking up stray values from a system card.
+    #[test]
+    fn system_card_has_no_scenario_fields() {
+        let card = parse(SAMPLE).expect("system card parses");
+        assert_eq!(card.card_type, "system");
+        assert!(card.setting.is_none());
+        assert!(card.tone.is_none());
+        assert!(card.opening_scene.is_none());
+        assert!(card.start_npc_ids.is_empty());
+        assert!(card.declared_activities.is_empty());
     }
 }

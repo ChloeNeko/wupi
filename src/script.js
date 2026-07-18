@@ -247,6 +247,89 @@ window.addEventListener('focus', () => {
 
 animate();
 
+// ════════════════════════════════════════════════════════════════════════
+// "WUPI OS" title — live AI-status indicator
+// ════════════════════════════════════════════════════════════════════════
+// The title reflects the live state of the MAIN chat model (local 12B OR the
+// connected API model — NOT Agent.gguf, which runs on its own thread and
+// never drives chat_send). Three states:
+//   - 'idle'    : connected, not generating → steady medium white glow
+//   - 'offline' : no AI connected (boot pre-load, ONLINE w/ no profile,
+//                 connect error, or a mode swap in progress) → fast red flash
+//   - 'typing'  : main model actively generating tokens → subtle random
+//                 white pulse spurts driven by a jittered setTimeout loop
+//                 (CSS can't do random timing).
+//
+// State inputs:
+//   1. The `model-status` Tauri event — Rust already emits ready/error/
+//      no_model at boot + on api_disconnect reload; this is the offline/idle
+//      authority. We just never listened before.
+//   2. The chat IIFE's setGenerating() flag — bridges to 'typing'/'idle'.
+//   3. The AI panel's mode swaps — calls 'offline' while a swap is pending.
+const osTitleEl = document.querySelector('.os-title');
+let titleState = 'idle';      // 'idle' | 'offline' | 'typing'
+let titleFlickerTimer = null;  // the setTimeout handle for the typing pulse
+
+function applyTitleClass() {
+  if (!osTitleEl) return;
+  osTitleEl.classList.remove('is-offline', 'is-typing');
+  if (titleState === 'offline') osTitleEl.classList.add('is-offline');
+  else if (titleState === 'typing') osTitleEl.classList.add('is-typing');
+}
+
+// The random "typing" pulse: toggles .title-flicker on a jittered timer so
+// the glow bursts feel organic (like someone actually typing). ON 80–200ms,
+// OFF 120–500ms, re-rolled each cycle. Stops when state leaves 'typing'.
+function scheduleNextFlicker() {
+  if (titleState !== 'typing' || !osTitleEl) return;
+  const isOn = osTitleEl.classList.contains('title-flicker');
+  const delay = isOn
+    ? 80 + Math.random() * 120   // ON duration: 80–200ms
+    : 120 + Math.random() * 380; // OFF duration: 120–500ms
+  titleFlickerTimer = setTimeout(() => {
+    if (titleState !== 'typing') return;
+    osTitleEl.classList.toggle('title-flicker');
+    scheduleNextFlicker();
+  }, delay);
+}
+
+function stopFlicker() {
+  if (titleFlickerTimer) { clearTimeout(titleFlickerTimer); titleFlickerTimer = null; }
+  if (osTitleEl) osTitleEl.classList.remove('title-flicker');
+}
+
+function setTitleState(state) {
+  if (!osTitleEl || state === titleState) return;
+  const wasTyping = titleState === 'typing';
+  titleState = state;
+  applyTitleClass();
+  if (state === 'typing') {
+    scheduleNextFlicker();
+  } else if (wasTyping) {
+    stopFlicker();
+  }
+}
+
+// Subscribe to Rust's model-status events (already emitted, previously
+// unobserved). Boot starts at 'idle' (steady white) per Chloe's call — the
+// pulse only fires for actual typing, and the red alarm only for confirmed
+// offline/error states. The first model-status event then corrects to the
+// real state.
+(async () => {
+  try {
+    await listen('model-status', (e) => {
+      const status = e?.payload?.status;
+      // typing state is owned by the chat flag; don't clobber it here. Only
+      // model-status transitions affect idle/offline.
+      if (titleState === 'typing') return;
+      if (status === 'ready') setTitleState('idle');
+      else if (status === 'error' || status === 'no_model') setTitleState('offline');
+    });
+  } catch (err) {
+    console.warn('[Wupi] model-status listen failed', err);
+  }
+})();
+
 // NOTE: this file is loaded as type="module", which defers execution until
 // after the DOM is parsed — so DOMContentLoaded has ALREADY fired by the time
 // we run. Do NOT wrap the wiring in a DOMContentLoaded listener (it would
@@ -974,33 +1057,46 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   })();
 
   // ════════════════════════════════════════════════════════════════════════
-  // API — endpoint profiles + main chat source selector
+  // AI — Connection Profile panel (LOCAL | ONLINE mode selector + profile CRUD)
   // ════════════════════════════════════════════════════════════════════════
   // Source of truth = api_config.json (loaded at boot into AppState). The
-  // panel lists saved profiles, lets you New/Edit/Delete/Test them, and pick
-  // which is the active chat source. Selecting API triggers the model swap
-  // (12B unloads, Agent.gguf spins up for schema/memory). Selecting Local
-  // reverts it.
+  // panel shows two large mode boxes: LOCAL (the single WUPI 12B bubble) or
+  // ONLINE (saved endpoint profiles + an editor). Selecting ONLINE triggers
+  // the model swap (12B unloads, Agent.gguf spins up for schema/memory);
+  // selecting LOCAL reverts it. Temperature is fixed at 1.0 (no UI field).
+  // The model field is a dropdown populated from the endpoint's /models
+  // list after a successful connect — never free text.
   (function apiPanel() {
     const root = document.getElementById('api');
     if (!root) return;
-    const listEl = document.getElementById('apiProfileList');
+    const panel = document.getElementById('aiPanel');
     const editorEl = document.getElementById('apiEditor');
     const nameEl = document.getElementById('apiName');
     const endpointEl = document.getElementById('apiEndpoint');
-    const modelEl = document.getElementById('apiModel');
     const keyEl = document.getElementById('apiKey');
-    const tempEl = document.getElementById('apiTemp');
-    const newBtn = document.getElementById('apiNewBtn');
-    const saveBtn = document.getElementById('apiSaveBtn');
-    const cancelBtn = document.getElementById('apiCancelBtn');
-    const testBtn = document.getElementById('apiTestBtn');
+    const addBtn = document.getElementById('aiAddBtn');
+    const editProfileBtn = document.getElementById('aiEditProfileBtn');
+    const deleteProfileBtn = document.getElementById('aiDeleteProfileBtn');
+    const localConnectBtn = document.getElementById('aiLocalConnectBtn');
     const statusEl = document.getElementById('apiStatus');
-    const sourceRadios = document.querySelectorAll('input[name="apiSource"]');
-    const sourceHintEl = document.getElementById('apiSourceHint');
+    const modeLocalBtn = document.getElementById('aiModeLocal');
+    const modeOnlineBtn = document.getElementById('aiModeOnline');
+    const localSection = document.getElementById('aiLocalSection');
+    const onlineSection = document.getElementById('aiOnlineSection');
+    const profileSelect = document.getElementById('aiProfileSelect');
+    const modelSelect = document.getElementById('apiModel');
+    const onlineBubble = document.getElementById('aiOnlineBubble');
+    const connectBtn = document.getElementById('aiConnectBtn');
 
-    let editingId = null; // null = creating new; string = editing existing
+    let editingId = null; // null = creating; string = editing existing
     let lastConfig = null; // cached for rendering
+    let currentMode = 'local'; // UI view: 'local' | 'online'
+    let runtimeSource = 'local'; // actual backend source
+    let activeProfileId = null; // currently-connected profile (mirror of backend)
+    // Model cache: profileId → { ids: [..], selected: str }. Avoids refetching
+    // /models when toggling between already-loaded profiles.
+    const modelCache = new Map();
+    let modeInitialized = false;
 
     function setStatus(msg, kind) {
       statusEl.textContent = msg || '';
@@ -1013,183 +1109,424 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       }[c]));
     }
 
-    // Render the profile list from the cached config. Active profile gets a
-    // highlighted row + an "Active" badge; others get an "Activate" button.
-    function renderList(config) {
-      lastConfig = config;
-      if (!config.profiles || config.profiles.length === 0) {
-        listEl.innerHTML = '<div class="api-empty">No profiles yet. Click "+ New" to add your first endpoint.</div>';
-        return;
-      }
-      const activeId = config.active_profile_id;
-      const rows = config.profiles.map((p) => {
-        const isActive = p.id === activeId;
-        const meta = escapeHtml(`${p.model || '?'} · ${p.endpoint || ''}`);
-        return `<div class="api-profile-row${isActive ? ' active' : ''}" data-id="${escapeHtml(p.id)}">
-          <div class="api-profile-info">
-            <div class="api-profile-name">${escapeHtml(p.name || p.id)}</div>
-            <div class="api-profile-meta">${meta}</div>
-          </div>
-          <div class="api-profile-buttons">
-            ${isActive ? '<span class="api-mini-btn activate" disabled>Active</span>' : `<button class="api-mini-btn activate" data-act="activate">Activate</button>`}
-            <button class="api-mini-btn" data-act="edit">Edit</button>
-            <button class="api-mini-btn del" data-act="delete">Delete</button>
-          </div>
-        </div>`;
-      }).join('');
-      listEl.innerHTML = rows;
+    function findProfile(id) {
+      return lastConfig?.profiles.find((p) => p.id === id) || null;
     }
 
-    // Render the source selector state. API radio is disabled unless a profile
-    // is active. The hint explains the current state + what happens on switch.
-    function renderSource(config, extra) {
-      const source = extra?.source || config.model_source || 'local';
-      const apiReady = !!config.active_profile_id || !!extra?.apiReady;
-      sourceRadios.forEach((r) => {
-        if (r.value === 'api') {
-          r.disabled = !apiReady;
-          r.checked = source === 'api';
-        } else {
-          r.checked = source === 'local';
-        }
-      });
-      const activeName = (config.profiles.find((p) => p.id === config.active_profile_id) || {}).name;
-      if (source === 'api') {
-        sourceHintEl.textContent = `Chat via API${activeName ? ' (' + activeName + ')' : ''}. Schema + memory tracking runs on Agent.gguf locally.`;
-      } else if (apiReady) {
-        sourceHintEl.textContent = 'Chat runs on WUPI 12B locally. Switch to API to offload chat + free VRAM.';
-      } else {
-        sourceHintEl.textContent = 'Local model (WUPI 12B). Add + activate an API profile to enable the API option.';
+    // Render the profile dropdown from the cached config. Sorted alphabetically
+    // by name. Active profile is flagged with a ● prefix. The "Create a New
+    // Profile" placeholder option is ONLY shown when there are zero saved
+    // profiles — once any exist it disappears (the + button is the create
+    // affordance then). Selecting the placeholder focuses the editor.
+    function renderProfileSelect(config) {
+      lastConfig = config;
+      const profiles = [...(config.profiles || [])].sort((a, b) =>
+        (a.name || a.id).localeCompare(b.name || b.id)
+      );
+      // Capture the selection BEFORE we rebuild the DOM. After innerHTML
+      // rebuilds the options, the .value reverts to "" — so we must remember
+      // it now and re-apply it after.
+      const prevValue = profileSelect.value;
+
+      if (profiles.length === 0) {
+        // No saved profiles yet — the dropdown IS the "create" affordance.
+        profileSelect.innerHTML = '<option value="">Create a New Profile</option>';
+        profileSelect.disabled = false;
+        editProfileBtn.disabled = true;
+        deleteProfileBtn.disabled = true;
+        return;
       }
+      profileSelect.disabled = false;
+      // Once profiles exist, drop the "Create a New Profile" placeholder —
+      // the + button below handles creation.
+      profileSelect.innerHTML = profiles.map((p) => {
+        const isActive = p.id === config.active_profile_id;
+        return `<option value="${escapeHtml(p.id)}">${isActive ? '● ' : ''}${escapeHtml(p.name || p.id)}</option>`;
+      }).join('');
+      // Re-apply the previous selection if that profile still exists.
+      // Otherwise default to the active profile (or the first one).
+      const stillExists = (id) => id && [...profileSelect.options].some((o) => o.value === id);
+      const target = stillExists(prevValue) ? prevValue
+                   : stillExists(config.active_profile_id) ? config.active_profile_id
+                   : profiles[0].id;
+      profileSelect.value = target;
+      // Edit/trash are enabled whenever a real profile is selected.
+      // Per Chloe: even a single profile must be editable/deletable.
+      const hasRealSelection = !!profileSelect.value;
+      editProfileBtn.disabled = !hasRealSelection;
+      deleteProfileBtn.disabled = !hasRealSelection;
+    }
+
+    // Update the online bubble. Three states:
+    //   - connected (runtime on API): magenta glow + "Name — model"
+    //   - selection pending (profile+model picked, not yet Connect'd): subdued
+    //     preview of what Connect will activate, no glow
+    //   - nothing picked: muted "No profile connected"
+    function renderOnlineBubble() {
+      // Connected — runtime actually on API with an active profile.
+      if (runtimeSource === 'api' && activeProfileId) {
+        const p = findProfile(activeProfileId);
+        if (p) {
+          onlineBubble.classList.add('active');
+          onlineBubble.classList.remove('pending');
+          onlineBubble.innerHTML =
+            `<span class="ai-online-bubble-text">${escapeHtml(p.name || p.id)}</span>` +
+            `<span class="ai-online-bubble-sep">—</span>` +
+            `<span class="ai-online-bubble-model">${escapeHtml(p.model || '?')}</span>`;
+          return;
+        }
+      }
+      // Selection pending — profile + model both picked in the dropdowns but
+      // not yet connected. Show a preview so the user sees what they're about
+      // to activate. Uses the "pending" style (no glow, lighter text).
+      const pickedProfileId = profileSelect?.value;
+      const pickedModel = modelSelect?.value;
+      if (pickedProfileId && pickedModel) {
+        const p = findProfile(pickedProfileId);
+        if (p) {
+          onlineBubble.classList.remove('active');
+          onlineBubble.classList.add('pending');
+          onlineBubble.innerHTML =
+            `<span class="ai-online-bubble-text">${escapeHtml(p.name || p.id)}</span>` +
+            `<span class="ai-online-bubble-sep">—</span>` +
+            `<span class="ai-online-bubble-model">${escapeHtml(pickedModel)}</span>`;
+          return;
+        }
+      }
+      // Nothing useful to show.
+      onlineBubble.classList.remove('active', 'pending');
+      onlineBubble.innerHTML = '<span class="ai-online-bubble-text">No profile connected</span>';
+    }
+
+    // Fetch /models for a profile + populate the model dropdown. Cached per
+    // profile so switching back doesn't refetch. Default-selects the saved
+    // model if present in the list, else the first alphabetically. The list
+    // is sorted alphabetically (case-insensitive) — NanoGPT's /models returns
+    // 100+ models in provider-defined order (a chaotic mix of org/name), so
+    // alphabetical is the only sane default. There's no membership/free-vs-
+    // paid field in the OpenAI-standard /models response, so we can't group
+    // by tier without custom metadata — just alphabetize for now.
+    async function populateModelDropdown(profile) {
+      if (!profile) {
+        modelSelect.innerHTML = '<option value="">Pick a profile to load models…</option>';
+        modelSelect.disabled = true;
+        return;
+      }
+      // Cache hit. But HONOR the user's current in-UI selection — if the
+      // dropdown already has a value and it's still in the cached list,
+      // keep it selected. Otherwise a refresh() after Connect would fling
+      // the selection back to the cache's stale `selected` field.
+      const cached = modelCache.get(profile.id);
+      if (cached) {
+        const currentPick = modelSelect.value;
+        const honored = (currentPick && cached.ids.includes(currentPick))
+          ? currentPick
+          : cached.selected;
+        renderModelOptions(cached.ids, honored);
+        return;
+      }
+      modelSelect.disabled = true;
+      modelSelect.innerHTML = '<option value="">Loading models…</option>';
+      try {
+        const v = await invoke('api_profile_test', { profile });
+        const rawIds = (v && Array.isArray(v.data))
+          ? v.data.map((m) => (typeof m === 'string' ? m : m?.id)).filter(Boolean)
+          : [];
+        if (rawIds.length === 0) {
+          modelSelect.innerHTML = '<option value="">No models returned</option>';
+          return;
+        }
+        // Sort alphabetically, case-insensitive, deterministic for equal keys.
+        const ids = [...rawIds].sort((a, b) =>
+          a.toLowerCase().localeCompare(b.toLowerCase()) || a.localeCompare(b)
+        );
+        // Default to the profile's saved model if it's in the list; else the
+        // first alphabetically. The user's in-UI pick (if any) takes priority
+        // on cache hit (handled above).
+        const preferred = (profile.model && ids.includes(profile.model)) ? profile.model : ids[0];
+        modelCache.set(profile.id, { ids, selected: preferred });
+        renderModelOptions(ids, preferred);
+      } catch (err) {
+        modelSelect.innerHTML = '<option value="">Failed to load models</option>';
+        setStatus('Model list fetch failed: ' + err, 'err');
+      }
+    }
+
+    function renderModelOptions(ids, selected) {
+      modelSelect.innerHTML = ids.map((id) =>
+        `<option value="${escapeHtml(id)}"${id === selected ? ' selected' : ''}>${escapeHtml(id)}</option>`
+      ).join('');
+      modelSelect.disabled = false;
+    }
+
+    // Update the Connect button's enabled state. Requires a profile + model.
+    function updateConnectEnabled() {
+      const ready = !!profileSelect.value && !!modelSelect.value;
+      connectBtn.disabled = !ready;
+    }
+
+    // Apply the current UI mode to the DOM. Pure view; no backend call.
+    function applyMode() {
+      panel.dataset.mode = currentMode;
+      modeLocalBtn.classList.toggle('active', currentMode === 'local');
+      modeOnlineBtn.classList.toggle('active', currentMode === 'online');
+      localSection.classList.toggle('hidden', currentMode !== 'local');
+      onlineSection.classList.toggle('visible', currentMode === 'online');
     }
 
     async function refresh() {
-      setStatus('Loading…');
       try {
         const config = await invoke('api_profiles_list');
         const extra = await invoke('model_source_get');
-        renderList(config);
-        renderSource(config, extra);
+        lastConfig = config;
+        runtimeSource = (extra?.source || config.model_source) === 'api' ? 'api' : 'local';
+        activeProfileId = config.active_profile_id || null;
+        renderProfileSelect(config);
+        renderOnlineBubble();
+        // Seed the mode from the backend ONCE on first refresh. After that
+        // the mode is the user's click — refresh() must never clobber it.
+        if (!modeInitialized) {
+          currentMode = runtimeSource === 'api' ? 'online' : 'local';
+          modeInitialized = true;
+          applyMode();
+        }
+        // ALWAYS populate the model dropdown for the currently-selected
+        // profile (if any). Programmatic .value = ... doesn't fire the
+        // change event, so this is the only reliable way to keep the model
+        // list in sync after a refresh.
+        if (currentMode === 'online' && profileSelect.value) {
+          await populateModelDropdown(findProfile(profileSelect.value));
+        }
+        updateConnectEnabled();
         setStatus('');
       } catch (err) {
         setStatus('Load failed: ' + err, 'err');
       }
     }
 
-    // ── Profile list interactions (event delegation) ──
-    listEl.addEventListener('click', (e) => {
-      const btn = e.target.closest('[data-act]');
-      if (!btn) return;
-      const row = btn.closest('[data-id]');
-      const id = row?.dataset.id;
-      const act = btn.dataset.act;
-      if (!id) return;
-      if (act === 'edit') {
-        const p = lastConfig?.profiles.find((x) => x.id === id);
-        if (p) showEditor(p);
-      } else if (act === 'delete') {
-        const p = lastConfig?.profiles.find((x) => x.id === id);
-        if (!p) return;
-        if (!confirm(`Delete profile "${p.name || p.id}"?`)) return;
-        setStatus('Deleting…');
-        invoke('api_profile_delete', { profileId: id })
-          .then(() => { setStatus('Deleted.', 'ok'); return refresh(); })
-          .catch((err) => setStatus('Delete failed: ' + err, 'err'));
-      } else if (act === 'activate') {
-        setStatus('Activating…');
-        // Activate = set active profile AND switch source to Api (the model swap).
-        invoke('api_connect', { profileId: id })
-          .then(() => { setStatus('Connected — chat via API now.', 'ok'); return refresh(); })
-          .catch((err) => setStatus('Connect failed: ' + err, 'err'));
+    // ── TAB CLICKS = RUNTIME SWITCHES (per Chloe's design) ──
+    // Clicking LOCAL: disconnect API (if on API), reload the 12B. Clicking
+    // ONLINE: reconnect the last-used API profile + model. No separate
+    // disconnect affordance — you pick one or the other.
+    modeLocalBtn?.addEventListener('click', async () => {
+      if (currentMode === 'local' && runtimeSource === 'local') return;
+      currentMode = 'local';
+      applyMode();
+      if (runtimeSource === 'api') {
+        setTitleState('offline'); // red while the 12B reloads
+        setStatus('Disconnecting API — reloading WUPI 12B…', '');
+        try {
+          await invoke('api_disconnect');
+          setStatus('Back on local WUPI 12B.', 'ok');
+        } catch (err) {
+          setStatus('Disconnect failed: ' + err + '.', 'err');
+        }
+        await refresh();
       }
     });
 
-    // ── Source radio change ──
-    sourceRadios.forEach((r) => {
-      r.addEventListener('change', () => {
-        if (r.value === 'local') {
-          setStatus('Disconnecting — reloading WUPI 12B…', '');
-          invoke('api_disconnect')
-            .then(() => { setStatus('Back to local.', 'ok'); return refresh(); })
-            .catch((err) => setStatus('Disconnect failed: ' + err, 'err'));
-        } else if (r.value === 'api') {
-          // API radio needs an active profile. If none, the button is disabled;
-          // but defensively check.
-          if (!lastConfig?.active_profile_id) {
-            setStatus('Activate a profile first.', 'err');
-            r.checked = false;
-            return;
-          }
+    modeOnlineBtn?.addEventListener('click', async () => {
+      currentMode = 'online';
+      applyMode();
+      // If a profile is already connected, nothing to do — just show it.
+      if (runtimeSource === 'api' && activeProfileId) return;
+      // Reconnect the last-used profile if one exists.
+      if (activeProfileId) {
+        setTitleState('offline');
+        setStatus('Connecting last-used profile…', '');
+        try {
+          await invoke('api_connect', { profileId: activeProfileId });
+          setStatus('Connected.', 'ok');
+        } catch (err) {
+          setStatus('Connect failed: ' + err + ' — still on local.', 'err');
+          setTitleState('idle');
         }
-      });
+        await refresh();
+      } else {
+        // No active profile — ONLINE view is up, user picks one + hits Connect.
+        setStatus('');
+      }
     });
 
-    // ── Editor (New / Edit) ──
-    function showEditor(profile) {
+    // ── Profile dropdown: on change, load its models into the second dropdown ──
+    // When the dropdown has no real selection (zero-profile state — the
+    // "Create a New Profile" placeholder is selected), focus the editor so
+    // the user can start typing their first profile.
+    profileSelect?.addEventListener('change', async () => {
+      const selectedId = profileSelect.value;
+      if (!selectedId) {
+        // "Create a New Profile" (or no selection) — prep the editor.
+        clearEditor();
+        nameEl?.focus();
+        // Edit/trash aren't meaningful without a real profile.
+        editProfileBtn.disabled = true;
+        deleteProfileBtn.disabled = true;
+        updateConnectEnabled();
+        renderOnlineBubble();
+        return;
+      }
+      const p = findProfile(selectedId);
+      await populateModelDropdown(p);
+      updateConnectEnabled();
+      renderOnlineBubble();
+      // Real profile selected — enable edit/trash.
+      editProfileBtn.disabled = false;
+      deleteProfileBtn.disabled = false;
+    });
+
+    // ── Model dropdown: changing the selection updates Connect + the preview ──
+    // Also writes the new pick back into the cache so a subsequent refresh()
+    // (which hits the cache) honors it instead of flinging back to the old
+    // default — the cause of the "dropdown flings to first after Connect" bug.
+    modelSelect?.addEventListener('change', () => {
+      const pickedProfileId = profileSelect.value;
+      const pickedModel = modelSelect.value;
+      if (pickedProfileId && pickedModel) {
+        const cached = modelCache.get(pickedProfileId);
+        if (cached && cached.selected !== pickedModel) {
+          modelCache.set(pickedProfileId, { ...cached, selected: pickedModel });
+        }
+      }
+      updateConnectEnabled();
+      renderOnlineBubble();
+    });
+
+    // ── Connect button: the single runtime swap action for ONLINE ──
+    connectBtn?.addEventListener('click', async () => {
+      const profileId = profileSelect.value;
+      const modelId = modelSelect.value;
+      if (!profileId || !modelId) return;
+      // Persist the chosen model into the profile before connecting — the
+      // backend's api_connect validates non-empty model.
+      const p = findProfile(profileId);
+      if (p && p.model !== modelId) {
+        const updated = { ...p, model: modelId, temperature: 1.0 };
+        try {
+          await invoke('api_profile_save', { profile: updated });
+        } catch (err) {
+          setStatus('Could not save model choice: ' + err, 'err');
+          return;
+        }
+      }
+      setTitleState('offline'); // red while swapping
+      setStatus('Connecting…', '');
+      connectBtn.disabled = true;
+      try {
+        await invoke('api_connect', { profileId });
+        setStatus('Connected — chat via API now.', 'ok');
+      } catch (err) {
+        setStatus('Connect failed: ' + err + ' — still on local.', 'err');
+        setTitleState('idle');
+      }
+      await refresh();
+    });
+
+    // ── Profile editor (add new / edit existing) ──
+    function clearEditor() {
+      editingId = null;
+      nameEl.value = '';
+      endpointEl.value = '';
+      keyEl.value = '';
+      editorEl.classList.remove('editing');
+      setStatus('');
+    }
+
+    function loadEditor(profile) {
       editingId = profile?.id || null;
       nameEl.value = profile?.name || '';
       endpointEl.value = profile?.endpoint || '';
-      modelEl.value = profile?.model || '';
       keyEl.value = profile?.api_key || '';
-      tempEl.value = profile?.temperature != null ? profile.temperature : '';
-      editorEl.hidden = false;
-      setStatus('');
+      editorEl.classList.add('editing');
+      setStatus('Editing "' + (profile?.name || '') + '". + overwrites.');
       nameEl.focus();
     }
-    function hideEditor() {
-      editorEl.hidden = true;
-      editingId = null;
-      setStatus('');
-    }
 
-    newBtn?.addEventListener('click', () => showEditor(null));
-    cancelBtn?.addEventListener('click', hideEditor);
-
-    saveBtn?.addEventListener('click', () => {
+    // ── The + button: commit the editor (add new OR overwrite if editing) ──
+    // Errors via the status line if any field is empty. Does NOT auto-connect
+    // — just lands the profile in the dropdown and auto-selects it.
+    addBtn?.addEventListener('click', async () => {
       const name = nameEl.value.trim();
-      if (!name) { nameEl.focus(); return; }
-      if (!endpointEl.value.trim()) { endpointEl.focus(); return; }
-      if (!modelEl.value.trim()) { modelEl.focus(); return; }
-      const tempRaw = tempEl.value.trim();
-      const temperature = tempRaw === '' ? null : Math.max(0, Math.min(2, parseFloat(tempRaw)));
+      if (!name) { setStatus('Name is required.', 'err'); nameEl.focus(); return; }
+      if (!endpointEl.value.trim()) { setStatus('API URL is required.', 'err'); endpointEl.focus(); return; }
+      if (!keyEl.value.trim()) { setStatus('API key is required.', 'err'); keyEl.focus(); return; }
+      // Preserve the existing model if editing; new profiles start empty and
+      // get their model from the dropdown after selection.
+      const existing = editingId ? findProfile(editingId) : null;
       const profile = {
-        id: editingId || '', // backend sanitizes if empty
+        id: editingId || '',
         name,
         endpoint: endpointEl.value.trim(),
-        model: modelEl.value.trim(),
         api_key: keyEl.value,
-        temperature,
+        model: existing?.model || '',
+        temperature: 1.0,
       };
-      saveBtn.disabled = true;
-      setStatus('Saving…');
-      invoke('api_profile_save', { profile })
-        .then(() => { hideEditor(); setStatus('Saved.', 'ok'); return refresh(); })
-        .catch((err) => setStatus('Save failed: ' + err, 'err'))
-        .finally(() => { saveBtn.disabled = false; });
+      addBtn.disabled = true;
+      setStatus(editingId ? 'Saving…' : 'Adding…');
+      try {
+        const saved = await invoke('api_profile_save', { profile });
+        const savedId = saved?.id || editingId || name;
+        clearEditor();
+        await refresh();
+        // Auto-select the just-saved profile + populate its models.
+        profileSelect.value = savedId;
+        if (profileSelect.value === savedId) {
+          profileSelect.dispatchEvent(new Event('change'));
+          setStatus('Saved. Pick a model, then Connect.', 'ok');
+        } else {
+          setStatus('Saved.', 'ok');
+        }
+      } catch (err) {
+        setStatus('Save failed: ' + err, 'err');
+      } finally {
+        addBtn.disabled = false;
+      }
     });
 
-    testBtn?.addEventListener('click', () => {
-      const profile = {
-        id: editingId || 'test',
-        name: nameEl.value.trim() || 'test',
-        endpoint: endpointEl.value.trim(),
-        model: modelEl.value.trim(),
-        api_key: keyEl.value,
-        temperature: null,
-      };
-      if (!profile.endpoint || !profile.api_key) {
-        setStatus('Endpoint + API key required to test.', 'err');
-        return;
+    // ── Edit tool: load the selected profile into the editor ──
+    editProfileBtn?.addEventListener('click', () => {
+      const p = findProfile(profileSelect.value);
+      if (!p) { setStatus('Pick a profile to edit first.', 'err'); return; }
+      loadEditor(p);
+    });
+
+    // ── Trash tool: delete the selected profile ──
+    deleteProfileBtn?.addEventListener('click', async () => {
+      const id = profileSelect.value;
+      const p = findProfile(id);
+      if (!p) { setStatus('Pick a profile to delete first.', 'err'); return; }
+      if (!confirm(`Delete profile "${p.name || p.id}"?\nThis removes the saved API URL + key.`)) return;
+      setStatus('Deleting…');
+      try {
+        await invoke('api_profile_delete', { profileId: id });
+        // If we were editing this profile, clear the editor.
+        if (editingId === id) clearEditor();
+        setStatus('Deleted.', 'ok');
+        await refresh();
+      } catch (err) {
+        setStatus('Delete failed: ' + err, 'err');
       }
-      testBtn.disabled = true;
-      setStatus('Testing connection…');
-      invoke('api_profile_test', { profile })
-        .then((v) => {
-          const count = (v && v.data && Array.isArray(v.data)) ? v.data.length : null;
-          setStatus(count != null ? `Connected — ${count} models available.` : 'Connected.', 'ok');
-        })
-        .catch((err) => setStatus('Connection failed: ' + err, 'err'))
-        .finally(() => { testBtn.disabled = false; });
+    });
+
+    // ── LOCAL Connect button ──
+    // LOCAL is always "connected" to the 12B by design — clicking Connect
+    // here is visual parity with ONLINE. If the runtime is somehow on API
+    // (user connected then peeked at LOCAL), this triggers the disconnect +
+    // 12B reload. Otherwise it's a no-op confirmation.
+    localConnectBtn?.addEventListener('click', async () => {
+      if (runtimeSource === 'api') {
+        setTitleState('offline');
+        localConnectBtn.disabled = true;
+        setStatus('Disconnecting API — reloading WUPI 12B…', '');
+        try {
+          await invoke('api_disconnect');
+          setStatus('Back on local WUPI 12B.', 'ok');
+        } catch (err) {
+          setStatus('Disconnect failed: ' + err, 'err');
+        }
+        await refresh();
+      } else {
+        setStatus('Already on local WUPI 12B.', 'ok');
+      }
     });
 
     // Load fresh every time the window opens.
@@ -1447,6 +1784,11 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       inputEl.disabled = on;
       sendBtn.disabled = on;
       stopBtn.disabled = !on;
+      // Bridge to the title status indicator: the main model is "typing"
+      // during a chat_send. This flag is the authoritative source — it only
+      // flips on user-driven chat sends, so Agent.gguf (schema engine, own
+      // thread, never drives chat_send) is excluded by construction.
+      setTitleState(on ? 'typing' : 'idle');
     }
 
     async function send() {

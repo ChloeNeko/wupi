@@ -192,6 +192,16 @@ impl Conversation {
     /// retrieval — that's the whole point of the offload. If retrieval misses,
     /// the model genuinely sees less recency than before; the cap is in a
     /// `const` at the call site, trivially tunable.
+    ///
+    /// **Alternating roll-up (2026-07-17):** before returning, consecutive
+    /// same-role messages are merged into one block (content joined with
+    /// `\n\n`, `raw_output` joined with `\n` for assistant turns). This
+    /// guarantees a clean user↔assistant alternation for the downstream
+    /// backend — GLM gets the strictly-alternating payload its chat template
+    /// expects, and local Gemma 4 never emits adjacent `<|turn>user` or
+    /// `<|turn>model` blocks that would confuse the chat-template tracking.
+    /// The roll-up is a pure normalization on the assembled slice; stored
+    /// session state is untouched. See `normalize_alternating`.
     pub fn assemble_api_messages_windowed(
         &self,
         system_prompt: &str,
@@ -220,8 +230,57 @@ impl Conversation {
                 raw_output: m.raw_output.clone(),
             });
         }
-        out
+        normalize_alternating(out)
     }
+}
+
+/// Merge consecutive same-role messages into single blocks. Applied to the
+/// assembled `Vec<ApiMessage>` before it leaves `assemble_api_messages_windowed`,
+/// so BOTH backends (local Gemma 4 via `Gemma4Format::render_prompt`, online
+/// GLM via `HttpBackend::stream`) receive the same strictly-alternating
+/// payload. Session storage is left untouched — this is a presentation-layer
+/// transform only.
+///
+/// Rules:
+/// - Walk the slice; if message `i` and `i+1` share a role, their `content`
+///   strings are joined with `\n\n` and their `raw_output` strings with `\n`.
+///   The pair collapses into one entry; the walk continues from the merged
+///   entry so runs of 3+ same-role messages fold fully.
+/// - The system block (index 0) participates: it never has a same-role
+///   neighbor in practice (the conversation starts with user), but if a
+///   legacy/hand-edited session had a leading system+system pair it would
+///   merge cleanly rather than emit two system turns.
+/// - `raw_output` is merged too because the local formatter renders assistant
+///   turns from `raw_output` when present (Bug #3, §2C) — joining only
+///   `content` would desync the rendered tokens from the KV cache. Assistant
+///   `raw_output` blocks are the Gemma4 channel protocol; joining with `\n`
+///   (not `\n\n`) keeps the turn boundary inside the merged block legible.
+///
+/// Empty messages are NOT dropped — an empty user turn is still a turn (the
+/// backend's alternation contract doesn't care about content length).
+pub fn normalize_alternating(messages: Vec<ApiMessage>) -> Vec<ApiMessage> {
+    if messages.len() < 2 {
+        return messages;
+    }
+    let mut out: Vec<ApiMessage> = Vec::with_capacity(messages.len());
+    for m in messages {
+        if let Some(last) = out.last_mut() {
+            if last.role == m.role {
+                // Same-role neighbor: roll up into the last block.
+                if !last.content.is_empty() && !m.content.is_empty() {
+                    last.content.push_str("\n\n");
+                }
+                last.content.push_str(&m.content);
+                if !last.raw_output.is_empty() && !m.raw_output.is_empty() {
+                    last.raw_output.push('\n');
+                }
+                last.raw_output.push_str(&m.raw_output);
+                continue;
+            }
+        }
+        out.push(m);
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -448,5 +507,125 @@ mod tests {
         );
 
         cleanup(&path);
+    }
+
+    // ── normalize_alternating (the Alternating Roll-Up) ─────────────────
+    fn api(role: &str, content: &str) -> ApiMessage {
+        ApiMessage {
+            role: role.into(),
+            content: content.into(),
+            raw_output: String::new(),
+        }
+    }
+    fn api_raw(role: &str, content: &str, raw: &str) -> ApiMessage {
+        ApiMessage {
+            role: role.into(),
+            content: content.into(),
+            raw_output: raw.into(),
+        }
+    }
+
+    #[test]
+    fn normalize_keeps_already_alternating_unchanged() {
+        let msgs = vec![
+            api("system", "sys"),
+            api("user", "hi"),
+            api("assistant", "hello"),
+            api("user", "how are you?"),
+            api("assistant", "fine"),
+        ];
+        let out = normalize_alternating(msgs);
+        assert_eq!(out.len(), 5);
+        assert_eq!(out.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+                   vec!["system", "user", "assistant", "user", "assistant"]);
+    }
+
+    #[test]
+    fn normalize_merges_consecutive_user_messages() {
+        // Simulates the "user clicks Save / fires multiple commands" case:
+        // two user turns in a row should collapse into one.
+        let msgs = vec![
+            api("system", "sys"),
+            api("user", "save this"),
+            api("user", "and also that"),
+            api("assistant", "done"),
+        ];
+        let out = normalize_alternating(msgs);
+        assert_eq!(out.len(), 3, "two user msgs merge into one");
+        assert_eq!(out[1].role, "user");
+        assert_eq!(out[1].content, "save this\n\nand also that");
+        assert_eq!(out[2].role, "assistant");
+    }
+
+    #[test]
+    fn normalize_merges_consecutive_assistant_messages_with_raw_output() {
+        // Cache-coherence (Bug #3): raw_output must be merged alongside
+        // content, otherwise the local formatter renders the merged turn
+        // from a stale raw_output and desyncs the KV cache.
+        let msgs = vec![
+            api("user", "q"),
+            api_raw("assistant", "part 1", "<raw1>"),
+            api_raw("assistant", "part 2", "<raw2>"),
+            api("user", "next"),
+        ];
+        let out = normalize_alternating(msgs);
+        assert_eq!(out.len(), 3, "two assistant msgs merge into one");
+        assert_eq!(out[1].content, "part 1\n\npart 2");
+        assert_eq!(out[1].raw_output, "<raw1>\n<raw2>",
+                   "raw_output joined with single \\n (not \\n\\n)");
+    }
+
+    #[test]
+    fn normalize_folds_runs_of_three_or_more() {
+        let msgs = vec![
+            api("system", "sys"),
+            api("user", "a"),
+            api("user", "b"),
+            api("user", "c"),
+            api("assistant", "reply"),
+        ];
+        let out = normalize_alternating(msgs);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[1].content, "a\n\nb\n\nc");
+    }
+
+    #[test]
+    fn normalize_handles_empty_messages_without_dropping() {
+        // An empty user turn is still a turn — don't drop it. When the first
+        // of the merged pair is empty, no leading separator is emitted (the
+        // \n\n guard fires only when BOTH sides have content).
+        let msgs = vec![
+            api("user", ""),
+            api("user", "real message"),
+            api("assistant", "reply"),
+        ];
+        let out = normalize_alternating(msgs);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].content, "real message",
+                   "empty-leading case yields just the non-empty content");
+        assert_eq!(out[1].content, "reply");
+    }
+
+    #[test]
+    fn normalize_preserves_system_at_index_zero() {
+        // A legacy session with two leading system messages should merge them
+        // into the index-0 system block, not emit two system turns.
+        let msgs = vec![
+            api("system", "directive A"),
+            api("system", "directive B"),
+            api("user", "hi"),
+        ];
+        let out = normalize_alternating(msgs);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].role, "system");
+        assert_eq!(out[0].content, "directive A\n\ndirective B");
+        assert_eq!(out[1].role, "user");
+    }
+
+    #[test]
+    fn normalize_empty_and_single_pass_through() {
+        assert_eq!(normalize_alternating(vec![]).len(), 0);
+        let one = vec![api("user", "solo")];
+        assert_eq!(normalize_alternating(one).len(), 1);
     }
 }

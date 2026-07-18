@@ -115,17 +115,22 @@ enum EngineMsg {
     Shutdown,
 }
 
-/// The handle held by `AppState` (via `LlamaCppBackend`). Fully `Send` — it's
-/// just a channel sender + a marker that the engine started OK.
+/// The handle held by `AppState` (via `LlamaCppBackend`). Fully `Send` — a
+/// channel sender + the model family + the thread's JoinHandle. The JoinHandle
+/// lets `shutdown()` block until VRAM is actually freed (the old
+/// fire-and-forget pattern caused VRAM-overlap OOM during model swaps — see
+/// the 2026-07-18 fix in `swap_schema_engine`).
 pub struct ChatEngine {
     tx: mpsc::Sender<EngineMsg>,
     /// The model family, retained so the backend can report it without
     /// crossing thread boundaries to read the model.
     family: ModelFamily,
+    join: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 // SAFETY: mpsc::Sender<EngineMsg> is Send (EngineMsg owns only Send data).
-// ModelFamily is Copy+Send. No `LlamaContext` or `!Send` type crosses out.
+// ModelFamily is Copy+Send. Mutex<Option<JoinHandle<()>>> is Send+Sync.
+// No `LlamaContext` or `!Send` type crosses out.
 unsafe impl Send for ChatEngine {}
 unsafe impl Sync for ChatEngine {}
 
@@ -148,8 +153,8 @@ impl ChatEngine {
         let (tx, rx) = mpsc::channel::<EngineMsg>();
         let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
-        std::thread::Builder::new()
-            .name("wupi-engine".into())
+        let builder = std::thread::Builder::new().name("wupi-engine".into());
+        let join = builder
             .spawn(move || {
                 let mut engine = match Self::init_runtime(backend, model, family, context_size) {
                     Ok(rt) => {
@@ -240,7 +245,14 @@ impl ChatEngine {
             })
             .expect("failed to spawn wupi-engine thread");
 
-        (ChatEngine { tx, family }, init_rx)
+        (
+            ChatEngine {
+                tx,
+                family,
+                join: std::sync::Mutex::new(Some(join)),
+            },
+            init_rx,
+        )
     }
 
     /// Post a generation request and return a receiver the caller awaits.
@@ -250,11 +262,26 @@ impl ChatEngine {
             .map_err(|_| "engine thread closed".to_string())
     }
 
-    /// Signal the engine to shut down. Best-effort — the thread exits on next
-    /// recv. Not currently called (the engine lives for the process), but
-    /// kept for future hot-swap / settings-reload flows.
+    /// Shut down the engine thread AND block until it has fully exited +
+    /// dropped its `EngineRuntime` (LlamaContext + KvBuffer → VRAM freed).
+    /// Synchronous wait is load-bearing during model swaps: the old
+    /// fire-and-forget pattern posted Shutdown and returned immediately, so
+    /// the next model load raced the thread's VRAM teardown and OOM'd
+    /// `load_from_file` → `NullResult` (Chloe's 2026-07-18 VRAM-overlap
+    /// diagnosis). Blocking on the JoinHandle guarantees VRAM is released
+    /// before any new model allocates.
     pub fn shutdown(&self) {
         let _ = self.tx.send(EngineMsg::Shutdown);
+        // Take the JoinHandle (idempotent across repeated shutdown() calls)
+        // and block on it. A panic in the thread surfaces as Err; log it but
+        // don't propagate — shutdown is best-effort.
+        if let Ok(mut guard) = self.join.lock() {
+            if let Some(handle) = guard.take() {
+                if let Err(e) = handle.join() {
+                    tracing::warn!(error = ?e, "wupi-engine thread join failed during shutdown");
+                }
+            }
+        }
     }
 
     /// The model family this engine was built for.

@@ -253,14 +253,22 @@ impl GenerationClient for HttpBackend {
             }
 
             // Build the request body. `stream: true` requests SSE.
-            let mut body = serde_json::json!({
+            // Sampler params mirror the locked local-engine config (AGENTS.md
+            // §0 Sampler config): temp 1.0, top_p 0.95, min_p 0.1, top_k 0.
+            // min_p + top_k are llama.cpp-native and non-standard for the
+            // OpenAI /chat/completions contract — providers that don't
+            // recognize them should ignore them, and the few that reject
+            // unknown fields will surface a 400 (acceptable per the explicit
+            // "full mirror" decision; aligns the API path with local).
+            let body = serde_json::json!({
                 "model": model,
                 "messages": wire_messages,
                 "stream": true,
+                "temperature": temperature.unwrap_or(1.0),
+                "top_p": 0.95,
+                "min_p": 0.1,
+                "top_k": 0,
             });
-            if let Some(t) = temperature {
-                body["temperature"] = serde_json::json!(t);
-            }
 
             let response = client
                 .post(&url)
@@ -533,16 +541,18 @@ impl GenerationClient for LlamaCppBackend {
 
 impl LlamaCppBackend {
     /// Shut down the engine thread + clear the slot. Posts `EngineMsg::Shutdown`
-    /// (the thread exits, dropping its `EngineRuntime` — `LlamaContext` + the
-    /// borrowed `&'static LlamaModel` — which frees the VRAM), then sets the
-    /// inner slot to `None` so further `stream()` calls return the "not ready"
-    /// error instead of posting to a dead thread. Used by the model-swap code
-    /// (api_connect) to tear down the 12B chat engine before switching chat to
-    /// an API endpoint. After this, `AppState.backend` should be set to `None`.
+    /// AND blocks on the JoinHandle until the thread has fully exited + dropped
+    /// its `EngineRuntime` (LlamaContext + the borrowed `&'static LlamaModel`
+    /// → VRAM actually freed), then sets the inner slot to `None` so further
+    /// `stream()` calls return the "not ready" error instead of posting to a
+    /// dead thread. The synchronous join is load-bearing during model swaps —
+    /// the old fire-and-forget version raced VRAM teardown and OOM'd the next
+    /// `load_from_file` (Chloe's 2026-07-18 VRAM-overlap diagnosis). Callers
+    /// using this from an async context should wrap it in `spawn_blocking`.
     pub fn shutdown(&self) {
         if let Some(engine) = self.engine.lock().map(|mut g| g.take()).unwrap_or(None) {
             engine.shutdown();
-            tracing::info!("chat engine shutdown signaled (thread will exit + drop context)");
+            tracing::info!("chat engine shutdown complete (thread joined + context dropped)");
         }
     }
 }

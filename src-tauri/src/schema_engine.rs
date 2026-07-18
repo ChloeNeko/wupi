@@ -106,13 +106,18 @@ enum SchemaMsg {
 // Handle (held by callers; fully Send + Sync)
 // ---------------------------------------------------------------------------
 
-/// The handle callers hold. Fully `Send + Sync` — just a channel sender.
-/// Mirrors `ChatEngine` and `LlamaCppEmbedder`.
+/// The handle callers hold. Fully `Send + Sync` — a channel sender + the
+/// thread's JoinHandle so `shutdown()` can block until VRAM is actually freed
+/// (the fire-and-forget pattern was causing VRAM-overlap OOM during model
+/// swaps — see the 2026-07-18 fix in `swap_schema_engine`). Mirrors
+/// `ChatEngine` and `LlamaCppEmbedder`.
 pub struct SchemaEngine {
     tx: mpsc::Sender<SchemaMsg>,
+    join: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 // SAFETY: mpsc::Sender<SchemaMsg> is Send (SchemaMsg owns only Send data).
+// Mutex<Option<JoinHandle<()>>> is Send+Sync. No `LlamaContext` crosses out.
 unsafe impl Send for SchemaEngine {}
 unsafe impl Sync for SchemaEngine {}
 
@@ -136,8 +141,8 @@ impl SchemaEngine {
         let (tx, rx) = mpsc::channel::<SchemaMsg>();
         let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
 
-        std::thread::Builder::new()
-            .name("wupi-schema".into())
+        let builder = std::thread::Builder::new().name("wupi-schema".into());
+        let join = builder
             .spawn(move || {
                 let mut runtime = match Self::init_runtime(&path, n_gpu_layers) {
                     Ok(rt) => {
@@ -227,18 +232,35 @@ impl SchemaEngine {
             })
             .expect("failed to spawn wupi-schema thread");
 
-        (SchemaEngine { tx }, init_rx)
+        (
+            SchemaEngine {
+                tx,
+                join: std::sync::Mutex::new(Some(join)),
+            },
+            init_rx,
+        )
     }
 
-    /// Signal the schema thread to shut down. The thread drops its
-    /// `SchemaRuntime` (owning the `LlamaContext` + the leaked model ref) on
-    /// exit, freeing VRAM. Best-effort — the caller drops all clones of this
-    /// handle afterwards so the mpsc `RecvError` path also fires if the
-    /// Shutdown message races. Used by the model-swap code (api_connect /
-    /// api_disconnect) to tear down the schema engine before respawning on a
-    /// different model.
+    /// Shut down the schema thread AND block until it has fully exited +
+    /// dropped its `SchemaRuntime` (LlamaContext + leaked model ref → VRAM
+    /// freed). This synchronous wait is load-bearing during model swaps: the
+    /// old fire-and-forget pattern posted Shutdown and returned immediately,
+    /// so the next `spawn_load` raced the thread's VRAM teardown and OOM'd
+    /// `load_from_file` → `NullResult` (Chloe's 2026-07-18 diagnosis of the
+    /// E4B/Agent.gguf load failures). By blocking on the JoinHandle we
+    /// guarantee VRAM is actually released before any new model allocates.
     pub fn shutdown(&self) {
         let _ = self.tx.send(SchemaMsg::Shutdown);
+        // Take the JoinHandle (so repeated shutdown() calls are safe) and
+        // block on it. A panic in the thread surfaces as Err; log + ignore
+        // since shutdown is best-effort anyway.
+        if let Ok(mut guard) = self.join.lock() {
+            if let Some(handle) = guard.take() {
+                if let Err(e) = handle.join() {
+                    tracing::warn!(error = ?e, "wupi-schema thread join failed during shutdown");
+                }
+            }
+        }
     }
 
     /// Post a delta request. The caller awaits the reply via the receiver

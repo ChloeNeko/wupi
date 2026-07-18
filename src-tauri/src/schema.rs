@@ -248,7 +248,7 @@ impl SchemaDelta {
 /// This mirrors `chat_format.rs::Gemma4Format::parse_output`'s split-on-
 /// `<channel|>` logic, specialized to the schema's "I only want the reply"
 /// need (parse_output splits into both channels; we discard thought entirely).
-fn extract_reply_channel(raw: &str) -> &str {
+pub fn extract_reply_channel(raw: &str) -> &str {
     match raw.rsplit_once("<channel|>") {
         Some((_, reply)) => reply,
         None => raw,

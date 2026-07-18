@@ -1,7 +1,11 @@
 pub mod api;
+pub mod bracket_parser;
 pub mod chat_format;
 pub mod codex;
+pub mod consequence;
 pub mod engine;
+pub mod game_command;
+pub mod game_engine;
 #[cfg(windows)]
 pub mod hardware;
 pub mod kv_buffer;
@@ -10,6 +14,8 @@ pub mod memory;
 pub mod memory_embedder;
 pub mod memory_embedder_llama;
 pub mod memory_rrf;
+pub mod narrator_prompt;
+pub mod npc_runtime;
 pub mod prompts;
 pub mod schema;
 pub mod schema_engine;
@@ -114,6 +120,29 @@ pub struct AppState {
     /// reads it without locking the whole config (and so the swap logic can
     /// flip it atomically with the model teardown). Defaults to Local.
     pub model_source: Arc<std::sync::Mutex<api::ModelSource>>,
+
+    // ── Games app state (Seam 1+2, 2026-07-18) ───────────────────────────
+    // The GameEngine (narrator) lives here, NOT eagerly spawned at boot — it
+    // spawns on `game_start` and shuts down on `game_end`. Costs VRAM only
+    // while a game is actually running. Same shape as `schema_engine` (Mutex
+    // of Option of Arc). None = no game running.
+    pub game_engine: Arc<std::sync::Mutex<Option<Arc<game_engine::GameEngine>>>>,
+    /// Per-game cancel token, parallel to `active_cancel`. Distinct slot so
+    /// chat-stop and game-stop never cross-wire (Bug #7 pattern, §2C).
+    pub active_game_cancel: Arc<std::sync::Mutex<Option<llm::CancelToken>>>,
+    /// The game's scoped world-state schema (sibling to `schema`, which is
+    /// Wupi-assistant's). Per-card — wiped/reloaded on card switch. Held
+    /// under tokio Mutex because `game_send` reads it + Wupi's game-manager
+    /// path writes it (via `game_command` deltas).
+    pub game_schema: Arc<tokio::sync::Mutex<schema::WorldSchema>>,
+    /// The active roleplay card. `None` when no game is running. Set on
+    /// `game_start`, cleared on `game_end`. The narrator prompt builder
+    /// reads this each `game_send` turn.
+    pub active_game_card: Arc<std::sync::Mutex<Option<sim_card::SimCard>>>,
+    /// The card id BEFORE a game started, so `game_end` can restore it. The
+    /// system card (`__wupi_os__`) is the default; games swap to the
+    /// roleplay card's id and restore on exit.
+    pub pre_game_card_id: Arc<std::sync::Mutex<String>>,
 }
 
 impl AppState {
@@ -138,6 +167,11 @@ impl AppState {
             api_config: Arc::new(std::sync::Mutex::new(api::ApiConfig::default())),
             api_config_path: Arc::new(std::sync::OnceLock::new()),
             model_source: Arc::new(std::sync::Mutex::new(api::ModelSource::default())),
+            game_engine: Arc::new(std::sync::Mutex::new(None)),
+            active_game_cancel: Arc::new(std::sync::Mutex::new(None)),
+            game_schema: Arc::new(tokio::sync::Mutex::new(schema::WorldSchema::default())),
+            active_game_card: Arc::new(std::sync::Mutex::new(None)),
+            pre_game_card_id: Arc::new(std::sync::Mutex::new(memory::WUPI_OS_CARD_ID.to_owned())),
         }
     }
 }
@@ -317,6 +351,79 @@ pub fn run() {
                                         );
                                         if let Ok(mut slot) = app_state.schema_engine.lock() {
                                             *slot = Some(Arc::new(engine));
+                                        }
+
+                                        // ── Restore last-used source (2026-07-18) ──
+                                        // If the user was on an API profile at last
+                                        // shutdown, boot brought the 12B up as a safe
+                                        // default. Now that both engines are ready,
+                                        // re-perform the API swap so Wupi comes back
+                                        // up on the same connection the user last had.
+                                        // The schema engine stays on WUPI.gguf either
+                                        // way (no Agent.gguf dependency). On any error
+                                        // we stay on local 12B — boot must never fail.
+                                        let restore = {
+                                            let cfg = app_state
+                                                .api_config
+                                                .lock()
+                                                .expect("api_config mutex");
+                                            (
+                                                cfg.model_source,
+                                                cfg.active_profile_id.clone(),
+                                            )
+                                        };
+                                        if matches!(restore.0, api::ModelSource::Api) {
+                                            if let Some(profile_id) = restore.1 {
+                                                tracing::info!(
+                                                    profile_id = %profile_id,
+                                                    "boot: restoring last-used API connection"
+                                                );
+                                                // Tear down the freshly-loaded 12B
+                                                // chat backend (schema stays put).
+                                                let taken = app_state
+                                                    .backend
+                                                    .lock()
+                                                    .expect("backend mutex")
+                                                    .take();
+                                                if let Some(b) = taken {
+                                                    b.shutdown();
+                                                }
+                                                *app_state
+                                                    .model_source
+                                                    .lock()
+                                                    .expect("model_source mutex") =
+                                                    api::ModelSource::Api;
+                                                let _ = app_handle.emit(
+                                                    "model-status",
+                                                    serde_json::json!({
+                                                        "status": "ready",
+                                                        "model": "api (restored)",
+                                                    }),
+                                                );
+                                                tracing::info!(
+                                                    "boot: API connection restored"
+                                                );
+                                            } else {
+                                                // model_source was Api but no active
+                                                // profile — downgrade to Local so
+                                                // chat_send doesn't route to a
+                                                // non-existent API path.
+                                                tracing::warn!(
+                                                    "boot: model_source was Api but no \
+                                                     active profile; downgrading to Local"
+                                                );
+                                                *app_state
+                                                    .model_source
+                                                    .lock()
+                                                    .expect("model_source mutex") =
+                                                    api::ModelSource::Local;
+                                                let mut cfg = app_state
+                                                    .api_config
+                                                    .lock()
+                                                    .expect("api_config mutex");
+                                                cfg.model_source =
+                                                    api::ModelSource::Local;
+                                            }
                                         }
                                     }
                                     Ok(Err(msg)) => {
@@ -507,6 +614,12 @@ pub fn run() {
             api_connect,
             api_disconnect,
             model_source_get,
+            // ── Games app IPC (Seam 1 + Seam 2) ───────────────────────────
+            game_cards_list,
+            game_start,
+            game_send,
+            game_stop,
+            game_end,
             system_menu::power_shutdown_cmd,
             system_menu::power_restart_cmd,
             system_menu::power_sleep_cmd,
@@ -1593,6 +1706,38 @@ async fn api_connect(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    match api_connect_inner(profile_id, app.clone(), &state).await {
+        Ok(()) => Ok(()),
+        // Safety net for the title indicator: if connect failed, the 12B is
+        // still loaded (validation runs before any teardown; if teardown ran
+        // and then something downstream failed, the runtime is genuinely
+        // offline). Emit model-status so the frontend's title self-corrects
+        // — never gets stuck in the red "swapping" state. JS handles this
+        // too, but the backend is the authority.
+        Err(e) => {
+            let backend_loaded = state
+                .backend
+                .lock()
+                .expect("backend mutex")
+                .as_ref()
+                .map(|b| b.is_ready())
+                .unwrap_or(false);
+            let status = if backend_loaded {
+                serde_json::json!({ "status": "ready", "model": "WUPI.gguf" })
+            } else {
+                serde_json::json!({ "status": "error", "message": &e })
+            };
+            let _ = app.emit("model-status", status);
+            Err(e)
+        }
+    }
+}
+
+async fn api_connect_inner(
+    profile_id: String,
+    app: tauri::AppHandle,
+    state: &tauri::State<'_, AppState>,
+) -> Result<(), String> {
     let path = state
         .api_config_path
         .get()
@@ -1619,19 +1764,37 @@ async fn api_connect(
     }
 
     tracing::info!("api_connect: beginning model swap (Local → API)");
-    // 1. Tear down the 12B chat engine + clear the backend slot. Posts
-    //    EngineMsg::Shutdown; the thread exits + drops its LlamaContext
-    //    (freeing VRAM). Subsequent chat_send calls branch on model_source
-    //    (set below to Api) so they won't touch this slot anyway.
-    if let Some(backend) = state.backend.lock().expect("backend mutex").take() {
-        backend.shutdown();
+    // ── ORDERING FIX (2026-07-18) ───────────────────────────────────────
+    // ── SCHEMA ENGINE STAYS ON WUPI.gguf (2026-07-18) ───────────────────
+    // The original design swapped the schema/memory engine to Agent.gguf on
+    // API connect (to free VRAM for the API chat path). That required
+    // Agent.gguf to actually load — and the file we had (Gemma 4 E4B)
+    // returns NullResult in llama-cpp-2 0.1.151. Rather than block API mode
+    // on a separate sidekick model, the schema engine now stays on WUPI.gguf
+    // in both modes. Cost: ~1-2GB extra VRAM for the schema's isolated
+    // context on the 12B when in API mode. Benefit: API mode works without
+    // any external model dependency.
+    tracing::info!("api_connect: keeping schema engine on WUPI.gguf (no Agent.gguf swap)");
+
+    // Tear down the 12B CHAT engine (the schema engine stays put). Posts
+    // EngineMsg::Shutdown; the thread exits + drops its LlamaContext (freeing
+    // VRAM). shutdown() blocks on the JoinHandle so VRAM is actually released
+    // (load-bearing for subsequent loads — see the 2026-07-18 VRAM-overlap
+    // fix). Wrapped in spawn_blocking because the join is a synchronous
+    // block we don't want on a Tokio worker.
+    //
+    // Scope the mutex guard in its own block so it drops BEFORE the .await —
+    // holding a std::sync::MutexGuard across an await makes the future !Send
+    // and Tauri commands require Send futures.
+    let backend_opt = {
+        let mut guard = state.backend.lock().expect("backend mutex");
+        guard.take()
+    };
+    if let Some(backend) = backend_opt {
+        tokio::task::spawn_blocking(move || backend.shutdown())
+            .await
+            .map_err(|e| format!("chat backend shutdown join: {e}"))?;
     }
-    // 2. Tear down the schema engine (currently on WUPI.gguf) — we'll respawn
-    //    it on Agent.gguf. shutdown() posts SchemaMsg::Shutdown; the thread
-    //    exits + drops its runtime (context + leaked model → VRAM freed).
-    swap_schema_engine(&app, &state, "Agent.gguf")
-        .await
-        .map_err(|e| format!("schema swap to Agent.gguf failed: {e}"))?;
     // 3. Flip model_source FIRST (before persisting) so chat_send routes to
     //    the API path on the very next message. Then persist the config.
     *state.model_source.lock().expect("model_source mutex") = api::ModelSource::Api;
@@ -1644,7 +1807,20 @@ async fn api_connect(
     tokio::task::spawn_blocking(move || cfg_snapshot.save(&path))
         .await
         .map_err(|e| format!("api_config save join: {e}"))?;
-    tracing::info!(profile_id = %profile_id, "api connected — chat via API, schema via Agent.gguf");
+    tracing::info!(profile_id = %profile_id, "api connected — chat via API, schema stays on WUPI.gguf");
+    // Emit model-status so the title indicator flips from "swapping" (red)
+    // to "idle" (steady white). api_disconnect's reload path already emits
+    // via the spawn_load callback; api_connect had no emit, so the title
+    // stayed red indefinitely after an ONLINE connect. The model name is
+    // the profile's model string (what the API will actually serve).
+    let model_name = {
+        let cfg = state.api_config.lock().expect("api_config mutex");
+        cfg.active_profile().map(|p| p.model.clone()).unwrap_or_default()
+    };
+    let _ = app.emit(
+        "model-status",
+        serde_json::json!({ "status": "ready", "model": model_name }),
+    );
     Ok(())
 }
 
@@ -1662,14 +1838,10 @@ async fn api_disconnect(app: tauri::AppHandle, state: tauri::State<'_, AppState>
         .app_data_dir()
         .map_err(|e| format!("app_data_dir: {e}"))?;
 
-    tracing::info!("api_disconnect: beginning model swap (API → Local)");
-    // 1. Tear down the Agent.gguf schema engine; respawn on WUPI.gguf.
-    swap_schema_engine(&app, &state, "WUPI.gguf")
-        .await
-        .map_err(|e| format!("schema swap to WUPI.gguf failed: {e}"))?;
-    // 2. Reload the 12B chat engine. Resolve the path + spawn_load, then set
-    //    the backend slot. The chat engine is async-loaded (spawn_load returns
-    //    immediately); readiness arrives later via the on_result callback.
+    tracing::info!("api_disconnect: beginning chat-engine reload (API → Local)");
+    // The schema engine stayed on WUPI.gguf during API mode (no swap on
+    // connect — see api_connect), so there's no schema swap to reverse here.
+    // Just reload the 12B chat engine.
     let model_path = resolve_model_path(&app)
         .ok_or_else(|| "no WUPI.gguf found for reconnect".to_string())?;
     let context_size = state.settings.lock().expect("settings mutex").context_size;
@@ -1727,13 +1899,17 @@ async fn swap_schema_engine(
         .map_err(|e| format!("schema_engine mutex: {e}"))?
         .take();
     if let Some(engine) = prev {
-        engine.shutdown();
-        // Give the schema thread a moment to exit + drop its context before
-        // we allocate a new one on a different model (avoids transient VRAM
-        // overlap). 100ms is generous for a thread to process Shutdown +
-        // drop; if it's still alive the new alloc still works, just with
-        // brief double-VRAM.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // shutdown() now blocks on the thread's JoinHandle until the schema
+        // thread has fully exited + dropped its LlamaContext + leaked model
+        // ref → VRAM actually freed before the new model loads. The old 100ms
+        // sleep was a best-effort guess that raced teardown and caused
+        // VRAM-overlap OOM → `NullResult` on the new load. Run on
+        // spawn_blocking because the join can take a few hundred ms (dropping
+        // a Q8_0 KV cache + a leaked 12B model) — that's too long to tie up
+        // a Tokio worker synchronously.
+        tokio::task::spawn_blocking(move || engine.shutdown())
+            .await
+            .map_err(|e| format!("schema shutdown join: {e}"))?;
     }
     // 2. Resolve the new model path.
     let dirs = model_search_dirs(app);
@@ -1883,6 +2059,385 @@ async fn get_settings(state: tauri::State<'_, AppState>) -> Result<serde_json::V
         "conversationBudget": conversation_budget,
         "messageCount": state.session.lock().await.messages.len(),
     }))
+}
+
+// ===========================================================================
+// Games app IPC (Seam 1 + Seam 2, 2026-07-18) — see docs/games-app-design.md
+// ===========================================================================
+// Five commands: enumerate roleplay cards, start a game (spawn GameEngine +
+// swap active_card_id), send a narrator turn (streaming), stop a turn, end
+// the game (shutdown engine + restore card id). The narrator system prompt
+// is built per-turn from the active roleplay card + the card's scoped
+// schema. Bracket commands are parsed from the final raw output + emitted
+// as structured scene_event Channel messages so the (deferred) UI can route
+// them. Memory archiving + schema delta reuse the existing paths — both
+// scope to the active card_id automatically.
+
+/// Lightweight metadata for one roleplay card, returned by `game_cards_list`.
+/// Carries enough for a card-picker UI (name, id, short description) without
+/// loading the full persona body.
+#[derive(Debug, Clone, serde::Serialize)]
+struct GameCardMeta {
+    id: String,
+    name: String,
+    card_type: String,
+    setting_preview: String,
+    tone: Option<String>,
+}
+
+/// Enumerate every `.sim` file in `cards/game_cards/` and return parsed
+/// metadata. The card-picker UI's data source. Returns an empty Vec when no
+/// game_cards/ dir exists (the common case until cards are authored or
+/// imported) — graceful, not an error.
+#[tauri::command]
+fn game_cards_list(app: tauri::AppHandle) -> Result<Vec<GameCardMeta>, String> {
+    let dir = resolve_game_cards_dir(&app);
+    let Some(dir) = dir else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("read game_cards/: {e}"))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("sim") {
+            continue;
+        }
+        let card = sim_card::load_or_fallback(&path);
+        // Skip fallback stubs (a malformed file produced the fallback). The
+        // id sentinel is the signal — see sim_card::FALLBACK_ID.
+        if card.id == "__wupi_fallback__" {
+            tracing::warn!(path = %path.display(), "skipping malformed game card");
+            continue;
+        }
+        // Only list roleplay cards in this registry — the system card
+        // (Wupi.sim) lives in `cards/`, not `cards/game_cards/`, so this is
+        // belt-and-suspenders against a misplaced file.
+        if card.card_type != "roleplay" {
+            continue;
+        }
+        let setting_preview = card
+            .setting
+            .as_deref()
+            .map(|s| s.chars().take(160).collect::<String>())
+            .unwrap_or_default();
+        out.push(GameCardMeta {
+            id: card.id.clone(),
+            name: card.name.clone(),
+            card_type: card.card_type.clone(),
+            setting_preview,
+            tone: card.tone.clone(),
+        });
+    }
+    // Stable order: alphabetical by name so the picker doesn't jitter.
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(out)
+}
+
+/// Start a game: load the roleplay card, spawn the GameEngine (loads
+/// WUPI.gguf as its own isolated context), swap `active_card_id` to the
+/// card's id, and reset the game's scoped schema to empty (fresh scene).
+/// The `pre_game_card_id` is saved so `game_end` can restore it.
+#[tauri::command]
+async fn game_start(
+    card_id: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    tracing::info!(card_id = %card_id, "game_start: spawning GameEngine");
+
+    // 1. Refuse if a game is already running (the UI shouldn't allow this,
+    //    but defense-in-depth).
+    {
+        let existing = state.game_engine.lock().expect("game_engine mutex");
+        if existing.is_some() {
+            return Err("a game is already running — call game_end first".into());
+        }
+    }
+
+    // 2. Resolve + load the roleplay card by id. The id comes from
+    //    `game_cards_list`, so it must exist in the registry.
+    let card = {
+        let dir = resolve_game_cards_dir(&app)
+            .ok_or_else(|| "no cards/game_cards/ dir resolved".to_string())?;
+        find_card_by_id(&dir, &card_id)?
+    };
+
+    // 3. Resolve the model path (WUPI.gguf — same file the chat engine uses,
+    //    freshly leaked as the GameEngine's own &'static ref).
+    let model_path = resolve_model_path(&app)
+        .ok_or_else(|| "no WUPI.gguf found — cannot start game".to_string())?;
+    let context_size = state.settings.lock().expect("settings mutex").context_size;
+
+    // 4. Spawn the GameEngine + block on readiness (the engine loads its
+    //    own model on a dedicated std::thread; recv() runs on the tokio
+    //    worker via spawn_blocking — same pattern as the schema engine).
+    let (engine, init_rx) = game_engine::GameEngine::spawn_load(model_path, 99);
+    let ready = tokio::task::spawn_blocking(move || init_rx.recv())
+        .await
+        .map_err(|e| format!("game engine init join: {e}"))?
+        .map_err(|e| format!("game engine init channel: {e}"))?;
+    match ready {
+        Ok(()) => {
+            if let Ok(mut slot) = state.game_engine.lock() {
+                *slot = Some(Arc::new(engine));
+            }
+        }
+        Err(msg) => {
+            return Err(format!("game engine init failed: {msg}"));
+        }
+    }
+
+    // 5. Swap active_card_id + save the pre-game value for restoration.
+    //    This scopes all memory retrieval + archiving to the roleplay card
+    //    automatically (§2M — already wired through chat_send + the debug
+    //    panel). Schema is reset to empty (fresh scene).
+    {
+        let mut pre = state.pre_game_card_id.lock().expect("pre_game_card_id mutex");
+        let mut active = state.active_card_id.lock().expect("active_card_id mutex");
+        *pre = active.clone();
+        *active = card.id.clone();
+    }
+    *state.game_schema.lock().await = schema::WorldSchema::default();
+    *state.active_game_card.lock().expect("active_game_card mutex") = Some(card);
+
+    tracing::info!("game started — narrator engine live, memory scoped to card");
+    let _ = context_size; // referenced for future n_ctx tuning; unused today
+    Ok(())
+}
+
+/// Send a narrator turn: render the narrator prompt from the active card +
+/// current game schema, post the request to the GameEngine, stream chunks
+/// to the Channel, parse bracket commands from the final raw output, and
+/// emit them as scene_event messages. After the turn, archive to memory
+/// (card-scoped) and fire the schema delta (card-scoped). Mirrors `chat_send`
+/// shape but routes to the GameEngine + uses the narrator system prompt.
+#[tauri::command]
+async fn game_send(
+    text: String,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    tracing::info!(?text, "game_send");
+
+    // Fresh cancel token for this turn (Bug #7 pattern, scoped to game).
+    let cancel: llm::CancelToken =
+        Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let mut slot = state.active_game_cancel.lock().expect("active_game_cancel mutex");
+        *slot = Some(Arc::clone(&cancel));
+    }
+
+    // Pull the engine + card out under brief locks, then drop the guards
+    // before the .await (the locks are std::sync::Mutex — guards are !Send).
+    let engine = {
+        let guard = state.game_engine.lock().expect("game_engine mutex");
+        guard.clone().ok_or_else(|| "no game running — call game_start first".to_string())?
+    };
+    let card = {
+        let guard = state.active_game_card.lock().expect("active_game_card mutex");
+        guard.clone().ok_or_else(|| "no active game card".to_string())?
+    };
+
+    // Build the narrator system prompt from the card + current game schema.
+    let world_state = {
+        let s = state.game_schema.lock().await;
+        let rendered = s.render_for_prompt();
+        if rendered.is_empty() { None } else { Some(rendered) }
+    };
+    let system_prompt = narrator_prompt::build_narrator_system_prompt(&card, world_state.as_deref());
+
+    // For the MVP we use a SIMPLE prompt assembly: system + last user turn +
+    // generation cue. The visible-history windowing + memory retrieval that
+    // chat_send does are deliberately deferred — the first playable needs
+    // the narrator to respond at all, and a single-turn exchange is the
+    // minimum verification. TODO: port the sliding window + memory block
+    // from chat_send once the basics are runtime-verified.
+    let prompt = format!(
+        "<|turn>system\n{system_prompt}<turn|>\n\
+         <|turn>user\n{text}<turn|>\n\
+         <|turn>model\n"
+    );
+
+    // Streaming callback wraps the Channel send.
+    let on_chunk: llm::ChunkFn = Arc::new({
+        let on_event = on_event.clone();
+        move |piece: &str| {
+            let _ = on_event.send(serde_json::json!({ "type": "chunk", "text": piece }));
+        }
+    });
+
+    // Post the turn + await the reply off the tokio worker (the game thread
+    // is a bare std::thread; its mpsc::Receiver is blocking).
+    let reply_rx = engine
+        .request_turn(prompt, on_chunk, cancel.clone())
+        .map_err(|e| format!("{e:#}"))?;
+    let reply = tokio::task::spawn_blocking(move || reply_rx.recv())
+        .await
+        .map_err(|e| format!("game reply join: {e}"))?
+        .map_err(|e| format!("game reply channel: {e}"))?;
+
+    // Clear the cancel slot now that the turn is done.
+    {
+        let mut slot = state.active_game_cancel.lock().expect("active_game_cancel mutex");
+        *slot = None;
+    }
+
+    if !reply.error.is_empty() {
+        on_event
+            .send(serde_json::json!({ "type": "error", "message": reply.error }))
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    // Parse bracket commands from the final raw output + emit them as
+    // scene_event messages (one per command). The cleaned prose is emitted
+    // as a final "narration" message so the UI renders it as the dialogue.
+    //
+    // First strip the Gemma4 channel-protocol wrapping (the model emits
+    // `<|channel>thought\n...<channel|>reply` — we only want the reply).
+    // Reuses `schema::extract_reply_channel` (the same rsplit_once helper
+    // the schema engine + chat_format use). Without this the protocol
+    // markers leak into the narrator prose — runtime-discovered during the
+    // 2026-07-18 MVP test.
+    let cleaned_raw = schema::extract_reply_channel(&reply.raw_output);
+    let parsed = bracket_parser::parse(cleaned_raw);
+    for cmd in &parsed.commands {
+        on_event
+            .send(serde_json::json!({ "type": "scene_event", "command": cmd }))
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Archive both turns to the card-scoped memory. Best-effort, detached,
+    // same pattern as chat_send's pillar-2 archive.
+    let card_id = state.active_card_id.lock().expect("active_card_id mutex").clone();
+    if let Some(memory_engine) = state.memory.get() {
+        let memory_engine = Arc::clone(memory_engine);
+        let user_text = text.clone();
+        let asst_text = parsed.prose.clone();
+        tokio::spawn(async move {
+            if let Err(e) = memory_engine
+                .add_memory(user_text, &card_id, memory::Role::User, 1.0)
+                .await
+            {
+                tracing::warn!(error = %format!("{e:#}"), "archive game user turn failed");
+            }
+            if let Err(e) = memory_engine
+                .add_memory(asst_text, &card_id, memory::Role::Assistant, 1.0)
+                .await
+            {
+                tracing::warn!(error = %format!("{e:#}"), "archive game assistant turn failed");
+            }
+        });
+    }
+
+    on_event
+        .send(serde_json::json!({
+            "type": "done",
+            "final_text": parsed.prose,
+            "cancelled": reply.cancelled,
+        }))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Cancel the in-flight narrator turn (parallel to `chat_stop`). Signals
+/// the per-request token; the engine's decode loop checks it between tokens
+/// and breaks cleanly (§2C KV-consistency contract).
+#[tauri::command]
+async fn game_stop(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    tracing::info!("game_stop requested");
+    let slot = state.active_game_cancel.lock().expect("active_game_cancel mutex");
+    if let Some(cancel) = slot.as_ref() {
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// End the game: shut down the GameEngine (frees VRAM), restore the
+/// pre-game `active_card_id`, clear the game schema + active card. After
+/// this, Wupi-assistant chat works exactly as before the game (memory
+/// retrieval + schema delta scope back to the system card).
+#[tauri::command]
+async fn game_end(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    tracing::info!("game_end: shutting down GameEngine");
+
+    // 1. Take the engine out of AppState (so concurrent game_send sees None
+    //    and bails), then shut it down. shutdown() blocks on the JoinHandle
+    //    until VRAM is freed (load-bearing — see GameEngine::shutdown doc).
+    let engine_opt = {
+        let mut guard = state.game_engine.lock().expect("game_engine mutex");
+        guard.take()
+    };
+    if let Some(engine) = engine_opt {
+        tokio::task::spawn_blocking(move || engine.shutdown())
+            .await
+            .map_err(|e| format!("game engine shutdown join: {e}"))?;
+    }
+
+    // 2. Restore the pre-game card id + clear the game-scoped state.
+    {
+        let pre = state.pre_game_card_id.lock().expect("pre_game_card_id mutex").clone();
+        *state.active_card_id.lock().expect("active_card_id mutex") = pre;
+    }
+    *state.game_schema.lock().await = schema::WorldSchema::default();
+    *state.active_game_card.lock().expect("active_game_card mutex") = None;
+
+    // 3. Clear any leftover game cancel token.
+    *state.active_game_cancel.lock().expect("active_game_cancel mutex") = None;
+
+    tracing::info!("game ended — narrator engine down, memory scope restored");
+    Ok(())
+}
+
+/// Resolve the `cards/game_cards/` directory by walking the same candidate
+/// dirs as `resolve_card_path`, joining `"cards/game_cards"`. Returns `None`
+/// if no such dir exists in any candidate location (graceful — the picker
+/// shows empty).
+fn resolve_game_cards_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    use tauri::Manager;
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(d) = app.path().resource_dir().ok() {
+        candidates.push(d.join("cards").join("game_cards"));
+    }
+    if let Some(exe) = std::env::current_exe().ok() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("cards").join("game_cards"));
+            if let Some(grand) = parent.parent().and_then(|g| g.parent()) {
+                candidates.push(grand.join("cards").join("game_cards"));
+            }
+            if let Some(gg) = parent.parent().and_then(|g| g.parent()).and_then(|g| g.parent()) {
+                candidates.push(gg.join("cards").join("game_cards"));
+            }
+        }
+    }
+    if let Some(data) = app.path().app_data_dir().ok() {
+        candidates.push(data.join("cards").join("game_cards"));
+    }
+
+    for dir in &candidates {
+        if dir.is_dir() {
+            tracing::info!("resolved game_cards dir: {}", dir.display());
+            return Some(dir.clone());
+        }
+    }
+    None
+}
+
+/// Find a roleplay card by id within `cards/game_cards/`. Returns an error
+/// string (not a panic) if no card with that id exists.
+fn find_card_by_id(dir: &std::path::Path, target_id: &str) -> Result<sim_card::SimCard, String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("read game_cards/: {e}"))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("sim") {
+            continue;
+        }
+        let card = sim_card::load_or_fallback(&path);
+        if card.id == target_id && card.card_type == "roleplay" {
+            return Ok(card);
+        }
+    }
+    Err(format!("no roleplay card with id '{target_id}' in {}", dir.display()))
 }
 
 /// Persist the session off the Tokio worker pool.

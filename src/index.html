@@ -13,11 +13,11 @@
                 <img src="paw.png" alt="System Menu" class="paw-img" />
             </button>
             <div class="dropdown-menu" id="dropdownMenu">
-                <button class="dropdown-item" id="shutdownBtn">
+                <button class="dropdown-item" id="sleepBtn">
                     <svg class="menu-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M18.36 6.64a9 9 0 1 1-12.73 0M12 2v10" stroke-linecap="round" stroke-linejoin="round"/>
+                        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" stroke-linecap="round" stroke-linejoin="round"/>
                     </svg>
-                    Shut Down
+                    Sleep
                 </button>
                 <button class="dropdown-item" id="restartBtn">
                     <svg class="menu-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -25,11 +25,11 @@
                     </svg>
                     Restart
                 </button>
-                <button class="dropdown-item" id="sleepBtn">
+                <button class="dropdown-item" id="shutdownBtn">
                     <svg class="menu-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" stroke-linecap="round" stroke-linejoin="round"/>
+                        <path d="M18.36 6.64a9 9 0 1 1-12.73 0M12 2v10" stroke-linecap="round" stroke-linejoin="round"/>
                     </svg>
-                    Sleep
+                    Shut Down
                 </button>
                 <div class="dropdown-divider"></div>
                 <button class="dropdown-item" id="themeBtn">
@@ -175,10 +175,10 @@
 
     <div class="dock-trigger-area">
         <div class="dock-container">
-            <!-- Quick-access order (fixed): API → Chat → Profile → Codex. API
-                 is first per Chloe's call. This is NOT alphabetical — the
-                 Docks home grid is alphabetical. -->
-            <div class="dock-item" id="dockApi" aria-label="API">
+            <!-- Quick-access order (fixed): AI → Chat → Profile → Codex. AI is
+                 first per Chloe's call. This is NOT alphabetical — the Docks
+                 home grid is alphabetical. -->
+            <div class="dock-item" id="dockApi" aria-label="AI">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                     <rect x="4" y="8" width="16" height="12" rx="3"></rect>
                     <path d="M12 8V4M9 4h6"></path>
@@ -256,54 +256,96 @@
         </div>
     </div>
 
-    <!-- API — endpoint profiles + main chat source selector. The source radio
-         picks Local (WUPI.gguf 12B) vs API; selecting API unloads the 12B and
-         runs Agent.gguf as the schema/memory engine (chunk 4 swap). -->
-    <div class="app-window modal api draggable" id="api" aria-hidden="true">
+    <!-- AI — connection profile manager. Two large mode boxes (LOCAL vs
+         ONLINE) swap the section below. LOCAL shows the single local model
+         (WUPI.gguf 12B). ONLINE shows saved endpoint profiles + an editor.
+         Selecting ONLINE unloads the 12B and runs Agent.gguf as the
+         schema/memory engine. Temperature is fixed at 1.0 (no UI field). -->
+    <div class="app-window modal api" id="api" aria-hidden="true">
         <div class="app-window-header">
-            <span class="app-window-title">API</span>
+            <span class="app-window-title">Connection Profile</span>
             <button class="app-window-close" data-close="api" aria-label="Close">✕</button>
         </div>
-        <div class="app-window-body api-body">
-            <!-- ── Main chat source ── -->
-            <label class="field-label">Main chat source</label>
-            <div class="api-source-row">
-                <label class="api-radio">
-                    <input type="radio" name="apiSource" value="local" />
-                    <span>WUPI 12B (local)</span>
-                </label>
-                <label class="api-radio">
-                    <input type="radio" name="apiSource" value="api" />
-                    <span>API</span>
-                </label>
+        <div class="app-window-body api-body" id="aiPanel" data-mode="local">
+            <!-- ── Mode selector: LOCAL | ONLINE ── -->
+            <div class="ai-mode-row">
+                <button class="ai-mode-box" data-mode="local" id="aiModeLocal">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="5" y="5" width="14" height="14" rx="2"></rect>
+                        <rect x="9" y="9" width="6" height="6" rx="0.5"></rect>
+                        <path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"></path>
+                    </svg>
+                    <span class="ai-mode-label">LOCAL</span>
+                </button>
+                <button class="ai-mode-box" data-mode="online" id="aiModeOnline">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M17.5 19a4.5 4.5 0 0 0 0-9 6 6 0 0 0-11.6 1.5A4 4 0 0 0 6 19z"></path>
+                        <path d="M8 14v3M12 12v5M16 10v7"></path>
+                    </svg>
+                    <span class="ai-mode-label">ONLINE</span>
+                </button>
             </div>
-            <p class="api-source-hint" id="apiSourceHint"></p>
 
-            <!-- ── Saved profiles ── -->
-            <div class="api-section-divider"></div>
-            <div class="api-profiles-header">
-                <label class="field-label">Endpoint profiles</label>
-                <button id="apiNewBtn" class="field-btn primary api-new-btn">+ New</button>
-            </div>
-            <div class="api-profile-list" id="apiProfileList"></div>
+            <!-- ── LOCAL section ── -->
+            <div class="ai-local-section" id="aiLocalSection">
+                <div class="ai-local-list">
+                    <div class="ai-local-bubble active" id="aiLocalModel">
+                        <span class="ai-local-name">WUPI Gemma 4</span>
+                        <span class="ai-local-size">12B</span>
+                    </div>
+                </div>
+                    <button id="aiLocalConnectBtn" class="ai-connect-btn">Connect</button>
+                </div>
 
-            <!-- ── Editor (hidden until New/Edit) ── -->
-            <div class="api-editor" id="apiEditor" hidden>
-                <label class="field-label">Name</label>
-                <input type="text" id="apiName" class="field-input" placeholder="e.g. Z.AI personal, NanoGPT" />
-                <label class="field-label">Endpoint URL</label>
-                <input type="text" id="apiEndpoint" class="field-input" placeholder="https://api.z.ai/api/coding/paas/v4" />
-                <label class="field-label">Model</label>
-                <input type="text" id="apiModel" class="field-input" placeholder="glm-4.6, gpt-4o-mini, …" />
-                <label class="field-label">API key</label>
-                <input type="password" id="apiKey" class="field-input" placeholder="sk-…" autocomplete="off" />
-                <label class="field-label">Temperature (optional)</label>
-                <input type="number" id="apiTemp" class="field-input" placeholder="0.7" step="0.1" min="0" max="2" />
-                <div class="profile-actions">
+            <!-- ── ONLINE section ── -->
+            <div class="ai-online-section" id="aiOnlineSection">
+                <div class="ai-online-stack">
+                    <!-- PROFILE heading + edit/trash on the far right -->
+                    <div class="ai-profile-header">
+                        <span class="field-label">PROFILE</span>
+                        <div class="ai-profile-tools">
+                            <button id="aiEditProfileBtn" class="ai-tool-btn edit" title="Edit selected profile" disabled>✎</button>
+                            <button id="aiDeleteProfileBtn" class="ai-tool-btn del" title="Delete selected profile" disabled>🗑</button>
+                        </div>
+                    </div>
+
+                    <!-- Profile picker. Placeholder doubles as the "create new"
+                         affordance — selecting it focuses the editor below. -->
+                    <select id="aiProfileSelect" class="field-input ai-select">
+                        <option value="">Create a New Profile</option>
+                    </select>
+
+                    <!-- Model picker: populated from the selected profile's endpoint -->
+                    <label class="field-label">Model</label>
+                    <select id="apiModel" class="field-input ai-select" disabled>
+                        <option value="">Pick a profile to load models…</option>
+                    </select>
+
+                    <!-- Active-state bubble (mirrors the LOCAL 12B bubble). Shows
+                         "Custom Name — model-id" when a profile is connected,
+                         otherwise a muted hint. -->
+                    <div class="ai-online-bubble" id="aiOnlineBubble">
+                        <span class="ai-online-bubble-text">No profile connected</span>
+                    </div>
+
+                    <!-- Connect: the single runtime action. Pink per Chloe's
+                         spec. Disabled until both dropdowns have a selection. -->
+                    <button id="aiConnectBtn" class="ai-connect-btn" disabled>Connect</button>
+                </div>
+
+                <div class="ai-section-divider"></div>
+
+                <!-- Editor: add new / edit existing. No header, no Save/Cancel.
+                     The centered glowing + button at the bottom commits. -->
+                <div class="ai-editor" id="apiEditor">
+                    <label class="field-label">Name</label>
+                    <input type="text" id="apiName" class="field-input" />
+                    <label class="field-label">API URL</label>
+                    <input type="text" id="apiEndpoint" class="field-input" />
+                    <label class="field-label">API key</label>
+                    <input type="password" id="apiKey" class="field-input" autocomplete="off" />
                     <span class="profile-status" id="apiStatus"></span>
-                    <button id="apiTestBtn" class="field-btn">Test</button>
-                    <button id="apiSaveBtn" class="field-btn primary">Save</button>
-                    <button id="apiCancelBtn" class="field-btn">Cancel</button>
+                    <button id="aiAddBtn" class="ai-add-btn" title="Add profile">+</button>
                 </div>
             </div>
         </div>
@@ -344,7 +386,7 @@
     <div class="app-window home" id="apps" aria-hidden="true">
         <button class="app-window-close home-close" data-close="apps" aria-label="Close">✕</button>
         <div class="home-grid">
-            <!-- Alphabetical by label: API, Codex, Games, Profile Editor, WUPI Chat. -->
+            <!-- Alphabetical by label: AI, Codex, Games, Profile Editor, WUPI Chat. -->
             <div class="home-app" data-open="api">
                 <div class="home-app-icon">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -355,7 +397,7 @@
                         <path d="M2 13v4M22 13v4"></path>
                     </svg>
                 </div>
-                <span class="home-app-label">API</span>
+                <span class="home-app-label">AI</span>
             </div>
             <div class="home-app" data-open="codex">
                 <div class="home-app-icon">
