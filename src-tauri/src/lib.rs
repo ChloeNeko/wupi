@@ -135,6 +135,12 @@ pub struct AppState {
     /// under tokio Mutex because `game_send` reads it + Wupi's game-manager
     /// path writes it (via `game_command` deltas).
     pub game_schema: Arc<tokio::sync::Mutex<schema::WorldSchema>>,
+    /// The game's scoped conversation (sibling to `session`, which is
+    /// Wupi-assistant's). Per-card — loaded on `game_start` from
+    /// `sessions/<card_id>.json`, saved on `game_end`. Held under tokio Mutex
+    /// because `game_send` reads + writes it (windowing the narrator prompt +
+    /// appending each turn). Phase 3 per-card persistence (AGENTS.md §2AA).
+    pub game_session: Arc<tokio::sync::Mutex<session::Conversation>>,
     /// The active roleplay card. `None` when no game is running. Set on
     /// `game_start`, cleared on `game_end`. The narrator prompt builder
     /// reads this each `game_send` turn.
@@ -170,6 +176,7 @@ impl AppState {
             game_engine: Arc::new(std::sync::Mutex::new(None)),
             active_game_cancel: Arc::new(std::sync::Mutex::new(None)),
             game_schema: Arc::new(tokio::sync::Mutex::new(schema::WorldSchema::default())),
+            game_session: Arc::new(tokio::sync::Mutex::new(session::Conversation::new())),
             active_game_card: Arc::new(std::sync::Mutex::new(None)),
             pre_game_card_id: Arc::new(std::sync::Mutex::new(memory::WUPI_OS_CARD_ID.to_owned())),
         }
@@ -207,6 +214,11 @@ pub fn run() {
                 .app_data_dir()
                 .expect("app data dir is available");
             std::fs::create_dir_all(&data_dir).ok();
+            // Phase 3 per-card persistence: the sessions/ and schemas/ subdirs
+            // hold `<card_id>.json` files for each roleplay card that's been
+            // played. Created once at boot; cheap no-op if they already exist.
+            std::fs::create_dir_all(data_dir.join("sessions")).ok();
+            std::fs::create_dir_all(data_dir.join("schemas")).ok();
             tracing::info!("app data dir: {}", data_dir.display());
 
             let state: tauri::State<AppState> = app.state();
@@ -531,28 +543,62 @@ pub fn run() {
                     // embedder fallback). Runs synchronously here (setup is
                     // allowed to block — it already blocks on the embedder
                     // readiness channel above).
+                    // ── Phase 2 firewall: two disjoint seeds ──────────────────────
+                    // (1) User-authored codex from `docs/` → CODEX_CARD_ID. The user's
+                    //     blank slate — empty by default, populated only via the
+                    //     codex_* IPC. Pinned to CODEX_CARD_ID (not active_card_id)
+                    //     so editing lore during a game lands in the user's namespace,
+                    //     NOT the active roleplay card (the pre-Phase-2 bug).
+                    // (2) Wupi's non-editable system knowledge from
+                    //     `cards/wupi_knowledge/` → WUPI_SYSTEM_CARD_ID. The firewall:
+                    //     no user IPC writes here; only this boot seed does. Wupi
+                    //     reads it cross-card via search_wupi_visible regardless of
+                    //     which roleplay card is active.
                     if let Some(codex_dir) = resolve_codex_dir(app.handle()) {
                         // Cache the resolved path for the codex_* IPC (file CRUD).
                         let _ = state.codex_dir.set(Some(codex_dir.clone()));
                         if let Some(engine) = state.memory.get() {
                             match tauri::async_runtime::block_on(
-                                codex::seed_codex(engine, &codex_dir, memory::WUPI_OS_CARD_ID),
+                                codex::seed_codex(engine, &codex_dir, memory::CODEX_CARD_ID, "codex"),
                             ) {
                                 Ok(report) => tracing::info!(
                                     seeded = report.seeded,
                                     updated = report.updated,
                                     purged = report.purged,
                                     unchanged = report.unchanged,
-                                    "codex seeded"
+                                    "user codex seeded"
                                 ),
                                 Err(e) => tracing::warn!(
                                     error = %format!("{e:#}"),
-                                    "codex seed failed; continuing without authored lore"
+                                    "user codex seed failed; continuing without authored lore"
                                 ),
                             }
                         }
                     } else {
-                        tracing::info!("no docs/ dir found; skipping codex seed");
+                        tracing::info!("no docs/ dir found; skipping user codex seed");
+                    }
+
+                    // Wupi-system seed — her own OS docs (the firewall's read-only side).
+                    if let Some(wupi_knowledge_dir) = resolve_wupi_knowledge_dir(app.handle()) {
+                        if let Some(engine) = state.memory.get() {
+                            match tauri::async_runtime::block_on(
+                                codex::seed_codex(engine, &wupi_knowledge_dir, memory::WUPI_SYSTEM_CARD_ID, "wupi_system"),
+                            ) {
+                                Ok(report) => tracing::info!(
+                                    seeded = report.seeded,
+                                    updated = report.updated,
+                                    purged = report.purged,
+                                    unchanged = report.unchanged,
+                                    "wupi system knowledge seeded"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    error = %format!("{e:#}"),
+                                    "wupi system knowledge seed failed; continuing"
+                                ),
+                            }
+                        }
+                    } else {
+                        tracing::info!("no cards/wupi_knowledge/ dir found; skipping system knowledge seed");
                     }
                 }
                 Err(e) => {
@@ -933,6 +979,45 @@ fn resolve_codex_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     None
 }
 
+/// Resolve the `cards/wupi_knowledge/` directory — the home of Wupi's non-
+/// editable system knowledge (the Phase 2 firewall's read-only seed source).
+///
+/// Mirrors [`resolve_codex_dir`]: same 5-candidate walk (resource_dir, exe
+/// parent/grandparent/great-grandparent, app_data_dir), but joins
+/// `cards/wupi_knowledge`. Returns `None` if no such dir exists (graceful —
+/// the system knowledge is optional; the seed loader treats a missing dir as
+/// "nothing to seed"). The path sits alongside `cards/Wupi.sim` and
+/// `cards/game_cards/` — all three are bundled tracked text assets, not
+/// user-writable state.
+fn resolve_wupi_knowledge_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(d) = app.path().resource_dir().ok() {
+        candidates.push(d.join("cards").join("wupi_knowledge"));
+    }
+    if let Some(exe) = std::env::current_exe().ok() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("cards").join("wupi_knowledge"));
+            if let Some(grand) = parent.parent().and_then(|g| g.parent()) {
+                candidates.push(grand.join("cards").join("wupi_knowledge"));
+            }
+            if let Some(gg) = parent.parent().and_then(|g| g.parent()).and_then(|g| g.parent()) {
+                candidates.push(gg.join("cards").join("wupi_knowledge"));
+            }
+        }
+    }
+    if let Some(data) = app.path().app_data_dir().ok() {
+        candidates.push(data.join("cards").join("wupi_knowledge"));
+    }
+
+    for dir in &candidates {
+        if dir.is_dir() {
+            tracing::info!("resolved wupi_knowledge dir: {}", dir.display());
+            return Some(dir.clone());
+        }
+    }
+    None
+}
+
 // ── Phase E helpers (Wupi-as-game-manager routing, 2026-07-18) ──────────────
 // Three small functions: game_is_active checks whether a GameEngine is
 // running; route_to_game_manager handles the MutateWorldState intent
@@ -1231,7 +1316,12 @@ async fn chat_send(
             .expect("active_card_id mutex")
             .clone();
         match state.memory.get() {
-            Some(engine) => match engine.search(&text, &card_id, 5, None).await {
+            // Phase 2 firewall: Wupi-as-assistant retrieves from BOTH the
+            // active card AND her reserved system-knowledge partition
+            // (WUPI_SYSTEM_CARD_ID) via search_wupi_visible. She always knows
+            // her own OS docs regardless of which card is active. Roleplay
+            // cards never see each other — only system knowledge leaks through.
+            Some(engine) => match engine.search_wupi_visible(&text, &card_id, 5, None).await {
                 Ok(hits) if !hits.is_empty() => Some(memory::render_memory_block(&hits)),
                 Ok(_) => None,
                 Err(e) => {
@@ -1744,9 +1834,12 @@ async fn codex_save(
         .map_err(|e| format!("codex save join: {e}"))?
         .map_err(|e| format!("{e:#}"))?;
     // Re-seed so the retrieval index reflects the edit without a reboot.
+    // Pinned to CODEX_CARD_ID (NOT active_card_id) — Phase 2 firewall fix:
+    // pre-fix this read active_card_id, so editing lore DURING a game wrote
+    // it into the active roleplay card's partition. User lore always lands in
+    // the user's namespace regardless of what game is running.
     if let (Some(engine), Some(dir)) = (state.memory.get(), state.codex_dir.get().and_then(|o| o.as_ref())) {
-        let card_id = state.active_card_id.lock().expect("active_card_id mutex").clone();
-        let _ = codex::seed_codex(engine, dir, &card_id).await;
+        let _ = codex::seed_codex(engine, dir, memory::CODEX_CARD_ID, "codex").await;
     }
     Ok(saved_name)
 }
@@ -1766,9 +1859,9 @@ async fn codex_delete(
         .await
         .map_err(|e| format!("codex delete join: {e}"))?
         .map_err(|e| format!("{e:#}"))?;
+    // Same CODEX_CARD_ID pin as codex_save (Phase 2 firewall).
     if let (Some(engine), Some(dir)) = (state.memory.get(), state.codex_dir.get().and_then(|o| o.as_ref())) {
-        let card_id = state.active_card_id.lock().expect("active_card_id mutex").clone();
-        let _ = codex::seed_codex(engine, dir, &card_id).await;
+        let _ = codex::seed_codex(engine, dir, memory::CODEX_CARD_ID, "codex").await;
     }
     Ok(())
 }
@@ -2428,17 +2521,28 @@ async fn game_start(
     // 5. Swap active_card_id + save the pre-game value for restoration.
     //    This scopes all memory retrieval + archiving to the roleplay card
     //    automatically (§2M — already wired through chat_send + the debug
-    //    panel). Schema is reset to empty (fresh scene).
+    //    panel). Phase 3: instead of zeroing the schema/session, LOAD any
+    //    prior per-card state from disk so a game resumes where it left off.
+    //    First launch of a card → NotFound → default/empty (the loaders handle
+    //    this gracefully).
     {
         let mut pre = state.pre_game_card_id.lock().expect("pre_game_card_id mutex");
         let mut active = state.active_card_id.lock().expect("active_card_id mutex");
         *pre = active.clone();
         *active = card.id.clone();
     }
-    *state.game_schema.lock().await = schema::WorldSchema::default();
+    // Load prior per-card state. Both fall back to default/empty when no save
+    // exists (the loaders' NotFound path returns Default::default()). This is
+    // what makes games resumable across reboots.
+    let prior_schema = load_schema(&app, &card.id).await
+        .unwrap_or_else(schema::WorldSchema::default);
+    let prior_session = load_session(&app, &card.id).await
+        .unwrap_or_else(session::Conversation::new);
+    *state.game_schema.lock().await = prior_schema;
+    *state.game_session.lock().await = prior_session;
     *state.active_game_card.lock().expect("active_game_card mutex") = Some(card);
 
-    tracing::info!("game started — narrator engine live, memory scoped to card");
+    tracing::info!("game started — narrator engine live, memory scoped to card, per-card state loaded");
     let _ = context_size; // referenced for future n_ctx tuning; unused today
     Ok(())
 }
@@ -2484,17 +2588,47 @@ async fn game_send(
     };
     let system_prompt = narrator_prompt::build_narrator_system_prompt(&card, world_state.as_deref());
 
-    // For the MVP we use a SIMPLE prompt assembly: system + last user turn +
-    // generation cue. The visible-history windowing + memory retrieval that
-    // chat_send does are deliberately deferred — the first playable needs
-    // the narrator to respond at all, and a single-turn exchange is the
-    // minimum verification. TODO: port the sliding window + memory block
-    // from chat_send once the basics are runtime-verified.
-    let prompt = format!(
-        "<|turn>system\n{system_prompt}<turn|>\n\
-         <|turn>user\n{text}<turn|>\n\
-         <|turn>model\n"
-    );
+    // Phase 3: append the user turn to the per-card game conversation BEFORE
+    // building the prompt, then window the visible history. Mirrors chat_send's
+    // 4-message sliding window (§2I M2): old turns are evicted from the prompt
+    // (memory backfills via retrieval) and the prompt stays small (~5KB not
+    // ~80KB). The full conversation is persisted on game_end so games resume.
+    const GAME_VISIBLE_WINDOW: usize = 8; // narrator turns are shorter; allow more context than chat's 4
+    {
+        let mut gs = state.game_session.lock().await;
+        gs.add_message(session::Role::User, text.clone());
+    }
+
+    // Build a windowed prompt: system + last GAME_VISIBLE_WINDOW messages +
+    // generation cue. Same Gemma4 `<|turn>` protocol the chat path uses
+    // (assistant → "model"). We render inline (no ChatFormat trait dependency)
+    // because the narrator prompt is a single-shot prefill into the GameEngine
+    // (no KV-cache reuse across turns — the GameEngine clears KV every turn,
+    // see game_engine.rs:375). So cache-coherent re-render from raw_output
+    // isn't required here; cleaned content is fine.
+    let window: Vec<session::Message> = {
+        let gs = state.game_session.lock().await;
+        let msgs = &gs.messages;
+        let start = msgs.len().saturating_sub(GAME_VISIBLE_WINDOW);
+        msgs[start..].to_vec()
+    };
+    let mut prompt = String::with_capacity(4096);
+    prompt.push_str("<|turn>system\n");
+    prompt.push_str(system_prompt.trim());
+    prompt.push_str("<turn|>\n");
+    for m in &window {
+        let role = match m.role {
+            session::Role::Assistant => "model",
+            session::Role::User => "user",
+            session::Role::System => "system",
+        };
+        prompt.push_str("<|turn>");
+        prompt.push_str(role);
+        prompt.push('\n');
+        prompt.push_str(&m.content);
+        prompt.push_str("<turn|>\n");
+    }
+    prompt.push_str("<|turn>model\n");
 
     // Streaming callback wraps the Channel send.
     let on_chunk: llm::ChunkFn = Arc::new({
@@ -2568,6 +2702,17 @@ async fn game_send(
         });
     }
 
+    // Phase 3: append the assistant turn to the per-card game conversation so
+    // the next turn's windowed prompt includes it. We store the CLEANED prose
+    // (parsed.prose) — the GameEngine clears its KV cache every turn (no delta-
+    // prefill), so cache-coherent raw_output re-render isn't required here
+    // (unlike the chat path's Bug #3 fix). The reasoning channel is empty for
+    // narrator turns (the bracket parser doesn't extract a thought channel).
+    {
+        let mut gs = state.game_session.lock().await;
+        gs.add_assistant_turn(parsed.prose.clone(), String::new(), reply.raw_output.clone());
+    }
+
     on_event
         .send(serde_json::json!({
             "type": "done",
@@ -2591,12 +2736,16 @@ async fn game_stop(state: tauri::State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
-/// End the game: shut down the GameEngine (frees VRAM), restore the
-/// pre-game `active_card_id`, clear the game schema + active card. After
-/// this, Wupi-assistant chat works exactly as before the game (memory
-/// retrieval + schema delta scope back to the system card).
+/// End the game: shut down the GameEngine (frees VRAM), persist the per-card
+/// session + schema (Phase 3 — resumable across reboots), restore the
+/// pre-game `active_card_id`, clear the game state. After this, Wupi-assistant
+/// chat works exactly as before the game (memory retrieval + schema delta
+/// scope back to the system card).
 #[tauri::command]
-async fn game_end(state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn game_end(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
     tracing::info!("game_end: shutting down GameEngine");
 
     // 1. Take the engine out of AppState (so concurrent game_send sees None
@@ -2612,18 +2761,34 @@ async fn game_end(state: tauri::State<'_, AppState>) -> Result<(), String> {
             .map_err(|e| format!("game engine shutdown join: {e}"))?;
     }
 
-    // 2. Restore the pre-game card id + clear the game-scoped state.
+    // 2. Phase 3 per-card persistence — capture the roleplay card id BEFORE
+    //    the restore (step 3 swaps active_card_id back to the system value),
+    //    then save the session + schema under the roleplay id. Both saves are
+    //    best-effort: a failure logs a warning but doesn't block game_end
+    //    (the in-memory state is cleared regardless; the user just loses the
+    //    resume point on a disk error, not the running game).
+    let roleplay_card_id = state.active_card_id.lock().expect("active_card_id mutex").clone();
+    if roleplay_card_id != memory::WUPI_OS_CARD_ID {
+        let schema_snapshot = state.game_schema.lock().await.clone();
+        let session_snapshot = state.game_session.lock().await.clone();
+        save_schema(&app, &roleplay_card_id, &schema_snapshot).await;
+        save_session(&app, &roleplay_card_id, &session_snapshot).await;
+        tracing::info!(card_id = %roleplay_card_id, "per-card state saved");
+    }
+
+    // 3. Restore the pre-game card id + clear the game-scoped state.
     {
         let pre = state.pre_game_card_id.lock().expect("pre_game_card_id mutex").clone();
         *state.active_card_id.lock().expect("active_card_id mutex") = pre;
     }
     *state.game_schema.lock().await = schema::WorldSchema::default();
+    *state.game_session.lock().await = session::Conversation::new();
     *state.active_game_card.lock().expect("active_game_card mutex") = None;
 
-    // 3. Clear any leftover game cancel token.
+    // 4. Clear any leftover game cancel token.
     *state.active_game_cancel.lock().expect("active_game_cancel mutex") = None;
 
-    tracing::info!("game ended — narrator engine down, memory scope restored");
+    tracing::info!("game ended — narrator engine down, per-card state persisted, memory scope restored");
     Ok(())
 }
 
@@ -2694,17 +2859,20 @@ fn find_card_by_id(dir: &std::path::Path, target_id: &str) -> Result<sim_card::S
 /// — that's correct for a `tokio::sync::Mutex` (its guard is await-safe) and
 /// serializes concurrent saves, which we want anyway.
 ///
-/// UNUSED since 2026-07-14 (ephemeral sessions). Retained for the future
-/// character/simulation card system, which will re-introduce SCOPED
-/// persistence (a card carries its own resumable session). The atomic-save
-/// machinery is tested infrastructure — don't rebuild it when cards land.
-#[allow(dead_code)]
-async fn save_session(app: &tauri::AppHandle, conv: &session::Conversation) {
+/// **Phase 3 per-card persistence (AGENTS.md §2AA):** now scoped by `card_id`
+/// → `sessions/<card_id>.json`. The Wupi-assistant session stays ephemeral
+/// (§2K); only roleplay game sessions persist (a card carries its own
+/// resumable session). The atomic-save machinery is reused as-is.
+async fn save_session(
+    app: &tauri::AppHandle,
+    card_id: &str,
+    conv: &session::Conversation,
+) {
     use tauri::Manager;
     let Some(data_dir) = app.path().app_data_dir().ok() else {
         return;
     };
-    let path = data_dir.join("session.json");
+    let path = resolve_session_path(&data_dir, card_id);
     // Clone so the closure owns its data (spawn_blocking needs 'static). The
     // Conversation is a Vec of small messages — cheap to clone relative to a
     // disk fsync.
@@ -2717,19 +2885,39 @@ async fn save_session(app: &tauri::AppHandle, conv: &session::Conversation) {
     .await;
 }
 
+/// Load a card-scoped session. Returns a fresh empty `Conversation` when no
+/// saved file exists (the `Conversation::load` NotFound path already does
+/// this — we just route through it). Symmetric to `save_session`.
+async fn load_session(
+    app: &tauri::AppHandle,
+    card_id: &str,
+) -> Option<session::Conversation> {
+    use tauri::Manager;
+    let data_dir = app.path().app_data_dir().ok()?;
+    let path = resolve_session_path(&data_dir, card_id);
+    let path_cloned = path.clone();
+    tokio::task::spawn_blocking(move || session::Conversation::load(&path_cloned))
+        .await
+        .ok()?
+        .ok()
+}
+
 /// Persist the world-state schema off the Tokio worker pool. Mirrors
 /// `save_session`: `WorldSchema::save` is atomic (temp + fsync + rename) but
 /// synchronous, so `spawn_blocking` keeps the async runtime free.
 ///
-/// UNUSED since 2026-07-14 (ephemeral schema). Retained for the future
-/// character/simulation card system alongside `save_session`.
-#[allow(dead_code)]
-async fn save_schema(app: &tauri::AppHandle, schema: &schema::WorldSchema) {
+/// **Phase 3:** now scoped by `card_id` → `schemas/<card_id>.json`. Only the
+/// active game's schema persists (Wupi-assistant's schema stays ephemeral).
+async fn save_schema(
+    app: &tauri::AppHandle,
+    card_id: &str,
+    schema: &schema::WorldSchema,
+) {
     use tauri::Manager;
     let Some(data_dir) = app.path().app_data_dir().ok() else {
         return;
     };
-    let path = data_dir.join("world_schema.json");
+    let path = resolve_schema_path(&data_dir, card_id);
     let schema = schema.clone();
     let _ = tokio::task::spawn_blocking(move || {
         if let Err(e) = schema.save(&path) {
@@ -2737,4 +2925,35 @@ async fn save_schema(app: &tauri::AppHandle, schema: &schema::WorldSchema) {
         }
     })
     .await;
+}
+
+/// Load a card-scoped world schema. Returns a fresh default `WorldSchema`
+/// when no saved file exists (the `WorldSchema::load` NotFound path already
+/// does this). Symmetric to `save_schema`.
+async fn load_schema(
+    app: &tauri::AppHandle,
+    card_id: &str,
+) -> Option<schema::WorldSchema> {
+    use tauri::Manager;
+    let data_dir = app.path().app_data_dir().ok()?;
+    let path = resolve_schema_path(&data_dir, card_id);
+    let path_cloned = path.clone();
+    tokio::task::spawn_blocking(move || schema::WorldSchema::load(&path_cloned))
+        .await
+        .ok()?
+        .ok()
+}
+
+/// `<data_dir>/sessions/<card_id>.json`. The `sessions/` subdir is created
+/// once in `setup()` (extends the existing `create_dir_all(&data_dir)`). The
+/// card_id is the filename stem — roleplay card ids are filesystem-safe
+/// (lowercased, derived from `<metadata><id>` in `sim_card.rs`).
+fn resolve_session_path(data_dir: &std::path::Path, card_id: &str) -> std::path::PathBuf {
+    data_dir.join("sessions").join(format!("{card_id}.json"))
+}
+
+/// `<data_dir>/schemas/<card_id>.json`. Sibling to `resolve_session_path`;
+/// same subdir convention + filesystem-safety assumption.
+fn resolve_schema_path(data_dir: &std::path::Path, card_id: &str) -> std::path::PathBuf {
+    data_dir.join("schemas").join(format!("{card_id}.json"))
 }

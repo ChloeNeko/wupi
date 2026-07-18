@@ -76,10 +76,20 @@ struct ParsedEntry {
 /// error). A parse failure on one file → logs a warning and skips that file;
 /// the rest still seed. Only a systemic failure (e.g. the DB list call dies)
 /// returns `Err`.
+///
+/// **Phase 2 firewall:** `namespace` tags the seeded entries so callers can
+/// distinguish user-authored codex (`"codex"`) from Wupi's non-editable system
+/// knowledge (`"wupi_system"`). Both reuse the `kind=codex` discriminator
+/// downstream (so the per-class floor + render frame apply automatically); the
+/// `namespace` field is for future filtering and the audit log. The two seed
+/// paths (user codex from `docs/`, Wupi-system from `cards/wupi_knowledge/`)
+/// write to disjoint `card_id` partitions — see `CODEX_CARD_ID` and
+/// `WUPI_SYSTEM_CARD_ID` in `memory.rs`.
 pub async fn seed_codex(
     engine: &MemoryEngine<impl Embedder>,
     codex_dir: &Path,
     card_id: &str,
+    namespace: &str,
 ) -> anyhow::Result<ReconcileReport> {
     let mut report = ReconcileReport::default();
 
@@ -91,6 +101,7 @@ pub async fn seed_codex(
             tracing::warn!(
                 dir = %codex_dir.display(),
                 error = %format!("{e}"),
+                namespace,
                 "codex dir unreadable or missing; skipping seed"
             );
             return Ok(report);
@@ -98,7 +109,7 @@ pub async fn seed_codex(
     };
 
     if sources.is_empty() {
-        tracing::info!(dir = %codex_dir.display(), "codex dir empty; nothing to seed");
+        tracing::info!(dir = %codex_dir.display(), namespace, "codex dir empty; nothing to seed");
         return Ok(report);
     }
 
@@ -140,7 +151,7 @@ pub async fn seed_codex(
                         continue;
                     }
                 }
-                match insert_entry(engine, src, card_id).await {
+                match insert_entry(engine, src, card_id, namespace).await {
                     Ok(()) => {
                         report.updated += 1;
                         consumed.insert(&src.title);
@@ -152,7 +163,7 @@ pub async fn seed_codex(
             }
             None => {
                 // New — insert.
-                match insert_entry(engine, src, card_id).await {
+                match insert_entry(engine, src, card_id, namespace).await {
                     Ok(()) => {
                         report.seeded += 1;
                         consumed.insert(&src.title);
@@ -181,11 +192,13 @@ pub async fn seed_codex(
 
 /// Insert one parsed entry via `add_codex_entry`, building its `metadata_json`.
 /// Salience is flat 1.0 (matches episodic; salience weighting is deferred per
-/// §2N landmine #4).
+/// §2N landmine #4). `namespace` flows into the metadata so the entry's origin
+/// (user codex vs Wupi-system) is queryable for future filtering.
 async fn insert_entry(
     engine: &MemoryEngine<impl Embedder>,
     src: &ParsedEntry,
     card_id: &str,
+    namespace: &str,
 ) -> anyhow::Result<()> {
     // Body-length guard: warn (don't reject) when the body exceeds the
     // ~350-token heuristic budget. The entry still seeds — the operator sees
@@ -200,7 +213,7 @@ async fn insert_entry(
         );
     }
 
-    let metadata = build_metadata_json(&src.title, &src.tags, src.hash);
+    let metadata = build_metadata_json(&src.title, &src.tags, src.hash, namespace);
     engine
         .add_codex_entry(src.body.clone(), card_id, 1.0, metadata)
         .await
@@ -441,16 +454,23 @@ fn parse_front_matter(front: Option<&str>, fallback_stem: &str) -> (String, Vec<
 /// Build the `metadata_json` string for a Codex entry. Hand-rolled JSON
 /// construction (the structure is fixed and small; a serde round-trip would be
 /// overkill). All values are JSON-escaped via `escape_json_string`.
-fn build_metadata_json(title: &str, tags: &[String], hash: u64) -> String {
+fn build_metadata_json(title: &str, tags: &[String], hash: u64, namespace: &str) -> String {
     let title_escaped = escape_json_string(title);
     let tags_array = tags
         .iter()
         .map(|t| format!("\"{}\"", escape_json_string(t)))
         .collect::<Vec<_>>()
         .join(",");
+    // `kind=codex` is the downstream discriminator (is_codex / codex floor /
+    // render frame). `namespace` is the origin tag — "codex" for user-authored
+    // lore, "wupi_system" for Wupi's non-editable system docs. Both reuse the
+    // same retrieval/render pipeline; namespace is for future filtering + audit.
     format!(
-        "{{\"kind\":\"codex\",\"title\":\"{}\",\"tags\":[{}],\"hash\":\"{}\"}}",
-        title_escaped, tags_array, hash
+        "{{\"kind\":\"codex\",\"namespace\":\"{}\",\"title\":\"{}\",\"tags\":[{}],\"hash\":\"{}\"}}",
+        escape_json_string(namespace),
+        title_escaped,
+        tags_array,
+        hash
     )
 }
 
@@ -549,18 +569,30 @@ mod tests {
     #[test]
     fn build_metadata_json_round_trips_through_extract() {
         let tags = vec!["a".to_owned(), "b".to_owned()];
-        let json = build_metadata_json("My Title", &tags, 12345);
+        let json = build_metadata_json("My Title", &tags, 12345, "codex");
         assert_eq!(extract_metadata_field(Some(&json), "title"), Some("My Title".to_owned()));
         assert_eq!(extract_metadata_field(Some(&json), "hash"), Some("12345".to_owned()));
         assert!(json.contains("\"kind\":\"codex\""));
+        assert!(json.contains("\"namespace\":\"codex\""));
         assert!(json.contains("\"tags\":[\"a\",\"b\"]"));
     }
 
     #[test]
     fn build_metadata_json_escapes_quotes_in_title() {
-        let json = build_metadata_json("He said \"hi\"", &[], 1);
+        let json = build_metadata_json("He said \"hi\"", &[], 1, "codex");
         assert!(json.contains("\"title\":\"He said \\\"hi\\\"\""));
         assert_eq!(extract_metadata_field(Some(&json), "title"), Some("He said \"hi\"".to_owned()));
+    }
+
+    #[test]
+    fn build_metadata_json_tags_wupi_system_namespace() {
+        // The firewall's distinguishing field: Wupi-system docs carry the same
+        // kind=codex (so the floor + render frame apply) but a different
+        // namespace (for future filtering / audit).
+        let json = build_metadata_json("Critical Wall", &[], 42, "wupi_system");
+        assert!(json.contains("\"kind\":\"codex\""));
+        assert!(json.contains("\"namespace\":\"wupi_system\""));
+        assert_eq!(extract_metadata_field(Some(&json), "namespace"), Some("wupi_system".to_owned()));
     }
 
     #[test]

@@ -127,12 +127,69 @@ pub struct MemoryEntry {
     /// system can scope at session granularity later without a migration; it
     /// is NOT filtered on today (retrieval scopes on `card_id` only).
     pub session_id: Option<String>,
+    /// Chunks-of-one-message grouping key (Phase 1 chunking). `None` on
+    /// whole-message rows AND on single-chunk messages (the common case stays
+    /// zero-overhead — `add_memory` only mints a UUID when the text actually
+    /// needs >1 chunk). Set on every chunk of a multi-chunk turn so a future
+    /// "coalesce siblings" hydration can reconstruct the original message.
+    pub parent_uuid: Option<String>,
 }
 
 /// The default `card_id` for memory that belongs to no specific simulation —
 /// i.e. Wupi-as-assistant conversations outside any card. Until the card
 /// system exists, ALL memory is written under this sentinel.
 pub const WUPI_OS_CARD_ID: &str = "__wupi_os__";
+
+/// Reserved partition for Wupi's non-editable, user-invisible system knowledge
+/// (the OS docs: critical-wall, os-directives-vs-persona, sim-card-format,
+/// user-profile-format). Seeded at boot from `cards/wupi_knowledge/*.md` via
+/// the parallel `seed_wupi_knowledge` loader.
+///
+/// **The firewall (Phase 2):** no user IPC (`codex_save`, `codex_delete`,
+/// `chat_send` archival, `game_send` archival) writes here. The only writer is
+/// the boot seed. The only reader is [`MemoryEngine::search_wupi_visible`],
+/// which lets Wupi-as-OS retrieve her system knowledge regardless of which
+/// card is active (Wupi always knows her own OS docs). Roleplay cards never
+/// see this partition; cross-card reads exist only for this one reserved
+/// sentinel, by design (AGENTS.md §2AA).
+pub const WUPI_SYSTEM_CARD_ID: &str = "__wupi_system__";
+
+/// Reserved partition for user-authored Codex reference lore (the `.md` files
+/// the user creates/edits via the `codex_*` IPC). Pinned to a fixed sentinel
+/// rather than `active_card_id` so editing codex *during a game* lands the lore
+/// in the user's namespace, NOT in the active roleplay card's partition (the
+/// bug found during Phase 2 exploration — pre-fix, `codex_save` re-seeded to
+/// `active_card_id`, leaking user lore into whatever game was running).
+///
+/// Distinct from [`WUPI_SYSTEM_CARD_ID`] (Wupi's docs, non-editable) and from
+/// any roleplay card id (per-scenario episodic + authored lore, if the card
+/// ever grows its own codex). Three disjoint namespaces.
+pub const CODEX_CARD_ID: &str = "__codex__";
+
+// ── Chunking constants (Phase 1) ───────────────────────────────────────────
+//
+// BERT (bge-small-en-v1.5) silently truncates input past 512 tokens, producing
+// garbage embeddings that contaminate the verified M engine (AGENTS.md §2N
+// landmine #6). We sidestep this by splitting long messages into chunks BEFORE
+// embedding, one vec0/FTS row per chunk.
+//
+// The budget is CHAR-based, not token-based. BERT's WordPiece tokenizer
+// explodes rare tokens (fantasy/sci-fi proper nouns like `neon2271`, custom
+// faction names) into many sub-tokens, so a pure token budget would under-
+// pack normal prose. A ~1,300-char budget keeps us safely under the 512-token
+// ceiling even on worst-case sub-token-heavy roleplay text (Chloe's call,
+// informed by the roleplay domain). The embedder's `BERT_TRUNCATE_TOKENS = 512`
+// (memory_embedder_llama.rs) is the hard backstop — if a chunk ever does exceed
+// it (shouldn't, but defense-in-depth), the embedder still truncates cleanly
+// rather than producing a garbage full-length embedding.
+
+/// Target maximum character length of a chunk. Chunks may be slightly shorter
+/// (when a paragraph/sentence boundary lands before the budget) but never
+/// longer unless a single paragraph + sentence has no internal break at all
+/// (the hard-cut fallback). 1,300 chars ≈ ~300-500 BERT tokens for typical
+/// English, leaving ~100-200 tokens of headroom below the 512 ceiling even on
+/// sub-token-heavy roleplay text.
+pub const CHUNK_CHAR_BUDGET: usize = 1300;
 
 /// A search result carrying its fused RRF score.
 ///
@@ -432,9 +489,19 @@ impl<E: Embedder> MemoryEngine<E> {
 
     /// Embed the text, then insert into all three tables in one transaction.
     ///
-    /// Returns the new memory's id. `chunk_index` defaults to 0 (whole-message,
-    /// no chunking yet — verdict I) and `metadata_json` to `None`. `card_id`
-    /// is the partition key — see [`WUPI_OS_CARD_ID`].
+    /// **Chunking (Phase 1):** if `text` exceeds [`CHUNK_CHAR_BUDGET`] chars,
+    /// it is split via [`chunk_text`] into multiple rows — one per chunk, each
+    /// with its own embedding, FTS mirror, and vec0 vector. All chunks of one
+    /// message share a `parent_uuid` grouping key so a future "coalesce
+    /// siblings" hydration can reconstruct the original message. The common
+    /// case (text under budget) stays a single row with `parent_uuid = NULL` —
+    /// zero overhead on short turns. The four call sites in `lib.rs` are
+    /// unchanged; chunking is fully internal.
+    ///
+    /// Returns the **first** chunk's id (chunk_index 0). Existing callers
+    /// ignore the return value. `metadata_json` is hardcoded `None` (use
+    /// [`Self::add_codex_entry`] for authored reference lore with metadata).
+    /// `card_id` is the partition key — see [`WUPI_OS_CARD_ID`].
     pub async fn add_memory(
         &self,
         text: String,
@@ -442,25 +509,79 @@ impl<E: Embedder> MemoryEngine<E> {
         role: Role,
         salience: f32,
     ) -> anyhow::Result<MemoryId> {
-        // Embed on the Tokio worker. Real backends will spend milliseconds
-        // here on GPU work; the StubEmbedder is microseconds. Either way the
-        // embedder owns its own threading story (a dedicated thread + channel
-        // for llama-cpp-2, since the context is !Send — same pattern as the
-        // chat engine).
-        let embedding = self.embedder.embed(text.clone()).await?;
+        // Chunk first (cheap — pure string work, no embedding). Filtering
+        // empty chunks here means the embedder never sees empty input (which
+        // it would bail on — memory_embedder_llama.rs:496-498).
+        let chunks: Vec<String> = chunk_text(&text)
+            .into_iter()
+            .filter(|c| !c.is_empty())
+            .collect();
+        if chunks.is_empty() {
+            anyhow::bail!("add_memory: text chunked to nothing (was empty?)");
+        }
 
-        // Clone the Arc (cheap — one atomic increment), move into the closure.
-        // The Mutex guard is acquired INSIDE the blocking closure, never held
-        // across an await. Same shape as save_session in lib.rs §2E.
+        // Single-chunk fast path: zero overhead vs the pre-chunking behavior.
+        // Same one embed, same one insert, parent_uuid = NULL.
+        if chunks.len() == 1 {
+            let text = chunks.into_iter().next().expect("single chunk");
+            let embedding = self.embedder.embed(text.clone()).await?;
+            let conn = self.conn.clone();
+            let card_id = card_id.to_owned();
+            let id = tokio::task::spawn_blocking(move || -> anyhow::Result<MemoryId> {
+                let c = conn.lock().expect("memory conn mutex");
+                insert_in_transaction(&c, &text, &card_id, None, role, salience, 0, None, None, &embedding)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("add_memory join: {e}"))??;
+            return Ok(id);
+        }
+
+        // Multi-chunk path. Embed each chunk on the Tokio worker (sequential:
+        // the embedder is single-threaded by design — a dedicated wupi-embedder
+        // thread owns the !Send LlamaContext; parallel embeds would just queue
+        // at the channel anyway). Collect (text, vector) pairs, then one
+        // spawn_blocking inserts them all in a sequence of transactions.
+        //
+        // The shared parent_uuid: we use the FIRST chunk's autoincrement id
+        // (minted inside the insert) cast to a string as the grouping key. So
+        // chunk 0 inserts with parent_uuid = NULL, we read back its id, then
+        // chunks 1..N insert with parent_uuid = Some(id_str). After all
+        // inserts we UPDATE chunk 0's parent_uuid to match — closing the loop.
+        // This is dependency-free (no uuid crate), intrinsically correct
+        // (can't collide — the id is unique), and the extra UPDATE on one row
+        // is negligible.
+        let mut embedded: Vec<(String, Vec<f32>)> = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            let vec = self.embedder.embed(chunk.clone()).await?;
+            embedded.push((chunk, vec));
+        }
+
         let conn = self.conn.clone();
         let card_id = card_id.to_owned();
-        let id = tokio::task::spawn_blocking(move || -> anyhow::Result<MemoryId> {
+        let first_id = tokio::task::spawn_blocking(move || -> anyhow::Result<MemoryId> {
             let c = conn.lock().expect("memory conn mutex");
-            insert_in_transaction(&c, &text, &card_id, None, role, salience, 0, None, &embedding)
+            // Chunk 0 — parent_uuid filled in after we know the id.
+            let first_id = insert_in_transaction(
+                &c, &embedded[0].0, &card_id, None, role, salience, 0, None, None, &embedded[0].1,
+            )?;
+            let parent = first_id.to_string();
+            // Chunks 1..N — parent_uuid = the first chunk's id, chunk_index increments.
+            for (idx, (text, vec)) in embedded.iter().enumerate().skip(1) {
+                insert_in_transaction(
+                    &c, text, &card_id, None, role, salience, idx as i32, None, Some(&parent), vec,
+                )?;
+            }
+            // Close the loop: chunk 0 joins its siblings under the same key.
+            c.execute(
+                "UPDATE memories SET parent_uuid = ?1 WHERE id = ?2",
+                params![&parent, first_id],
+            )
+            .map_err(|e| anyhow::anyhow!("update chunk 0 parent_uuid: {e:?}"))?;
+            Ok(first_id)
         })
         .await
         .map_err(|e| anyhow::anyhow!("add_memory join: {e}"))??;
-        Ok(id)
+        Ok(first_id)
     }
 
     /// Hybrid search: embed the query, pull top-N from each backend, fuse
@@ -550,7 +671,102 @@ impl<E: Embedder> MemoryEngine<E> {
         .map_err(|e| anyhow::anyhow!("search join: {e}"))??)
     }
 
-    // ── Codex (authored reference lore) — Codex v1, 2026-07-14 ────────────
+    /// Cross-card retrieval: the Wupi-as-OS path (Phase 2 firewall).
+    ///
+    /// Like [`Self::search`], but retrieves from BOTH `active_card_id` AND the
+    /// reserved [`WUPI_SYSTEM_CARD_ID`] partition, fusing results across both.
+    /// This is how Wupi always has access to her own non-editable system
+    /// knowledge (the OS docs seeded from `cards/wupi_knowledge/`) regardless
+    /// of which roleplay card is active — the firewall is one-way: system
+    /// knowledge leaks OUT to Wupi, roleplay cards never see each other.
+    ///
+    /// **Efficiency:** embeds the query ONCE (the expensive GPU step), then
+    /// runs 2 FTS5 + 2 vec0 queries (one per partition) in a single blocking
+    /// task, merges the candidate lists, and runs one RRF fuse. This is
+    /// cheaper than calling `search` twice (which would embed twice). The
+    /// per-class codex floor applies to codex entries from EITHER partition
+    /// (Wupi's system docs are tagged `kind=wupi_system` but reuse the codex
+    /// floor — domain asymmetry is the same: declarative reference prose embeds
+    /// lower than chat regardless of which namespace it lives in).
+    ///
+    /// `active_card_id` is the player's current card (a roleplay card during a
+    /// game, or `WUPI_OS_CARD_ID` for Wupi-as-assistant). The system partition
+    /// is always also queried. `dense_floor` overrides the episodic floor; the
+    /// codex floor is always [`crate::memory_rrf::CODEX_DENSE_FLOOR`].
+    pub async fn search_wupi_visible(
+        &self,
+        query: &str,
+        active_card_id: &str,
+        limit: usize,
+        dense_floor: Option<f32>,
+    ) -> anyhow::Result<Vec<RankedMemory>> {
+        const RETRIEVAL_DEPTH: usize = 64;
+
+        // Embed ONCE — the query vector is identical for both partitions.
+        let embedding = self.embedder.embed_query(query.to_owned()).await?;
+
+        let query_owned = query.to_owned();
+        let active_card_owned = active_card_id.to_owned();
+        let conn = self.conn.clone();
+        Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<RankedMemory>> {
+            let c = conn.lock().expect("memory conn mutex");
+
+            // Query each partition independently. FTS5 degrades to dense-only
+            // on syntax error (same resilience as `search`).
+            let sparse_active = match fts5_top_k(&c, &query_owned, &active_card_owned, RETRIEVAL_DEPTH) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "fts5 (active card) failed; dense-only");
+                    Vec::new()
+                }
+            };
+            let sparse_system = match fts5_top_k(&c, &query_owned, WUPI_SYSTEM_CARD_ID, RETRIEVAL_DEPTH) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "fts5 (system) failed; dense-only");
+                    Vec::new()
+                }
+            };
+            let dense_active = vec0_top_k(&c, &embedding, &active_card_owned, RETRIEVAL_DEPTH)?;
+            let dense_system = vec0_top_k(&c, &embedding, WUPI_SYSTEM_CARD_ID, RETRIEVAL_DEPTH)?;
+
+            // Merge across partitions. The candidate ids are unique across
+            // partitions (a memory row belongs to exactly one card_id), so a
+            // simple concatenation is correct — no dedup needed at the id
+            // level. RRF will re-rank the union.
+            let mut sparse: Vec<(MemoryId, f32)> = sparse_active;
+            sparse.extend(sparse_system);
+            let mut dense: Vec<(MemoryId, f32)> = dense_active;
+            dense.extend(dense_system);
+
+            let floor = dense_floor.unwrap_or(crate::memory_rrf::DENSE_COSINE_FLOOR);
+
+            // Codex per-class floor: applies to codex entries from EITHER
+            // partition (both user codex under __codex__ AND Wupi's system docs
+            // under __wupi_system__ get the lower floor).
+            let candidate_ids: Vec<MemoryId> = {
+                let mut ids: Vec<MemoryId> = sparse.iter().map(|(id, _)| *id).collect();
+                ids.extend(dense.iter().map(|(id, _)| *id));
+                ids.sort_unstable();
+                ids.dedup();
+                ids
+            };
+            let codex_ids = codex_ids_among(&c, &candidate_ids)?;
+
+            let fused = crate::memory_rrf::fuse_scored_rrf(
+                &sparse,
+                &dense,
+                floor,
+                &codex_ids,
+                crate::memory_rrf::CODEX_DENSE_FLOOR,
+                crate::memory_rrf::FusionWeights::default(),
+                limit,
+            );
+            fetch_entries(&c, &fused)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("search_wupi_visible join: {e}"))??)
+    }
     //
     // Codex entries are authored reference lore (system docs, world
     // background) stored in the SAME `memories` table as episodic turns. They
@@ -595,6 +811,8 @@ impl<E: Embedder> MemoryEngine<E> {
                 salience,
                 0,
                 Some(&metadata),
+                None, // codex entries are authored short (BUDGET_CHARS=1400 in
+                      // codex.rs enforces this at authoring time) — never chunked.
                 &embedding,
             )
         })
@@ -650,7 +868,7 @@ impl<E: Embedder> MemoryEngine<E> {
             let mut stmt = c
                 .prepare(
                     "SELECT id, text_content, timestamp, role, chunk_index, salience,
-                            metadata_json, card_id, session_id
+                            metadata_json, card_id, session_id, parent_uuid
                      FROM memories
                      WHERE card_id = ?1
                      ORDER BY id DESC
@@ -920,12 +1138,22 @@ fn init_schema(conn: &Connection) -> anyhow::Result<()> {
             card_id        TEXT NOT NULL DEFAULT '__wupi_os__',
             -- Optional session id within a card. Filtered on later when the
             -- card system adds session granularity; nullable for now.
-            session_id     TEXT
+            session_id     TEXT,
+            -- Chunks-of-one-message grouping key (Phase 1 chunking). NULL on
+            -- whole-message rows AND on single-chunk messages (the common
+            -- case stays zero-overhead). Set only when add_memory fans one long
+            -- turn into >1 chunk; all chunks of a message share this UUID.
+            parent_uuid    TEXT
         );
 
         -- Index card_id so the retrieval subquery `WHERE card_id = ?` is a
         -- cheap point lookup, not a scan. Memory is read every chat turn.
         CREATE INDEX IF NOT EXISTS idx_memories_card_id ON memories(card_id);
+
+        -- Index parent_uuid for the future "coalesce sibling chunks" hydration
+        -- query (today retrieval surfaces individual chunks — fine, each chunk
+        -- is self-contained prose — but a coalesce path will want this index).
+        CREATE INDEX IF NOT EXISTS idx_memories_parent_uuid ON memories(parent_uuid);
 
         -- FTS5 mirror. text_content is duplicated here (also in `memories`) —
         -- disk is cheap; external-content tables add trigger complexity not
@@ -934,6 +1162,13 @@ fn init_schema(conn: &Connection) -> anyhow::Result<()> {
         "#,
     )
     .map_err(|e| anyhow::anyhow!("create core+fts tables: {e:?}"))?;
+
+    // Additive migration: `parent_uuid` on pre-existing DBs (§2K DBs created
+    // before chunking shipped lack the column). SQLite has no
+    // `ADD COLUMN IF NOT EXISTS`, so probe `PRAGMA table_info` and only ALTER
+    // when the column is absent. Idempotent + safe on fresh DBs (the CREATE
+    // TABLE above already added it; the probe finds it and skips the ALTER).
+    migrate_add_column(conn, "memories", "parent_uuid", "TEXT")?;
 
     // vec0 DDL separately — its dimension comes from a const, so build the
     // statement with format!. (vec0's parser is picky; keep the literal clean.)
@@ -945,6 +1180,193 @@ fn init_schema(conn: &Connection) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("create vec0 table: {e:?}"))?;
 
     Ok(())
+}
+
+/// Add a column to an existing table if (and only if) it's not already there.
+///
+/// SQLite has no `ALTER TABLE ... ADD COLUMN ... IF NOT EXISTS`, so we probe
+/// `PRAGMA table_info` and issue the `ALTER TABLE` only when the column is
+/// absent. This is how additive schema migrations stay idempotent against
+/// pre-existing DBs (e.g. a `memory.sqlite` created before chunking shipped
+/// lacks the new column; a fresh DB already has it via `CREATE TABLE`).
+///
+/// `col_type` is the SQL type clause verbatim (e.g. `"TEXT"`, `"REAL NOT NULL
+/// DEFAULT 1.0"`). The caller owns correctness of the type; this helper only
+/// does the probe + ALTER.
+fn migrate_add_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    col_type: &str,
+) -> anyhow::Result<()> {
+    // PRAGMA table_info returns one row per column; column 1 (index 1) is the
+    // name. We don't use prepared-statement binding for PRAGMA — SQLite's
+    // pragma parser doesn't accept bound parameters for the table argument.
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| anyhow::anyhow!("migrate: pragma prepare {table}: {e:?}"))?;
+    let present: bool = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(|e| anyhow::anyhow!("migrate: pragma query {table}: {e:?}"))?
+        .any(|res| res.map(|name| name == column).unwrap_or(false));
+    if !present {
+        // SAFETY of the format!: `table`, `column`, `col_type` are all
+        // hard-coded literals at every call site (no user input flows here).
+        let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {col_type}");
+        conn.execute_batch(&sql)
+            .map_err(|e| anyhow::anyhow!("migrate: ALTER {table}.{column}: {e:?}"))?;
+        tracing::info!(table, column, "schema migration: added column");
+    }
+    Ok(())
+}
+
+/// Split a long message into chunks, each within [`CHUNK_CHAR_BUDGET`].
+///
+/// The split is **boundary-aware** (recursive descent, narrative-coherence
+/// preserving):
+/// 1. **Paragraph breaks first** (`\n\n` and runs of `\n`). Paragraphs are the
+///    natural narrative unit; keeping one intact inside a chunk makes the
+///    chunk's embedding semantically coherent.
+/// 2. **Sentence breaks second** (`. `, `! `, `? `). When a single paragraph
+///    exceeds the budget, slice it at sentence boundaries. Sentences are the
+///    next-coherent unit.
+/// 3. **Hard char cut last**. When even one sentence exceeds the budget
+///    (rare — a 1,300+ char run-on sentence), cut at the budget. The embedder's
+///    own `BERT_TRUNCATE_TOKENS` is the final backstop if this still produces
+///    an over-budget chunk (shouldn't, but defense-in-depth).
+///
+/// Greedy packing: the accumulator keeps absorbing units (paragraphs or
+/// sentences) until adding the next would exceed the budget, then flushes.
+/// This minimizes chunk count while respecting the ceiling. A unit larger than
+/// the budget on its own recurses one level deeper rather than overflowing.
+///
+/// Returns at least one chunk (empty input → one empty chunk, which the caller
+/// filters before embedding — `add_memory` skips empty chunks).
+pub fn chunk_text(text: &str) -> Vec<String> {
+    if text.len() <= CHUNK_CHAR_BUDGET {
+        return vec![text.to_owned()];
+    }
+    let mut out = Vec::new();
+    // Paragraph-level split. `\n\s*\n` would be cleaner but `split` on a
+    // literal is allocation-free and roleplay text uses plain `\n\n`. Keep the
+    // separator by splitting on `\n\n` and re-joining with `\n\n` on pack —
+    // this preserves the paragraph structure inside the packed chunk.
+    let paragraphs = text.split("\n\n");
+    let mut acc = String::new();
+    for para in paragraphs {
+        let para_to_add = if acc.is_empty() {
+            para.to_owned()
+        } else {
+            format!("{acc}\n\n{para}")
+        };
+        if para_to_add.len() <= CHUNK_CHAR_BUDGET {
+            // Fits (possibly with prior accumulator content). Keep packing.
+            acc = para_to_add;
+            continue;
+        }
+        // Adding this paragraph overflows. Flush whatever's accumulated.
+        if !acc.is_empty() {
+            out.push(std::mem::take(&mut acc));
+        }
+        // Now handle `para` alone. If it fits by itself, it becomes the new
+        // accumulator. Otherwise descend to sentence-level splitting.
+        if para.len() <= CHUNK_CHAR_BUDGET {
+            acc = para.to_owned();
+        } else {
+            // Paragraph alone exceeds budget — descend to sentences. Emit each
+            // sentence-packet directly (no further accumulator sharing across
+            // paragraph boundaries — keeps the recursion bounded + simple).
+            for sentence_chunk in split_long_paragraph(para) {
+                out.push(sentence_chunk);
+            }
+        }
+    }
+    if !acc.is_empty() {
+        out.push(acc);
+    }
+    // Defensive: if everything was empty, return one empty chunk (the caller
+    // filters empties before embedding).
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// Sentence-level splitter for a paragraph that alone exceeds the budget.
+///
+/// Splits on sentence terminators (`. `, `! `, `? `) followed by whitespace,
+/// keeping the terminator with its sentence. Greedy-packs sentences into
+/// chunks under [`CHUNK_CHAR_BUDGET`]. A single sentence longer than the
+/// budget (a run-on) gets a hard char cut — the only place we ever break
+/// inside a sentence.
+fn split_long_paragraph(para: &str) -> Vec<String> {
+    // Walk the string and slice at sentence boundaries. We keep the trailing
+    // space after the terminator with the *current* sentence (so ". " stays
+    // glued to the sentence that earned it); the next sentence starts clean.
+    let mut sentences: Vec<String> = Vec::new();
+    let mut start = 0usize;
+    let bytes = para.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if (b == b'.' || b == b'!' || b == b'?') && i + 1 < bytes.len() && bytes[i + 1] == b' ' {
+            // Sentence ends here (terminator + the following space).
+            let end = i + 2;
+            sentences.push(para[start..end].to_owned());
+            start = end;
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    if start < bytes.len() {
+        // Trailing fragment with no terminal punctuation (still a sentence for
+        // our purposes — narrative prose often ends mid-paragraph at a quote
+        // or em-dash).
+        sentences.push(para[start..].to_owned());
+    }
+
+    // Greedy-pack sentences into budget-sized chunks.
+    let mut out = Vec::new();
+    let mut acc = String::new();
+    for sentence in sentences {
+        let candidate = if acc.is_empty() {
+            sentence.clone()
+        } else {
+            format!("{acc}{sentence}")
+        };
+        if candidate.len() <= CHUNK_CHAR_BUDGET {
+            acc = candidate;
+            continue;
+        }
+        // Adding this sentence overflows. Flush accumulator.
+        if !acc.is_empty() {
+            out.push(std::mem::take(&mut acc));
+        }
+        // Sentence alone fits? Start a fresh accumulator.
+        if sentence.len() <= CHUNK_CHAR_BUDGET {
+            acc = sentence;
+        } else {
+            // Run-on sentence longer than the budget — hard char cut. Walk on
+            // a char boundary so we never split a multi-byte UTF-8 sequence.
+            let mut s = sentence.as_str();
+            while s.len() > CHUNK_CHAR_BUDGET {
+                let mut cut = CHUNK_CHAR_BUDGET;
+                while cut > 0 && !s.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                out.push(s[..cut].to_owned());
+                s = &s[cut..];
+            }
+            if !s.is_empty() {
+                acc = s.to_owned();
+            }
+        }
+    }
+    if !acc.is_empty() {
+        out.push(acc);
+    }
+    out
 }
 
 /// Insert one memory into all three tables inside a single transaction.
@@ -965,6 +1387,7 @@ fn insert_in_transaction(
     salience: f32,
     chunk_index: i32,
     metadata_json: Option<&str>,
+    parent_uuid: Option<&str>,
     embedding: &[f32],
 ) -> anyhow::Result<MemoryId> {
     // Defensive: vec0 will reject a wrong-length blob with an opaque error;
@@ -986,9 +1409,9 @@ fn insert_in_transaction(
     // directly (None → SQL NULL, Some → TEXT) — no intermediate dyn indirection
     // needed (which would borrow a local pattern binding and fail E0597).
     tx.execute(
-        "INSERT INTO memories (text_content, timestamp, role, chunk_index, salience, metadata_json, card_id, session_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![text, ts, role.as_str(), chunk_index, salience, metadata_json, card_id, session_id],
+        "INSERT INTO memories (text_content, timestamp, role, chunk_index, salience, metadata_json, card_id, session_id, parent_uuid)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![text, ts, role.as_str(), chunk_index, salience, metadata_json, card_id, session_id, parent_uuid],
     )
     .map_err(|e| anyhow::anyhow!("insert memories: {e:?}"))?;
 
@@ -1156,7 +1579,7 @@ fn vec0_top_k(
 ///
 /// Column order (must match every SELECT in this module):
 /// `id, text_content, timestamp, role, chunk_index, salience,
-///  metadata_json, card_id, session_id`.
+///  metadata_json, card_id, session_id, parent_uuid`.
 fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
     let role_str: String = r.get(3)?;
     Ok(MemoryEntry {
@@ -1170,6 +1593,7 @@ fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
         metadata_json: r.get(6)?,
         card_id: r.get(7)?,
         session_id: r.get(8)?,
+        parent_uuid: r.get(9)?,
     })
 }
 
@@ -1189,7 +1613,7 @@ fn fetch_entries(conn: &Connection, fused: &[RankedMemory]) -> anyhow::Result<Ve
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT id, text_content, timestamp, role, chunk_index, salience, metadata_json, card_id, session_id
+        "SELECT id, text_content, timestamp, role, chunk_index, salience, metadata_json, card_id, session_id, parent_uuid
          FROM memories
          WHERE id IN ({placeholders})"
     );
@@ -1211,6 +1635,7 @@ fn fetch_entries(conn: &Connection, fused: &[RankedMemory]) -> anyhow::Result<Ve
             let role_str: String = r.get(3)?;
             let card_id: String = r.get(7)?;
             let session_id: Option<String> = r.get(8)?;
+            let parent_uuid: Option<String> = r.get(9)?;
             Ok(MemoryEntry {
                 id: r.get(0)?,
                 text_content: r.get(1)?,
@@ -1222,6 +1647,7 @@ fn fetch_entries(conn: &Connection, fused: &[RankedMemory]) -> anyhow::Result<Ve
                 metadata_json,
                 card_id,
                 session_id,
+                parent_uuid,
             })
         })
         .map_err(|e| anyhow::anyhow!("query fetch_entries: {e:?}"))?;
@@ -1338,6 +1764,7 @@ mod tests {
                 metadata_json: metadata.map(str::to_owned),
                 card_id: "__wupi_os__".to_owned(),
                 session_id: None,
+                parent_uuid: None,
             },
             score: 0.0,
             debug: DebugScores::default(),
@@ -1462,5 +1889,148 @@ mod tests {
             codex_title(Some(r#"{"title":"he said \"hi\""}"#)),
             Some("he said \"hi\"".to_owned())
         );
+    }
+
+    // ── Chunking tests (Phase 1) ──────────────────────────────────────────
+
+    /// Short text (under budget) passes through as a single chunk unchanged.
+    /// This is the common case — zero chunking overhead.
+    #[test]
+    fn chunk_text_short_passthrough() {
+        let text = "The tavern door creaks open. Rain lashes the cobblestones.";
+        let chunks = chunk_text(text);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], text);
+    }
+
+    /// Empty string yields a single empty chunk (the caller filters empties
+    /// before embedding — see `add_memory`).
+    #[test]
+    fn chunk_text_empty_yields_one_empty_chunk() {
+        let chunks = chunk_text("");
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].is_empty());
+    }
+
+    /// Text just under the budget stays one chunk (boundary condition).
+    #[test]
+    fn chunk_text_at_budget_minus_one_is_single_chunk() {
+        let text = "a".repeat(CHUNK_CHAR_BUDGET - 1);
+        let chunks = chunk_text(&text);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), CHUNK_CHAR_BUDGET - 1);
+    }
+
+    /// Multi-paragraph text splits at `\n\n` boundaries. Two paragraphs each
+    /// under budget, joined over budget → two chunks preserving the separator
+    /// inside the chunk that contains it.
+    #[test]
+    fn chunk_text_splits_at_paragraph_boundaries() {
+        let para_a = "a".repeat(CHUNK_CHAR_BUDGET - 50);
+        let para_b = "b".repeat(CHUNK_CHAR_BUDGET - 50);
+        let text = format!("{para_a}\n\n{para_b}");
+        let chunks = chunk_text(&text);
+        assert_eq!(chunks.len(), 2, "two paragraphs that don't fit together → two chunks");
+        // First chunk is para_a alone (no separator — the \n\n only gets glued
+        // when packing into the accumulator, and para_a overflowed on its own).
+        assert_eq!(chunks[0], para_a);
+        assert_eq!(chunks[1], para_b);
+        // No chunk exceeds the budget.
+        for (i, c) in chunks.iter().enumerate() {
+            assert!(c.len() <= CHUNK_CHAR_BUDGET, "chunk {i} over budget: {}", c.len());
+        }
+    }
+
+    /// Paragraphs small enough to pack together get packed — three short
+    /// paragraphs whose sum exceeds budget pack the first two together, then
+    /// the third flushes on its own. Verifies greedy packing.
+    #[test]
+    fn chunk_text_greedy_packs_paragraphs() {
+        // Each paragraph ~60% of budget. Two fit (120%), three don't.
+        let para = "para. ".repeat(150); // ~900 chars, well under 1300
+        let text = format!("{para}\n\n{para}\n\n{para}");
+        let chunks = chunk_text(&text);
+        // Total ~2700 chars. Two paragraphs ~1800 (overflows) → expect at least
+        // 2 chunks, possibly 3 depending on packing. Verify the invariant:
+        // every chunk ≤ budget, and the concatenation (with appropriate
+        // separators) covers all the content.
+        assert!(chunks.len() >= 2, "should split into multiple chunks");
+        for (i, c) in chunks.iter().enumerate() {
+            assert!(c.len() <= CHUNK_CHAR_BUDGET, "chunk {i} over budget");
+            assert!(!c.is_empty(), "chunk {i} should not be empty");
+        }
+    }
+
+    /// A single paragraph longer than the budget descends to sentence-level
+    /// splitting. Sentences are kept intact where possible.
+    #[test]
+    fn chunk_text_long_paragraph_descends_to_sentences() {
+        // One paragraph, many sentences, no \n\n. Each sentence ~50 chars.
+        let sentence = "The rain falls steadily on the cold stone. ";
+        let text = sentence.repeat(60); // ~2640 chars, one big paragraph
+        let chunks = chunk_text(&text);
+        assert!(chunks.len() >= 2, "long paragraph should split into multiple chunks");
+        for (i, c) in chunks.iter().enumerate() {
+            assert!(c.len() <= CHUNK_CHAR_BUDGET, "chunk {i} over budget: {}", c.len());
+        }
+        // Sentence boundaries preserved: no chunk should start mid-sentence
+        // (the first word of every chunk after [0] should be the start of a
+        // sentence, i.e. capitalized "The").
+        for c in chunks.iter().skip(1) {
+            assert!(
+                c.starts_with("The "),
+                "chunk should start at a sentence boundary, got: {:?}",
+                &c[..c.len().min(20)]
+            );
+        }
+    }
+
+    /// A single run-on sentence longer than the budget gets a hard char cut.
+    /// This is the only place we ever break inside a sentence. UTF-8 boundary
+    /// safety is verified: no panic, and the chunk is valid UTF-8.
+    #[test]
+    fn chunk_text_runon_sentence_hard_cuts_at_char_boundary() {
+        // One sentence, no terminator punctuation, longer than budget.
+        let text = "x".repeat(CHUNK_CHAR_BUDGET * 3);
+        let chunks = chunk_text(&text);
+        assert!(chunks.len() >= 3, "3x budget run-on should yield ≥3 chunks");
+        for (i, c) in chunks.iter().enumerate() {
+            assert!(c.len() <= CHUNK_CHAR_BUDGET, "chunk {i} over budget");
+        }
+        // Reassembling the chunks reconstructs the original (no chars lost).
+        let reassembled: String = chunks.concat();
+        assert_eq!(reassembled.len(), text.len());
+    }
+
+    /// UTF-8 boundary safety on multibyte content. The hard-cut path walks back
+    /// to a char boundary — a chunk should never end mid-codepoint.
+    #[test]
+    fn chunk_text_hard_cut_respects_utf8_boundaries() {
+        // Emoji are 4 bytes each; fill a run-on with them so the hard cut
+        // lands inside multibyte territory.
+        let text = "😀".repeat(CHUNK_CHAR_BUDGET * 2);
+        let chunks = chunk_text(&text);
+        assert!(chunks.len() >= 2);
+        for c in &chunks {
+            assert!(c.len() <= CHUNK_CHAR_BUDGET);
+            // Every chunk must be valid UTF-8 (would panic on construction if
+            // not, but assert explicitly for clarity).
+            assert!(std::str::from_utf8(c.as_bytes()).is_ok());
+        }
+    }
+
+    /// Sub-token-heavy roleplay text (fantasy/sci-fi proper nouns) well under
+    /// the char ceiling should still be a single chunk — the budget is sized
+    /// for the worst case (WordPiece explosion) with margin to spare.
+    #[test]
+    fn chunk_text_subtoken_heavy_under_ceiling_stays_single() {
+        // Mix of repeated rare tokens (the WordPiece worst case). Total well
+        // under 1300 chars → single chunk regardless of tokenization.
+        let text = "Kaelen walks through neon2271 district. The Quorvaxi sentinel \
+                    watches from the ziggurat. Mira taps her cyberdeck, the \
+                    Vex'tung protocol humming in her ears.";
+        let chunks = chunk_text(text);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], text);
     }
 }

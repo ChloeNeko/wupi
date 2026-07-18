@@ -500,6 +500,22 @@ impl EmbedderRuntime {
         // Enforce BERT's 512-token limit. Inputs longer than this silently
         // truncate into garbage embeddings at the C++ level; truncating here
         // is the documented, expected behavior.
+        //
+        // Visibility (Phase 1 chunking): when the input exceeds the budget,
+        // log at debug so silent truncation becomes observable in the live
+        // exe's tracing output. The caller (`add_memory`) is supposed to chunk
+        // first (see `memory::chunk_text`) so this should never fire on the
+        // archival path post-chunking — but queries, codex entries, or future
+        // callers can still exceed it. If this fires frequently, the chunk
+        // budget may need lowering OR a caller is bypassing chunking.
+        let pre_truncate_len = tokens.len();
+        if pre_truncate_len > BERT_TRUNCATE_TOKENS {
+            tracing::debug!(
+                pre_truncate_tokens = pre_truncate_len,
+                budget_tokens = BERT_TRUNCATE_TOKENS,
+                "embedder input exceeds BERT context window; truncating (caller should chunk first)"
+            );
+        }
         tokens.truncate(BERT_TRUNCATE_TOKENS);
 
         // Build the batch. logits=true for EVERY position — the pooling layer

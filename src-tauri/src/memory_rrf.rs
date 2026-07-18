@@ -261,6 +261,7 @@ pub fn fuse_scored_rrf(
                 metadata_json: None,
                 card_id: String::new(),
                 session_id: None,
+                parent_uuid: None,
             },
             score: a.score,
             debug: DebugScores {
