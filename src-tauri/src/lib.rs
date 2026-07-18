@@ -1,3 +1,4 @@
+pub mod api;
 pub mod chat_format;
 pub mod codex;
 pub mod engine;
@@ -98,6 +99,19 @@ pub struct AppState {
     /// `theme_set` saves to it. OnceLock because it needs the Tauri app handle
     /// to resolve app_data_dir (not available in AppState::new()).
     pub theme_path: Arc<std::sync::OnceLock<std::path::PathBuf>>,
+    /// The API connection config (saved profiles + active source). Read by
+    /// the `api_*` IPC commands; written by `api_profile_save`/`api_connect`/
+    /// `api_disconnect`. Held under a std Mutex — short critical sections.
+    pub api_config: Arc<std::sync::Mutex<api::ApiConfig>>,
+    /// The resolved path to `api_config.json` in app data. Filled once in
+    /// setup; the `api_*` IPC saves to it. OnceLock for the same reason as
+    /// `theme_path` — needs the Tauri app handle to resolve app_data_dir.
+    pub api_config_path: Arc<std::sync::OnceLock<std::path::PathBuf>>,
+    /// The active chat source (`Local` = WUPI.gguf 12B, `Api` = HTTP endpoint).
+    /// Mirrors `api_config.model_source` but held separately so `chat_send`
+    /// reads it without locking the whole config (and so the swap logic can
+    /// flip it atomically with the model teardown). Defaults to Local.
+    pub model_source: Arc<std::sync::Mutex<api::ModelSource>>,
 }
 
 impl AppState {
@@ -119,6 +133,9 @@ impl AppState {
             codex_dir: Arc::new(std::sync::OnceLock::new()),
             theme: Arc::new(std::sync::Mutex::new(theme::ThemeSettings::default())),
             theme_path: Arc::new(std::sync::OnceLock::new()),
+            api_config: Arc::new(std::sync::Mutex::new(api::ApiConfig::default())),
+            api_config_path: Arc::new(std::sync::OnceLock::new()),
+            model_source: Arc::new(std::sync::Mutex::new(api::ModelSource::default())),
         }
     }
 }
@@ -172,6 +189,29 @@ pub fn run() {
                 );
                 *state.theme.lock().expect("theme mutex") = loaded;
                 let _ = state.theme_path.set(theme_path);
+            }
+
+            // ── API config (persisted; default = no profiles, Local source) ──
+            // Same pattern as theme: resolve path → load → cache path on
+            // AppState so the api_* IPC commands don't need the app handle.
+            // model_source is restored here; the actual model swap (if it was
+            // Api at last shutdown) is re-performed later in setup once the
+            // local model has finished loading, NOT here — we can't swap
+            // models before the local model has loaded.
+            {
+                let api_path = api::ApiConfig::resolve_path(&data_dir);
+                let loaded = api::ApiConfig::load(&api_path);
+                tracing::info!(
+                    profiles = loaded.profiles.len(),
+                    source = ?loaded.model_source,
+                    active = ?loaded.active_profile_id,
+                    "api config loaded"
+                );
+                // Sync model_source to the loaded value (both track the same
+                // thing; model_source is the fast-read copy for chat_send).
+                *state.model_source.lock().expect("model_source mutex") = loaded.model_source;
+                *state.api_config.lock().expect("api_config mutex") = loaded;
+                let _ = state.api_config_path.set(api_path);
             }
 
             // ── Session + schema are EPHEMERAL (2026-07-14) ───────────────
