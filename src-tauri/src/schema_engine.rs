@@ -230,6 +230,17 @@ impl SchemaEngine {
         (SchemaEngine { tx }, init_rx)
     }
 
+    /// Signal the schema thread to shut down. The thread drops its
+    /// `SchemaRuntime` (owning the `LlamaContext` + the leaked model ref) on
+    /// exit, freeing VRAM. Best-effort — the caller drops all clones of this
+    /// handle afterwards so the mpsc `RecvError` path also fires if the
+    /// Shutdown message races. Used by the model-swap code (api_connect /
+    /// api_disconnect) to tear down the schema engine before respawning on a
+    /// different model.
+    pub fn shutdown(&self) {
+        let _ = self.tx.send(SchemaMsg::Shutdown);
+    }
+
     /// Post a delta request. The caller awaits the reply via the receiver
     /// it created. Fire-and-forget is NOT the contract here — the caller
     /// (chat_send's queue) needs the result before proceeding.

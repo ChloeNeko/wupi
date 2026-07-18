@@ -63,10 +63,12 @@ pub struct AppState {
     /// The schema delta engine. Wrapped in `OnceLock` because spawning it
     /// requires the chat model to have loaded first (`shared_model()` is the
     /// leaked `&'static LlamaModel` the schema context is created from). For
-    /// the B/C runtime test the engine is spawned LAZILY on first
-    /// `debug_schema_delta` call; Component E will move this to an eager spawn
-    /// at model-ready.
-    pub schema_engine: Arc<std::sync::OnceLock<Arc<schema_engine::SchemaEngine>>>,
+    /// The schema delta engine. Held under a resettable Mutex<Option<...>> so
+    /// the model-swap code (api_connect/api_disconnect, chunk 4b) can tear it
+    /// down + respawn it on a different model (WUPI.gguf ↔ Agent.gguf). Was
+    /// OnceLock before the API feature; OnceLock can't be reset, which blocked
+    /// the swap. None = not running (chat proceeds without schema deltas).
+    pub schema_engine: Arc<std::sync::Mutex<Option<Arc<schema_engine::SchemaEngine>>>>,
     /// The active simulation card's id — the partition key for Memory
     /// retrieval and archiving (AGENTS.md §2M). Defaults to
     /// [`memory::WUPI_OS_CARD_ID`] (the Wupi-as-assistant namespace) until
@@ -124,7 +126,7 @@ impl AppState {
             memory: Arc::new(std::sync::OnceLock::new()),
             schema: Arc::new(tokio::sync::Mutex::new(schema::WorldSchema::default())),
             pending_delta: Arc::new(tokio::sync::Mutex::new(None)),
-            schema_engine: Arc::new(std::sync::OnceLock::new()),
+            schema_engine: Arc::new(std::sync::Mutex::new(None)),
             active_card_id: Arc::new(std::sync::Mutex::new(
                 memory::WUPI_OS_CARD_ID.to_owned(),
             )),
@@ -298,7 +300,12 @@ pub fn run() {
                             // the two loads don't compete for VRAM during boot;
                             // runs on the loader thread, blocking recv is fine.
                             let app_state = app_handle.state::<AppState>();
-                            if app_state.schema_engine.get().is_none() {
+                            let already = app_state
+                                .schema_engine
+                                .lock()
+                                .map(|g| g.is_some())
+                                .unwrap_or(false);
+                            if !already {
                                 let (engine, init_rx) = schema_engine::SchemaEngine::spawn_load(
                                     path.clone(),
                                     99,
@@ -308,7 +315,9 @@ pub fn run() {
                                         tracing::info!(
                                             "schema engine ready (eager spawn at model-ready)"
                                         );
-                                        let _ = app_state.schema_engine.set(Arc::new(engine));
+                                        if let Ok(mut slot) = app_state.schema_engine.lock() {
+                                            *slot = Some(Arc::new(engine));
+                                        }
                                     }
                                     Ok(Err(msg)) => {
                                         tracing::warn!(
@@ -588,30 +597,7 @@ fn theme_set(
 }
 
 fn resolve_model_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
-    use tauri::Manager;
-
-    let candidates: Vec<std::path::PathBuf> = {
-        let mut v = Vec::new();
-        if let Some(d) = app.path().resource_dir().ok() {
-            v.push(d.join("models"));
-        }
-        if let Some(exe) = std::env::current_exe().ok() {
-            if let Some(parent) = exe.parent() {
-                v.push(parent.join("models"));
-                if let Some(grand) = parent.parent().and_then(|g| g.parent()) {
-                    v.push(grand.join("src-tauri").join("models"));
-                }
-                if let Some(gg) = parent.parent().and_then(|g| g.parent()).and_then(|g| g.parent()) {
-                    v.push(gg.join("src-tauri").join("models"));
-                }
-            }
-        }
-        if let Some(data) = app.path().app_data_dir().ok() {
-            v.push(data.join("models"));
-        }
-        v
-    };
-
+    let candidates = model_search_dirs(app);
     for dir in &candidates {
         if dir.exists() {
             if let Some(picked) = pick_main_model(dir) {
@@ -621,6 +607,34 @@ fn resolve_model_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+/// The candidate `models/` directories, in search order. Shared by the chat
+/// model resolver, the embedder resolver, and the schema-engine model
+/// resolver (so they all agree on where `.gguf` files live). Extracted from
+/// `resolve_model_path` so the swap logic can resolve Agent.gguf / WUPI.gguf
+/// by name against the same dirs.
+fn model_search_dirs(app: &tauri::AppHandle) -> Vec<std::path::PathBuf> {
+    use tauri::Manager;
+    let mut v = Vec::new();
+    if let Some(d) = app.path().resource_dir().ok() {
+        v.push(d.join("models"));
+    }
+    if let Some(exe) = std::env::current_exe().ok() {
+        if let Some(parent) = exe.parent() {
+            v.push(parent.join("models"));
+            if let Some(grand) = parent.parent().and_then(|g| g.parent()) {
+                v.push(grand.join("src-tauri").join("models"));
+            }
+            if let Some(gg) = parent.parent().and_then(|g| g.parent()).and_then(|g| g.parent()) {
+                v.push(gg.join("src-tauri").join("models"));
+            }
+        }
+    }
+    if let Some(data) = app.path().app_data_dir().ok() {
+        v.push(data.join("models"));
+    }
+    v
 }
 
 fn pick_main_model(dir: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -1104,8 +1118,15 @@ async fn chat_send(
     // context, never touches the chat KV cache). The JoinHandle wraps the
     // post-generation work: post the request, await the reply via
     // spawn_blocking, apply the delta, persist. If the schema engine isn't
-    // available (init failed, or chat proceeded in echo mode), skip silently.
-    if let Some(schema_engine) = state.schema_engine.get() {
+    // available (init failed, or chat proceeded in echo mode, or mid-swap),
+    // skip silently. Clone the Arc out of the Mutex and drop the guard
+    // before the spawned task (the task holds the clone across awaits).
+    let schema_engine_opt = state
+        .schema_engine
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or(None);
+    if let Some(schema_engine) = schema_engine_opt {
         // Capture the exchange from the session (clean strings, same source
         // as the memory archive — sidesteps the token-boundary-drift landmine
         // the same way). Read inside a brief lock, clone out, then drop the
@@ -1130,7 +1151,7 @@ async fn chat_send(
             );
         } else {
             let current_schema = state.schema.lock().await.clone();
-            let schema_engine = Arc::clone(schema_engine);
+            let schema_engine = Arc::clone(&schema_engine);
             let schema_slot = state.schema.clone();
             let handle = tokio::spawn(async move {
                 // Post the delta request. The reply comes back on a std::mpsc
@@ -1569,6 +1590,7 @@ fn model_source_get(state: tauri::State<'_, AppState>) -> serde_json::Value {
 #[tauri::command]
 async fn api_connect(
     profile_id: String,
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     let path = state
@@ -1595,9 +1617,24 @@ async fn api_connect(
             return Err("profile api_key is empty".into());
         }
     }
-    // TODO(chunk 4): perform the actual model swap here — tear down the 12B
-    // chat engine + schema engine, load Agent.gguf as the schema engine, set
-    // the HTTP backend as the chat path. For now just flip the bookkeeping.
+
+    tracing::info!("api_connect: beginning model swap (Local → API)");
+    // 1. Tear down the 12B chat engine + clear the backend slot. Posts
+    //    EngineMsg::Shutdown; the thread exits + drops its LlamaContext
+    //    (freeing VRAM). Subsequent chat_send calls branch on model_source
+    //    (set below to Api) so they won't touch this slot anyway.
+    if let Some(backend) = state.backend.lock().expect("backend mutex").take() {
+        backend.shutdown();
+    }
+    // 2. Tear down the schema engine (currently on WUPI.gguf) — we'll respawn
+    //    it on Agent.gguf. shutdown() posts SchemaMsg::Shutdown; the thread
+    //    exits + drops its runtime (context + leaked model → VRAM freed).
+    swap_schema_engine(&app, &state, "Agent.gguf")
+        .await
+        .map_err(|e| format!("schema swap to Agent.gguf failed: {e}"))?;
+    // 3. Flip model_source FIRST (before persisting) so chat_send routes to
+    //    the API path on the very next message. Then persist the config.
+    *state.model_source.lock().expect("model_source mutex") = api::ModelSource::Api;
     let cfg_snapshot = {
         let mut cfg = state.api_config.lock().expect("api_config mutex");
         cfg.active_profile_id = Some(profile_id.clone());
@@ -1607,22 +1644,58 @@ async fn api_connect(
     tokio::task::spawn_blocking(move || cfg_snapshot.save(&path))
         .await
         .map_err(|e| format!("api_config save join: {e}"))?;
-    *state.model_source.lock().expect("model_source mutex") = api::ModelSource::Api;
-    tracing::info!(profile_id = %profile_id, "api connected (chunk 2 stub — no model swap yet)");
+    tracing::info!(profile_id = %profile_id, "api connected — chat via API, schema via Agent.gguf");
     Ok(())
 }
 
 /// Disconnect the API: flip back to Local, perform the reverse model swap
-/// (API→Local). In chunk 2 the swap is a stub — just clears state.
+/// (API→Local). Reloads WUPI.gguf as the chat engine + schema engine.
 #[tauri::command]
-async fn api_disconnect(state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn api_disconnect(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let path = state
         .api_config_path
         .get()
         .cloned()
         .ok_or_else(|| "api_config path not initialized".to_string())?;
-    // TODO(chunk 4): tear down Agent.gguf schema engine, reload WUPI.gguf 12B
-    // chat + schema engines. For now just flip the bookkeeping.
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir: {e}"))?;
+
+    tracing::info!("api_disconnect: beginning model swap (API → Local)");
+    // 1. Tear down the Agent.gguf schema engine; respawn on WUPI.gguf.
+    swap_schema_engine(&app, &state, "WUPI.gguf")
+        .await
+        .map_err(|e| format!("schema swap to WUPI.gguf failed: {e}"))?;
+    // 2. Reload the 12B chat engine. Resolve the path + spawn_load, then set
+    //    the backend slot. The chat engine is async-loaded (spawn_load returns
+    //    immediately); readiness arrives later via the on_result callback.
+    let model_path = resolve_model_path(&app)
+        .ok_or_else(|| "no WUPI.gguf found for reconnect".to_string())?;
+    let context_size = state.settings.lock().expect("settings mutex").context_size;
+    let app_handle = app.clone();
+    let backend = llm::LlamaCppBackend::spawn_load(
+        model_path,
+        99,
+        context_size,
+        Box::new(move |result| match &result {
+            Ok(name) => {
+                let _ = app_handle.emit(
+                    "model-status",
+                    serde_json::json!({ "status": "ready", "model": name }),
+                );
+            }
+            Err(msg) => {
+                let _ = app_handle.emit(
+                    "model-status",
+                    serde_json::json!({ "status": "error", "message": msg }),
+                );
+            }
+        }),
+    );
+    *state.backend.lock().expect("backend mutex") = Some(backend);
+    // 3. Flip model_source to Local + persist.
+    *state.model_source.lock().expect("model_source mutex") = api::ModelSource::Local;
     let cfg_snapshot = {
         let mut cfg = state.api_config.lock().expect("api_config mutex");
         cfg.model_source = api::ModelSource::Local;
@@ -1631,9 +1704,57 @@ async fn api_disconnect(state: tauri::State<'_, AppState>) -> Result<(), String>
     tokio::task::spawn_blocking(move || cfg_snapshot.save(&path))
         .await
         .map_err(|e| format!("api_config save join: {e}"))?;
-    *state.model_source.lock().expect("model_source mutex") = api::ModelSource::Local;
-    tracing::info!("api disconnected (chunk 2 stub — no model swap yet)");
+    let _ = data_dir; // referenced for future use (e.g. logging); kept for symmetry
+    tracing::info!("api disconnected — chat + schema back on WUPI.gguf (local)");
     Ok(())
+}
+
+/// Swap the schema engine onto a different model. Shuts down the current
+/// engine (if any), resolves `model_name` (e.g. "Agent.gguf" / "WUPI.gguf")
+/// against the model search dirs, and respawns. The readiness recv runs on
+/// the tokio worker via spawn_blocking — the schema thread is a bare
+/// std::thread with a blocking mpsc receiver. On failure, the schema engine
+/// slot is left empty (chat proceeds without schema deltas — graceful).
+async fn swap_schema_engine(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    model_name: &str,
+) -> Result<(), String> {
+    // 1. Shut down the current engine (if any) + clear the slot.
+    let prev = state
+        .schema_engine
+        .lock()
+        .map_err(|e| format!("schema_engine mutex: {e}"))?
+        .take();
+    if let Some(engine) = prev {
+        engine.shutdown();
+        // Give the schema thread a moment to exit + drop its context before
+        // we allocate a new one on a different model (avoids transient VRAM
+        // overlap). 100ms is generous for a thread to process Shutdown +
+        // drop; if it's still alive the new alloc still works, just with
+        // brief double-VRAM.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    // 2. Resolve the new model path.
+    let dirs = model_search_dirs(app);
+    let path = schema_engine::resolve_schema_model(&dirs, model_name)
+        .ok_or_else(|| format!("no {model_name} found in model dirs"))?;
+    // 3. Spawn the new engine + block on readiness.
+    let (engine, init_rx) = schema_engine::SchemaEngine::spawn_load(path, 99);
+    let ready = tokio::task::spawn_blocking(move || init_rx.recv())
+        .await
+        .map_err(|e| format!("schema init join: {e}"))?
+        .map_err(|e| format!("schema init channel: {e}"))?;
+    match ready {
+        Ok(()) => {
+            if let Ok(mut slot) = state.schema_engine.lock() {
+                *slot = Some(Arc::new(engine));
+            }
+            tracing::info!("schema engine respawned on {model_name}");
+            Ok(())
+        }
+        Err(msg) => Err(format!("schema engine init on {model_name} failed: {msg}")),
+    }
 }
 
 /// Test whether an API profile is reachable. Issues a lightweight GET to the
@@ -1707,8 +1828,9 @@ async fn debug_schema_delta(
     // boot, surface that here.
     let engine = state
         .schema_engine
-        .get()
-        .cloned()
+        .lock()
+        .map_err(|e| format!("schema_engine mutex: {e}"))?
+        .clone()
         .ok_or_else(|| "schema engine not running (eager spawn failed at boot, or no model found)".to_string())?;
 
     // Snapshot the current schema (the delta pass diffs against this).

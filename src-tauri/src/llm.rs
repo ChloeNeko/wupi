@@ -531,6 +531,22 @@ impl GenerationClient for LlamaCppBackend {
     }
 }
 
+impl LlamaCppBackend {
+    /// Shut down the engine thread + clear the slot. Posts `EngineMsg::Shutdown`
+    /// (the thread exits, dropping its `EngineRuntime` — `LlamaContext` + the
+    /// borrowed `&'static LlamaModel` — which frees the VRAM), then sets the
+    /// inner slot to `None` so further `stream()` calls return the "not ready"
+    /// error instead of posting to a dead thread. Used by the model-swap code
+    /// (api_connect) to tear down the 12B chat engine before switching chat to
+    /// an API endpoint. After this, `AppState.backend` should be set to `None`.
+    pub fn shutdown(&self) {
+        if let Some(engine) = self.engine.lock().map(|mut g| g.take()).unwrap_or(None) {
+            engine.shutdown();
+            tracing::info!("chat engine shutdown signaled (thread will exit + drop context)");
+        }
+    }
+}
+
 /// Free function: the leaked `&'static LlamaModel`, available after the chat
 /// backend finishes loading. Used by the schema delta engine to create an
 /// isolated `LlamaContext` on the same model. Returns `None` if the model
