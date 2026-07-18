@@ -491,6 +491,13 @@ pub fn run() {
             codex_delete,
             operator_profile_get,
             operator_profile_set,
+            api_profiles_list,
+            api_profile_save,
+            api_profile_delete,
+            api_profile_test,
+            api_connect,
+            api_disconnect,
+            model_source_get,
             system_menu::power_shutdown_cmd,
             system_menu::power_restart_cmd,
             system_menu::power_sleep_cmd,
@@ -1401,6 +1408,200 @@ async fn operator_profile_set(
         .await
         .map_err(|e| format!("profile set join: {e}"))?
         .map_err(|e| format!("{e:#}"))
+}
+
+// ── API config IPC (the API panel surface) ─────────────────────────────────
+// Source of truth = `api_config.json` in the app data dir; the in-memory
+// `AppState.api_config` is the fast read copy. These commands cover enumerate
+// / mutate profiles + read/switch the active model source. `api_connect` and
+// `api_disconnect` perform the actual model swap (chunk 4); in chunk 2 they
+// just validate + set state so the IPC surface is testable end-to-end before
+// the risky teardown code lands.
+
+/// Read the full API config (all profiles + active source). The API panel's
+/// default view. Returns the `ApiConfig` as-is — the frontend renders the
+/// profile list + the model-source radio from it.
+#[tauri::command]
+fn api_profiles_list(state: tauri::State<'_, AppState>) -> api::ApiConfig {
+    state.api_config.lock().expect("api_config mutex").clone()
+}
+
+/// Upsert a profile by id (replace if same id, append otherwise), persist,
+/// return the saved profile. The id is sanitized from the name if the caller
+/// passes an empty one — the UI tracks entries by the returned id.
+#[tauri::command]
+async fn api_profile_save(
+    mut profile: api::ApiProfile,
+    state: tauri::State<'_, AppState>,
+) -> Result<api::ApiProfile, String> {
+    if profile.id.trim().is_empty() {
+        profile.id = api::sanitize_profile_id(&profile.name);
+    } else {
+        profile.id = api::sanitize_profile_id(&profile.id);
+    }
+    let path = state
+        .api_config_path
+        .get()
+        .cloned()
+        .ok_or_else(|| "api_config path not initialized".to_string())?;
+    let saved = profile.clone();
+    // Mutate under the lock, snapshot, then DROP the guard before awaiting
+    // (std::sync::MutexGuard is !Send; can't hold across spawn_blocking.await).
+    let cfg_snapshot = {
+        let mut cfg = state.api_config.lock().expect("api_config mutex");
+        cfg.upsert(profile);
+        cfg.clone()
+    };
+    tokio::task::spawn_blocking(move || cfg_snapshot.save(&path))
+        .await
+        .map_err(|e| format!("api_config save join: {e}"))?;
+    Ok(saved)
+}
+
+/// Delete a profile by id. If it was the active profile, clears active +
+/// downgrades model_source to Local (can't stay on API with no profile).
+/// Returns true if a profile was removed.
+#[tauri::command]
+async fn api_profile_delete(
+    profile_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    let path = state
+        .api_config_path
+        .get()
+        .cloned()
+        .ok_or_else(|| "api_config path not initialized".to_string())?;
+    // Mutate under the lock, snapshot, drop guard before awaiting.
+    let (removed, downgrade_source, cfg_snapshot) = {
+        let mut cfg = state.api_config.lock().expect("api_config mutex");
+        let was_active = cfg.active_profile_id.as_deref() == Some(profile_id.as_str());
+        let removed = cfg.remove(&profile_id);
+        // If we just deleted the active profile, we can't stay on API. This
+        // flips the in-memory state; the actual model swap (reload local)
+        // happens in chunk 4's full disconnect path. For chunk 2 it's just
+        // bookkeeping — the frontend reads model_source_get to reflect it.
+        let downgrade_source = removed && was_active;
+        if downgrade_source {
+            cfg.model_source = api::ModelSource::Local;
+        }
+        (removed, downgrade_source, cfg.clone())
+    };
+    tokio::task::spawn_blocking(move || cfg_snapshot.save(&path))
+        .await
+        .map_err(|e| format!("api_config save join: {e}"))?;
+    if downgrade_source {
+        *state.model_source.lock().expect("model_source mutex") = api::ModelSource::Local;
+    }
+    Ok(removed)
+}
+
+/// Read the current model source + readiness flags. The frontend's source
+/// selector reads this. `api_ready` = an active profile exists (so the API
+/// radio is enabled); `local_ready` = the local backend is loaded.
+#[tauri::command]
+fn model_source_get(state: tauri::State<'_, AppState>) -> serde_json::Value {
+    let source = *state.model_source.lock().expect("model_source mutex");
+    let cfg = state.api_config.lock().expect("api_config mutex");
+    let api_ready = cfg.active_profile().is_some();
+    let local_ready = state
+        .backend
+        .lock()
+        .expect("backend mutex")
+        .as_ref()
+        .map(|b| b.is_ready())
+        .unwrap_or(false);
+    serde_json::json!({
+        "source": source,
+        "apiReady": api_ready,
+        "localReady": local_ready,
+    })
+}
+
+/// Connect an API profile: set it active, perform the model swap (Local→API),
+/// flip model_source to Api. In chunk 2 the swap is a stub — it just validates
+/// the profile exists + sets state. The real teardown lands in chunk 4.
+#[tauri::command]
+async fn api_connect(
+    profile_id: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let path = state
+        .api_config_path
+        .get()
+        .cloned()
+        .ok_or_else(|| "api_config path not initialized".to_string())?;
+    // Validate the profile exists + has the required fields (under lock, then
+    // drop the guard before any await).
+    {
+        let cfg = state.api_config.lock().expect("api_config mutex");
+        let profile = cfg
+            .profiles
+            .iter()
+            .find(|p| p.id == profile_id)
+            .ok_or_else(|| format!("no API profile with id {profile_id}"))?;
+        if profile.endpoint.trim().is_empty() {
+            return Err("profile endpoint is empty".into());
+        }
+        if profile.model.trim().is_empty() {
+            return Err("profile model is empty".into());
+        }
+        if profile.api_key.trim().is_empty() {
+            return Err("profile api_key is empty".into());
+        }
+    }
+    // TODO(chunk 4): perform the actual model swap here — tear down the 12B
+    // chat engine + schema engine, load Agent.gguf as the schema engine, set
+    // the HTTP backend as the chat path. For now just flip the bookkeeping.
+    let cfg_snapshot = {
+        let mut cfg = state.api_config.lock().expect("api_config mutex");
+        cfg.active_profile_id = Some(profile_id.clone());
+        cfg.model_source = api::ModelSource::Api;
+        cfg.clone()
+    };
+    tokio::task::spawn_blocking(move || cfg_snapshot.save(&path))
+        .await
+        .map_err(|e| format!("api_config save join: {e}"))?;
+    *state.model_source.lock().expect("model_source mutex") = api::ModelSource::Api;
+    tracing::info!(profile_id = %profile_id, "api connected (chunk 2 stub — no model swap yet)");
+    Ok(())
+}
+
+/// Disconnect the API: flip back to Local, perform the reverse model swap
+/// (API→Local). In chunk 2 the swap is a stub — just clears state.
+#[tauri::command]
+async fn api_disconnect(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let path = state
+        .api_config_path
+        .get()
+        .cloned()
+        .ok_or_else(|| "api_config path not initialized".to_string())?;
+    // TODO(chunk 4): tear down Agent.gguf schema engine, reload WUPI.gguf 12B
+    // chat + schema engines. For now just flip the bookkeeping.
+    let cfg_snapshot = {
+        let mut cfg = state.api_config.lock().expect("api_config mutex");
+        cfg.model_source = api::ModelSource::Local;
+        cfg.clone()
+    };
+    tokio::task::spawn_blocking(move || cfg_snapshot.save(&path))
+        .await
+        .map_err(|e| format!("api_config save join: {e}"))?;
+    *state.model_source.lock().expect("model_source mutex") = api::ModelSource::Local;
+    tracing::info!("api disconnected (chunk 2 stub — no model swap yet)");
+    Ok(())
+}
+
+/// Test whether an API profile is reachable. Issues a lightweight GET to the
+/// endpoint's `/models` path (the OpenAI-standard list endpoint). Returns Ok
+/// with the model list if reachable, Err with a diagnostic if not. Used by
+/// the API panel's "Test connection" button before the user commits.
+#[tauri::command]
+async fn api_profile_test(
+    profile: api::ApiProfile,
+) -> Result<serde_json::Value, String> {
+    // NOTE: this requires reqwest (chunk 3 dependency). Stubbed for chunk 2
+    // so the IPC surface compiles without the HTTP dep; chunk 3 fills it in.
+    let _ = profile;
+    Err("api_profile_test not implemented until chunk 3 (reqwest dep lands)".into())
 }
 
 /// Debug probe into the schema delta engine (B/C runtime test). Posts a
