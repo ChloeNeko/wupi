@@ -64,6 +64,14 @@ pub struct SimCard {
     /// 2+ hint — the engine registry will match these against available
     /// activity modules. Empty for system cards.
     pub declared_activities: Vec<String>,
+    /// The protagonist's name for roleplay cards (e.g. "Alex", "Kaelen").
+    /// Used by the narrator prompt's `<active_reality>` tail block (Phase E,
+    /// 2026-07-18) to anchor the model in the current card's identity and
+    /// prevent cross-card KV-cache contamination (the "Alex hallucination"
+    /// where the cyberpunk narrator used the dungeon protagonist's name).
+    /// `None` for system cards; narrator hardening falls back to generic
+    /// "the protagonist" phrasing.
+    pub protagonist_name: Option<String>,
 }
 
 impl SimCard {
@@ -181,6 +189,7 @@ pub fn fallback() -> SimCard {
         opening_scene: None,
         start_npc_ids: Vec::new(),
         declared_activities: Vec::new(),
+        protagonist_name: None,
     }
 }
 
@@ -321,6 +330,11 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         .and_then(|n| first_child(n, "activities"))
         .map(|n| parse_bullet_list(&text_content(n)))
         .unwrap_or_default();
+    // Protagonist name (Phase E narrator hardening, 2026-07-18). Optional;
+    // absent on system cards and on roleplay cards that don't declare one.
+    let protagonist_name = scenario
+        .and_then(|n| child_text(n, "protagonist"))
+        .filter(|s| !s.is_empty());
 
     Ok(SimCard {
         id,
@@ -339,6 +353,7 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         opening_scene,
         start_npc_ids,
         declared_activities,
+        protagonist_name,
     })
 }
 
@@ -493,6 +508,7 @@ mod tests {
             opening_scene: None,
             start_npc_ids: Vec::new(),
             declared_activities: Vec::new(),
+            protagonist_name: None,
         };
         assert!(card.random_intro().is_none());
     }
@@ -572,6 +588,7 @@ ago. A locked iron chest sits under a table by the hearth.
     <activities><![CDATA[
 - combat
     ]]></activities>
+    <protagonist>Alex</protagonist>
   </scenario>
 </sim_card>"#;
         let card = parse(roleplay).expect("roleplay card parses");
@@ -582,6 +599,7 @@ ago. A locked iron chest sits under a table by the hearth.
         assert!(card.opening_scene.as_deref().unwrap().contains("Rain lashes"));
         assert_eq!(card.start_npc_ids, vec!["barkeeper".to_string(), "goblin".to_string()]);
         assert_eq!(card.declared_activities, vec!["combat".to_string()]);
+        assert_eq!(card.protagonist_name.as_deref(), Some("Alex"));
     }
 
     /// The system card (Wupi.sim) has NO `<scenario>` block. Every roleplay
@@ -596,5 +614,6 @@ ago. A locked iron chest sits under a table by the hearth.
         assert!(card.opening_scene.is_none());
         assert!(card.start_npc_ids.is_empty());
         assert!(card.declared_activities.is_empty());
+        assert!(card.protagonist_name.is_none());
     }
 }

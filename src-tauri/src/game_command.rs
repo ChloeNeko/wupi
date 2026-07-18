@@ -255,12 +255,19 @@ mod tests {
         assert_eq!(extract_focus("what's the weather?"), "weather");
         assert_eq!(extract_focus("show me my inventory."), "inventory");
     }
+}
 
-    // Helper so the `_` match arms above compile without warnings about
-    // unused Debug formatting.
-    impl std::fmt::Display for GameCommand {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "{self:?}")
+// Top-level `Display` impl (Phase E cleanup, 2026-07-18). Was previously
+// inside `#[cfg(test)]` to silence unused-Debug-format warnings on `_` match
+// arms in tests. Promoted to the module level — it's useful for log lines in
+// the route helpers too (`tracing::info!(?cmd, ...)` falls back to Display
+// when Debug isn't used). No behavior change.
+impl std::fmt::Display for GameCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GameCommand::MutateWorldState(_) => write!(f, "MutateWorldState"),
+            GameCommand::QueryWorldState(focus) => write!(f, "QueryWorldState({focus})"),
+            GameCommand::NotACommand => write!(f, "NotACommand"),
         }
     }
 }

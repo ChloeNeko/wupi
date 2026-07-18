@@ -933,6 +933,221 @@ fn resolve_codex_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     None
 }
 
+// ── Phase E helpers (Wupi-as-game-manager routing, 2026-07-18) ──────────────
+// Three small functions: game_is_active checks whether a GameEngine is
+// running; route_to_game_manager handles the MutateWorldState intent
+// (translates the player's request to a SchemaDelta via the schema engine's
+// isolated context, applies it, streams a confirmation); route_to_game_query
+// handles QueryWorldState (returns a slice of the game's world-state schema).
+//
+// Both route helpers are invoked from the top of chat_send via an early
+// return, so the existing Wupi-assistant chat body is never entered when a
+// management intent is detected.
+
+/// True when a GameEngine is currently running (a game is active). Cheap:
+/// locks the Mutex briefly, checks for Some, drops the guard. Used at the top
+/// of `chat_send` to decide whether to run the management-intent classifier.
+fn game_is_active(state: &tauri::State<'_, AppState>) -> bool {
+    state
+        .game_engine
+        .lock()
+        .map(|g| g.is_some())
+        .unwrap_or(false)
+}
+
+/// Handle a `MutateWorldState` intent: translate the player's natural-language
+/// request into a `SchemaDelta` via the schema engine's isolated context,
+/// apply it to the active game's scoped `game_schema`, and stream a
+/// confirmation back through the same `on_event` Channel Wupi's chat uses.
+///
+/// The translation reuses `SchemaEngine::request_translation` (Phase E,
+/// 2026-07-18) — the same isolated context the auto-summarizer runs on, no
+/// KV pollution to chat or narrator. The confirmation text is a template
+/// filled from the actual delta (no LLM needed for the confirmation itself —
+/// keeps the management path cheap).
+///
+/// Errors surface as a single `error` Channel event + an `Err` return, so the
+/// UI can render them like any chat error. The active game's schema is left
+/// unchanged on any failure path.
+async fn route_to_game_manager(
+    text: String,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
+    state: &tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    // 1. Pull the schema engine out under a brief lock. If it's not running
+    //    (rare — eager-spawned at boot), surface an error rather than crash.
+    let schema_engine = state
+        .schema_engine
+        .lock()
+        .map_err(|e| format!("schema_engine mutex: {e}"))?
+        .clone()
+        .ok_or_else(|| "schema engine not running — cannot translate request".to_string())?;
+
+    // 2. Snapshot the current game schema (the delta diffs against this).
+    //    Clone out + drop the guard before the awaited translation call.
+    let current_schema = state.game_schema.lock().await.clone();
+
+    // 3. Post the translation request + await the reply off the tokio worker
+    //    (the schema thread is a bare std::thread; its mpsc::Receiver blocks).
+    let reply_rx = schema_engine
+        .request_translation(text.clone(), &current_schema)
+        .map_err(|e| format!("{e:#}"))?;
+    let reply = tokio::task::spawn_blocking(move || reply_rx.recv())
+        .await
+        .map_err(|e| format!("translation reply join: {e}"))?
+        .map_err(|e| format!("translation reply channel: {e}"))?;
+
+    if !reply.error.is_empty() {
+        on_event
+            .send(serde_json::json!({
+                "type": "error",
+                "message": format!("couldn't translate that: {}", reply.error),
+            }))
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    // 4. Apply the delta to the game schema. If the model emitted `{}` (no
+    //    changes), the delta is empty — treat as "didn't understand, nothing
+    //    changed" and confirm that specifically.
+    let Some(delta) = reply.delta else {
+        on_event
+            .send(serde_json::json!({
+                "type": "error",
+                "message": "couldn't translate that into a state change".to_string(),
+            }))
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    };
+
+    let delta_applied = delta.has_changes();
+    if delta_applied {
+        let mut s = state.game_schema.lock().await;
+        s.apply_delta(delta.clone());
+    }
+
+    // 5. Build + stream the confirmation. The text is template-filled from
+    //    the delta (no LLM call) — keeps the management path cheap. The
+    //    frontend renders it as a normal Wupi bubble via the same `chunk` +
+    //    `done` event shape chat uses.
+    let confirmation = if delta_applied {
+        format_confirmation(&delta, &text)
+    } else {
+        "I couldn't turn that into a state change — try rephrasing? \
+         For example: \"make it stormy\", \"set the weather to clear\", \
+         \"give Alex a torch\".".to_string()
+    };
+    on_event
+        .send(serde_json::json!({ "type": "chunk", "text": &confirmation }))
+        .map_err(|e| e.to_string())?;
+    on_event
+        .send(serde_json::json!({
+            "type": "done",
+            "final_text": confirmation,
+            "reasoning": "",
+            "game_manager": true,
+        }))
+        .map_err(|e| e.to_string())?;
+    tracing::info!(
+        request = %text.chars().take(80).collect::<String>(),
+        applied = delta_applied,
+        "game-manager: mutation request handled"
+    );
+    Ok(())
+}
+
+/// Handle a `QueryWorldState` intent: return a slice of the active game's
+/// world-state schema so Wupi can narrate it. The `focus` (e.g. "weather",
+/// "inventory") is matched against the schema's entity keys; if nothing
+/// matches, the whole schema is returned (so Wupi can still describe the
+/// state of the world generally).
+async fn route_to_game_query(
+    focus: String,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
+    state: &tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let snapshot = state.game_schema.lock().await.clone();
+    let state_json = snapshot.to_json_pretty();
+
+    // Best-effort focus match: look for entity keys containing the focus
+    // substring. If none match, send the full schema.
+    let focused = if focus.is_empty() {
+        state_json.clone()
+    } else {
+        let lower = focus.to_lowercase();
+        snapshot
+            .entities
+            .iter()
+            .filter(|(k, _)| k.to_lowercase().contains(&lower))
+            .map(|(k, v)| format!("  {k}: {v}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let body = if focused.is_empty() {
+        format!("Here's what I know about the world right now:\n{state_json}")
+    } else {
+        format!("Here's what I know about {focus}:\n{focused}")
+    };
+
+    // Emit two messages: the structured `game_state_query` (machine-readable,
+    // for any future UI that wants to render state differently) + the
+    // chunk/done pair Wupi's chat UI renders as a normal bubble.
+    on_event
+        .send(serde_json::json!({
+            "type": "game_state_query",
+            "focus": focus,
+            "state": state_json,
+        }))
+        .map_err(|e| e.to_string())?;
+    on_event
+        .send(serde_json::json!({ "type": "chunk", "text": &body }))
+        .map_err(|e| e.to_string())?;
+    on_event
+        .send(serde_json::json!({
+            "type": "done",
+            "final_text": body,
+            "reasoning": "",
+            "game_manager": true,
+        }))
+        .map_err(|e| e.to_string())?;
+    tracing::info!(
+        focus = %focus,
+        "game-manager: query handled"
+    );
+    Ok(())
+}
+
+/// Build a short natural-language confirmation of a `SchemaDelta`. Avoids an
+/// extra LLM call — the mutation translation already did the work; this just
+/// narrates the result. Falls back to a generic "Done." if the delta has no
+/// recognizable changes (the `has_changes` gate upstream should prevent that).
+fn format_confirmation(delta: &schema::SchemaDelta, original_request: &str) -> String {
+    let mut bits = Vec::new();
+    if let Some(summary) = delta.summary.as_deref() {
+        bits.push(format!("Summary updated: \"{summary}\""));
+    }
+    if let Some(events) = delta.recent_events.as_ref() {
+        if !events.is_empty() {
+            let preview = events.last().map(|s| s.as_str()).unwrap_or("");
+            let preview: String = preview.chars().take(80).collect();
+            bits.push(format!("Logged event: {preview}"));
+        }
+    }
+    if let Some(ents) = delta.entities.as_ref() {
+        for (k, v) in ents.iter() {
+            match v {
+                Some(val) => bits.push(format!("{k} → {val}")),
+                None => bits.push(format!("{k} removed")),
+            }
+        }
+    }
+    if bits.is_empty() {
+        format!("Done — \"{}\" applied.", original_request)
+    } else {
+        format!("Done! {}", bits.join("; "))
+    }
+}
+
 #[tauri::command]
 async fn chat_send(
     text: String,
@@ -951,6 +1166,29 @@ async fn chat_send(
     {
         let mut slot = state.active_cancel.lock().expect("active_cancel mutex");
         *slot = Some(Arc::clone(&cancel));
+    }
+
+    // ── Phase E gate: Wupi-as-game-manager routing (2026-07-18) ────────────
+    // When a game is active, check whether the player's message to Wupi is a
+    // game-management intent (mutate world state / query world state). If so,
+    // route to the dedicated handlers and RETURN EARLY — the existing chat
+    // body is never entered, so Wupi-assistant chat behavior is unchanged
+    // when no game is active OR when the message isn't management-shaped.
+    // See docs/games-app-design.md §1.4 + game_command.rs for the heuristic.
+    if game_is_active(&state) {
+        match game_command::classify(&text) {
+            game_command::GameCommand::MutateWorldState(_) => {
+                clear_active_cancel(&state);
+                return route_to_game_manager(text, on_event, &state).await;
+            }
+            game_command::GameCommand::QueryWorldState(focus) => {
+                clear_active_cancel(&state);
+                return route_to_game_query(focus, on_event, &state).await;
+            }
+            game_command::GameCommand::NotACommand => {
+                // Fall through to normal Wupi-assistant chat.
+            }
+        }
     }
 
     // ── State-Delta queue (invisible, Component D) ─────────────────────

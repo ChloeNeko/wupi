@@ -79,6 +79,37 @@ pub fn build_narrator_system_prompt(
         }
     }
 
+    // ── Active-reality anchor (tail of system prompt, 2026-07-18) ──────────
+    // DELIBERATELY last — closest to the user input — so it's the loudest
+    // signal the model sees when generating. The GameEngine's KV cache may
+    // hold residual state from a PRIOR card (the 2026-07-18 "Alex
+    // hallucination": the cyberpunk narrator used the dungeon protagonist's
+    // name). Gemma 4, like all transformer LLMs, weights recent tokens
+    // heavily; putting the explicit card-identity reinforcement at the tail
+    // overrides those lingering vibes. Same principle that made §2O's persona
+    // injection work: explicit, structured, recently-positioned context wins
+    // over implicit residual state.
+    out.push_str("<active_reality>\n");
+    out.push_str(&format!(
+        "You are narrating {}, NOT any other scenario. ",
+        card.name.trim(),
+    ));
+    if let Some(name) = card.protagonist_name.as_deref() {
+        out.push_str(&format!(
+            "The protagonist is {name} — use this name exclusively; never use a different protagonist's name. "
+        ));
+    } else {
+        out.push_str("Refer to the protagonist generically (e.g. \"the traveler\"); never invent or import a protagonist name. ");
+    }
+    if let Some(setting) = card.setting.as_deref() {
+        // Brief recap (full setting already lives in <scenario> above). The
+        // recap here is the recency-reinforcement, not the source of truth.
+        let brief: String = setting.trim().chars().take(160).collect();
+        out.push_str(&format!("Setting recap: {brief}… "));
+    }
+    out.push_str("Do NOT reference characters, locations, items, or elements from any other scenario — only what belongs to this one.\n");
+    out.push_str("</active_reality>\n\n");
+
     out
 }
 
@@ -149,6 +180,7 @@ mod tests {
             opening_scene: Some("Rain lashes the shutters.".into()),
             start_npc_ids: vec!["gorm".into(), "goblin".into()],
             declared_activities: vec!["combat".into()],
+            protagonist_name: Some("Alex".into()),
         }
     }
 
@@ -209,9 +241,75 @@ mod tests {
             opening_scene: None,
             start_npc_ids: Vec::new(),
             declared_activities: Vec::new(),
+            protagonist_name: None,
         };
         let prompt = build_narrator_system_prompt(&card, None);
         assert!(prompt.contains("<narrator_role>"));
         assert!(prompt.contains("<scenario>"));
+    }
+
+    /// The `<active_reality>` anchor (Phase E, 2026-07-18): reinforces the
+    /// active card's identity at the prompt tail to override cross-card KV
+    /// contamination. Must include the card name + protagonist name when
+    /// declared.
+    #[test]
+    fn narrator_prompt_has_active_reality_with_protagonist() {
+        let card = dungeon_card();
+        let prompt = build_narrator_system_prompt(&card, None);
+        assert!(prompt.contains("<active_reality>"));
+        assert!(prompt.contains("The Rusty Tankard"));
+        assert!(prompt.contains("The protagonist is Alex"));
+        assert!(prompt.contains("NOT any other scenario"));
+    }
+
+    /// When `protagonist_name` is None (a card that doesn't declare one),
+    /// the anchor falls back to generic phrasing and explicitly forbids
+    /// inventing a name — which is the actual defense against the Alex
+    /// hallucination when no protagonist is named.
+    #[test]
+    fn narrator_prompt_active_reality_falls_back_when_no_protagonist() {
+        let card = SimCard {
+            id: "minimal".into(),
+            name: "Some Scene".into(),
+            card_type: "roleplay".into(),
+            core_persona: String::new(),
+            traits: String::new(),
+            appearance: String::new(),
+            role_instruction: String::new(),
+            responsibilities: String::new(),
+            conversational_rules: String::new(),
+            technical_rules: String::new(),
+            introductions: Vec::new(),
+            setting: Some("A place.".into()),
+            tone: None,
+            opening_scene: None,
+            start_npc_ids: Vec::new(),
+            declared_activities: Vec::new(),
+            protagonist_name: None,
+        };
+        let prompt = build_narrator_system_prompt(&card, None);
+        assert!(prompt.contains("<active_reality>"));
+        // Generic fallback — must NOT contain a hardcoded name.
+        assert!(!prompt.contains("The protagonist is Alex"));
+        assert!(prompt.contains("never invent or import a protagonist name"));
+        assert!(prompt.contains("Some Scene"));
+    }
+
+    /// The `<active_reality>` block is the LAST section in the prompt
+    /// (closest to the user input). Verify ordering: <narrator_role> first,
+    /// <active_reality> last.
+    #[test]
+    fn active_reality_is_last_section() {
+        let card = dungeon_card();
+        let prompt = build_narrator_system_prompt(&card, Some("weather: stormy"));
+        let narrator_idx = prompt.find("<narrator_role>").expect("narrator_role present");
+        let scenario_idx = prompt.find("<scenario>").expect("scenario present");
+        let bracket_idx = prompt.find("<bracket_commands>").expect("bracket_commands present");
+        let world_idx = prompt.find("<world_state>").expect("world_state present");
+        let reality_idx = prompt.find("<active_reality>").expect("active_reality present");
+        assert!(narrator_idx < scenario_idx);
+        assert!(scenario_idx < bracket_idx);
+        assert!(bracket_idx < world_idx);
+        assert!(world_idx < reality_idx);
     }
 }

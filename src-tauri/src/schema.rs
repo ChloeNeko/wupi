@@ -229,6 +229,25 @@ impl SchemaDelta {
         let cleaned = strip_markdown_fences(reply).trim();
         serde_json::from_str(cleaned)
     }
+
+    /// True if the delta carries ANY actual change (summary, events, or entity
+    /// mutations). False for an empty `{}` delta — which the model may emit when
+    /// the player's request didn't translate to anything. Used by the
+    /// game-manager routing (Phase E, 2026-07-18) to decide whether to apply +
+    /// confirm vs. ask the player to rephrase.
+    pub fn has_changes(&self) -> bool {
+        self.summary.is_some()
+            || self
+                .recent_events
+                .as_ref()
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+            || self
+                .entities
+                .as_ref()
+                .map(|m| !m.is_empty())
+                .unwrap_or(false)
+    }
 }
 
 /// Extract the reply channel from Gemma4 protocol output. The model emits
@@ -386,6 +405,47 @@ mod tests {
         assert_eq!(schema.summary, "kept");
         assert_eq!(schema.recent_events, vec!["kept"]);
         assert_eq!(schema.entities.get("k"), Some(&"v".to_string()));
+    }
+
+    #[test]
+    fn has_changes_detects_populated_delta() {
+        // Summary populated → has_changes.
+        assert!(SchemaDelta {
+            summary: Some("hi".into()),
+            recent_events: None,
+            entities: None,
+        }
+        .has_changes());
+        // Recent events populated → has_changes.
+        assert!(SchemaDelta {
+            summary: None,
+            recent_events: Some(vec!["e".into()]),
+            entities: None,
+        }
+        .has_changes());
+        // Entity mutations (even a delete/null) → has_changes.
+        let mut ents = HashMap::new();
+        ents.insert("k".to_string(), None);
+        assert!(SchemaDelta {
+            summary: None,
+            recent_events: None,
+            entities: Some(ents),
+        }
+        .has_changes());
+    }
+
+    #[test]
+    fn has_changes_false_for_empty_delta() {
+        // Default (all-None) → no changes. This is the `{}` case the model
+        // emits when a player's request didn't translate to anything.
+        assert!(!SchemaDelta::default().has_changes());
+        // Empty Vec / empty Map also count as no-op.
+        assert!(!SchemaDelta {
+            summary: None,
+            recent_events: Some(Vec::new()),
+            entities: Some(HashMap::new()),
+        }
+        .has_changes());
     }
 
     #[test]

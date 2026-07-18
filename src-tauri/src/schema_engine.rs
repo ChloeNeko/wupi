@@ -97,9 +97,30 @@ pub struct SchemaReply {
 
 enum SchemaMsg {
     Request(Box<SchemaRequest>),
+    /// Translate a player's natural-language game-management request into a
+    /// `SchemaDelta` (Phase E, 2026-07-18). Distinct from `Request` (the auto-
+    /// summarizer's per-turn delta): the translation takes an explicit player
+    /// command, not a just-finished chat exchange. Reuses the same JSON-delta
+    /// parser + the schema engine's isolated context — no new infrastructure.
+    RequestTranslation(Box<TranslationRequest>),
     /// Kept for future hot-swap / clean shutdown, mirroring `ChatEngine`.
     #[allow(dead_code)]
     Shutdown,
+}
+
+/// A request to translate a player's natural-language request ("make it
+/// stormy") into a `SchemaDelta` against the current game-world schema.
+/// Carries the raw player text + the current schema JSON. The handler uses
+/// `game_command::render_translation_prompt` to build the LLM prompt, then
+/// parses the reply via the same `SchemaDelta::from_model_output` the
+/// auto-summarizer uses.
+struct TranslationRequest {
+    /// The player's verbatim request to Wupi (e.g. "make it stormy").
+    player_request: String,
+    /// The current game-world schema as pretty JSON (what to diff against).
+    current_schema_json: String,
+    /// One-shot reply channel.
+    reply: mpsc::Sender<SchemaReply>,
 }
 
 // ---------------------------------------------------------------------------
@@ -160,7 +181,10 @@ impl SchemaEngine {
                 tracing::info!("wupi-schema thread ready");
 
                 loop {
-                    match rx.recv() {
+                    // Both Request and RequestTranslation produce the same
+                    // `(raw, Result<delta, err>)` outcome shape; we share the
+                    // outcome → SchemaReply mapping (Phase E, 2026-07-18).
+                    let parsed_msg = match rx.recv() {
                         Ok(SchemaMsg::Request(req)) => {
                             // Self-healing: isolate each delta pass so one
                             // panic doesn't kill the thread.
@@ -169,55 +193,19 @@ impl SchemaEngine {
                                     runtime.generate_delta(&req)
                                 }),
                             );
-                            let reply_msg = match outcome {
-                                Ok(Ok((raw, Ok(delta)))) => SchemaReply {
-                                    raw_output: raw,
-                                    delta: Some(delta),
-                                    error: String::new(),
-                                },
-                                Ok(Ok((raw, Err(e)))) => {
-                                    // Generation succeeded but JSON parse failed
-                                    // twice. Surface the raw output so the debug
-                                    // panel can show what the model emitted.
-                                    tracing::warn!(error = %e, "schema delta parse failed");
-                                    runtime.ctx.clear_kv_cache();
-                                    SchemaReply {
-                                        raw_output: raw,
-                                        delta: None,
-                                        error: e,
-                                    }
-                                }
-                                Ok(Err(e)) => {
-                                    // Generation itself failed (tokenize/prefill/
-                                    // decode). No raw output to report.
-                                    tracing::warn!(error = %format!("{e:#}"), "schema delta failed");
-                                    runtime.ctx.clear_kv_cache();
-                                    SchemaReply {
-                                        raw_output: String::new(),
-                                        delta: None,
-                                        error: format!("{e:#}"),
-                                    }
-                                }
-                                Err(payload) => {
-                                    let msg = payload
-                                        .downcast_ref::<String>()
-                                        .map(|s| s.clone())
-                                        .or_else(|| {
-                                            payload.downcast_ref::<&str>().map(|s| s.to_string())
-                                        })
-                                        .unwrap_or_else(|| {
-                                            "schema delta panic (unknown cause)".to_string()
-                                        });
-                                    tracing::error!(panic = %msg, "schema delta panicked");
-                                    runtime.ctx.clear_kv_cache();
-                                    SchemaReply {
-                                        raw_output: String::new(),
-                                        delta: None,
-                                        error: format!("schema panic: {msg}"),
-                                    }
-                                }
-                            };
-                            let _ = req.reply.send(reply_msg);
+                            Some((outcome, req.reply))
+                        }
+                        Ok(SchemaMsg::RequestTranslation(req)) => {
+                            // Phase E: same self-healing wrap, different runtime
+                            // call. The translation prompt is built by
+                            // `game_command::render_translation_prompt`; the
+                            // parser is the same `SchemaDelta::from_model_output`.
+                            let outcome = std::panic::catch_unwind(
+                                std::panic::AssertUnwindSafe(|| {
+                                    runtime.generate_translation(&req)
+                                }),
+                            );
+                            Some((outcome, req.reply))
                         }
                         Ok(SchemaMsg::Shutdown) => {
                             tracing::info!("wupi-schema shutting down");
@@ -227,7 +215,57 @@ impl SchemaEngine {
                             tracing::info!("wupi-schema: all senders dropped, exiting");
                             break;
                         }
-                    }
+                    };
+                    let Some((outcome, reply_tx)) = parsed_msg else { continue };
+                    let reply_msg = match outcome {
+                        Ok(Ok((raw, Ok(delta)))) => SchemaReply {
+                            raw_output: raw,
+                            delta: Some(delta),
+                            error: String::new(),
+                        },
+                        Ok(Ok((raw, Err(e)))) => {
+                            // Generation succeeded but JSON parse failed
+                            // twice. Surface the raw output so the debug
+                            // panel can show what the model emitted.
+                            tracing::warn!(error = %e, "schema delta parse failed");
+                            runtime.ctx.clear_kv_cache();
+                            SchemaReply {
+                                raw_output: raw,
+                                delta: None,
+                                error: e,
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            // Generation itself failed (tokenize/prefill/
+                            // decode). No raw output to report.
+                            tracing::warn!(error = %format!("{e:#}"), "schema delta failed");
+                            runtime.ctx.clear_kv_cache();
+                            SchemaReply {
+                                raw_output: String::new(),
+                                delta: None,
+                                error: format!("{e:#}"),
+                            }
+                        }
+                        Err(payload) => {
+                            let msg = payload
+                                .downcast_ref::<String>()
+                                .map(|s| s.clone())
+                                .or_else(|| {
+                                    payload.downcast_ref::<&str>().map(|s| s.to_string())
+                                })
+                                .unwrap_or_else(|| {
+                                    "schema delta panic (unknown cause)".to_string()
+                                });
+                            tracing::error!(panic = %msg, "schema delta panicked");
+                            runtime.ctx.clear_kv_cache();
+                            SchemaReply {
+                                raw_output: String::new(),
+                                delta: None,
+                                error: format!("schema panic: {msg}"),
+                            }
+                        }
+                    };
+                    let _ = reply_tx.send(reply_msg);
                 }
             })
             .expect("failed to spawn wupi-schema thread");
@@ -279,6 +317,28 @@ impl SchemaEngine {
         };
         self.tx
             .send(SchemaMsg::Request(Box::new(req)))
+            .map_err(|_| anyhow::anyhow!("schema engine thread closed"))?;
+        Ok(reply_rx)
+    }
+
+    /// Post a TRANSLATION request (Phase E, 2026-07-18): translate a player's
+    /// natural-language game-management request into a `SchemaDelta`. Used by
+    /// `route_to_game_manager` when Wupi intercepts a "make it stormy" /
+    /// "give me a sword" / "travel to the dungeon" command. Same reply
+    /// contract as `request_delta` — caller awaits via the returned receiver.
+    pub fn request_translation(
+        &self,
+        player_request: String,
+        current_schema: &WorldSchema,
+    ) -> anyhow::Result<mpsc::Receiver<SchemaReply>> {
+        let (reply_tx, reply_rx) = mpsc::channel::<SchemaReply>();
+        let req = TranslationRequest {
+            player_request,
+            current_schema_json: current_schema.to_json_pretty(),
+            reply: reply_tx,
+        };
+        self.tx
+            .send(SchemaMsg::RequestTranslation(Box::new(req)))
             .map_err(|_| anyhow::anyhow!("schema engine thread closed"))?;
         Ok(reply_rx)
     }
@@ -374,6 +434,51 @@ impl SchemaRuntime {
                         raw2,
                         Err(format!(
                             "schema delta parse failed twice: first={first_err}, retry={e}"
+                        )),
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Translate a player's natural-language game-management request into a
+    /// `SchemaDelta` (Phase E, 2026-07-18). Same shape as `generate_delta` —
+    /// two-pass with repair, same JSON parser — but the prompt is built by
+    /// `game_command::render_translation_prompt` from the player's verbatim
+    /// text + the current game-world schema. Used by Wupi-as-game-manager
+    /// when she intercepts "make it stormy" / "give me a sword" via chat_send.
+    fn generate_translation(
+        &mut self,
+        req: &TranslationRequest,
+    ) -> Result<(String, Result<SchemaDelta, String>), anyhow::Error> {
+        let prompt = crate::game_command::render_translation_prompt(
+            &req.player_request,
+            &req.current_schema_json,
+        );
+        let raw = self.generate_text(&prompt)?;
+        match SchemaDelta::from_model_output(&raw) {
+            Ok(delta) => {
+                tracing::debug!(
+                    tokens = raw.len(),
+                    request = %req.player_request.chars().take(80).collect::<String>(),
+                    "schema translation parsed on first pass"
+                );
+                Ok((raw, Ok(delta)))
+            }
+            Err(first_err) => {
+                tracing::warn!(
+                    error = %first_err,
+                    request = %req.player_request.chars().take(80).collect::<String>(),
+                    "schema translation parse failed; retrying with repair prompt"
+                );
+                let repair = render_repair_prompt(&raw);
+                let raw2 = self.generate_text(&repair)?;
+                match SchemaDelta::from_model_output(&raw2) {
+                    Ok(delta) => Ok((raw2, Ok(delta))),
+                    Err(e) => Ok((
+                        raw2,
+                        Err(format!(
+                            "translation parse failed twice: first={first_err}, retry={e}"
                         )),
                     )),
                 }

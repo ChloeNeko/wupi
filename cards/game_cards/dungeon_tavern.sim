@@ -46,6 +46,7 @@ the hearth, its lock rusted shut. The fire is dying.
     <activities><![CDATA[
 - combat
     ]]></activities>
+    <protagonist>Alex</protagonist>
   </scenario>
 
   <role>
