@@ -953,7 +953,53 @@ async fn chat_send(
     });
 
     let backend_opt = state.backend.lock().expect("backend mutex").clone();
-    let result = if let Some(backend) = backend_opt {
+    // Model-source dispatch: API path constructs a fresh HttpBackend from the
+    // active profile; Local path uses the persistent LlamaCppBackend (or
+    // EchoBackend if no local model loaded). The memory_block + world_state
+    // are folded into the system message by the HttpBackend (APIs take a flat
+    // messages list, not the inter-turn splice the local backend uses).
+    let source = *state.model_source.lock().expect("model_source mutex");
+    let result = if source == api::ModelSource::Api {
+        // Active profile must exist (api_connect validates + sets it). If it's
+        // somehow missing (e.g. config edited mid-session), fall through to
+        // the local path rather than crashing.
+        let profile_opt = {
+            let cfg = state.api_config.lock().expect("api_config mutex");
+            cfg.active_profile().cloned()
+        };
+        match profile_opt {
+            Some(profile) => {
+                let http = llm::HttpBackend::new(profile);
+                match http
+                    .stream(messages, memory_block, world_state, settings.context_size, on_chunk, cancel.clone())
+                    .await
+                {
+                    Ok(text) => text,
+                    Err(e) => {
+                        clear_active_cancel(&state);
+                        rollback_last_user_message(&state, &app).await;
+                        on_event
+                            .send(serde_json::json!({ "type": "error", "message": format!("{e}") }))
+                            .map_err(|e| e.to_string())?;
+                        return Ok(());
+                    }
+                }
+            }
+            None => {
+                // No active profile but source=Api — corrupted state. Surface
+                // it so the user knows to reconnect, then bail.
+                clear_active_cancel(&state);
+                rollback_last_user_message(&state, &app).await;
+                on_event
+                    .send(serde_json::json!({
+                        "type": "error",
+                        "message": "API source selected but no profile connected. Reconnect in the API panel."
+                    }))
+                    .map_err(|e| e.to_string())?;
+                return Ok(());
+            }
+        }
+    } else if let Some(backend) = backend_opt {
         match backend
             .stream(messages, memory_block, world_state, settings.context_size, on_chunk, cancel.clone())
             .await
@@ -1598,10 +1644,36 @@ async fn api_disconnect(state: tauri::State<'_, AppState>) -> Result<(), String>
 async fn api_profile_test(
     profile: api::ApiProfile,
 ) -> Result<serde_json::Value, String> {
-    // NOTE: this requires reqwest (chunk 3 dependency). Stubbed for chunk 2
-    // so the IPC surface compiles without the HTTP dep; chunk 3 fills it in.
-    let _ = profile;
-    Err("api_profile_test not implemented until chunk 3 (reqwest dep lands)".into())
+    let base = profile.endpoint.trim_end_matches('/').to_string();
+    // Hit /models if the endpoint is a bare base; if it already points at
+    // /chat/completions, strip back to the base and try /models from there.
+    let base = base.trim_end_matches("/chat/completions").to_string();
+    let url = format!("{base}/models");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("build client: {e}"))?;
+    let resp = client
+        .get(&url)
+        .bearer_auth(&profile.api_key)
+        .send()
+        .await
+        .map_err(|e| format!("request to {url} failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "API returned {status}: {}",
+            body.chars().take(300).collect::<String>()
+        ));
+    }
+    // Return the raw JSON (shape varies by provider; the frontend just shows
+    // "connected" + optionally the model count). Best-effort parse: if it's
+    // not JSON, return a success marker with the text body.
+    match resp.json::<serde_json::Value>().await {
+        Ok(v) => Ok(v),
+        Err(_) => Ok(serde_json::json!({ "connected": true })),
+    }
 }
 
 /// Debug probe into the schema delta engine (B/C runtime test). Posts a

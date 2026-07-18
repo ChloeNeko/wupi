@@ -18,6 +18,13 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 # Typed errors without boilerplate.
 anyhow = "1"
+# HTTP client for the API chat backend (OpenAI-compatible SSE streaming).
+# rustls-tls avoids any system OpenSSL dependency on Windows; the `stream`
+# feature is required to read the Server-Sent Events response incrementally
+# (token-by-token, same streaming UX as the local model).
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# futures-util for StreamExt — needed to iterate the reqwest SSE byte stream.
+futures-util = "0.3"
 # Regex for the StreamFilter's combined marker-stripping pattern.
 regex = "1"
 # Logging — written to a file in app data; visible only in Debug mode.

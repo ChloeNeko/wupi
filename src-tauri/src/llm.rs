@@ -114,6 +114,232 @@ impl GenerationClient for EchoBackend {
     }
 }
 
+/// HTTP API backend — talks to an OpenAI-compatible chat completions endpoint
+/// (Z.AI, NanoGPT, OpenRouter, OpenAI itself, llama.cpp/vLLM/Ollama servers).
+/// Implements the same [`GenerationClient`] trait as [`LlamaCppBackend`] so
+/// `chat_send` can dispatch on `ModelSource` without caring which backend is
+/// active.
+///
+/// **Streaming:** POST `{endpoint}/chat/completions` with
+/// `{model, messages, stream:true, temperature?}`, read the SSE response
+/// incrementally. Each `data: {...}` line carries a `choices[0].delta.content`
+/// token; forward each to `on_chunk` for live UI rendering. Honors `cancel`
+/// by aborting mid-stream (the equivalent of the local engine's between-token
+/// cancel check).
+///
+/// **Memory + world_state injection:** the local backend splices these into
+/// the inter-turn region via `render_prompt`. An API only takes a flat
+/// `messages` list, so we fold them into the system message (they're already
+/// XML-tagged blocks — `<retrieved_memory>`, `<world_state>` — and read fine
+/// as additional system context). This preserves the retrieval + schema
+/// injection that makes Wupi's memory work, just routed through the system
+/// role instead of a protocol splice.
+///
+/// **No reasoning/raw:** the OpenAI streaming format has no equivalent of the
+/// Gemma4 thought channel. `ParsedOutput.reasoning` + `.raw` are left empty
+/// (the post-generation archiving + schema-delta pipeline keys off `.content`
+/// only, so this is safe).
+pub struct HttpBackend {
+    profile: crate::api::ApiProfile,
+    client: reqwest::Client,
+}
+
+impl HttpBackend {
+    /// Construct from a saved profile. Builds a reqwest client with a generous
+    /// timeout (generation can take minutes for long replies) + the bearer
+    /// token pre-attached so every request on this client is authenticated.
+    pub fn new(profile: crate::api::ApiProfile) -> Self {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if !profile.api_key.is_empty() {
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!(
+                "Bearer {}",
+                profile.api_key
+            )) {
+                headers.insert(reqwest::header::AUTHORIZATION, v);
+            }
+        }
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { profile, client }
+    }
+
+    /// Resolve the full chat-completions URL from the profile's base endpoint.
+    /// Accepts either a bare base (`https://nano-gpt.com/api/v1`) or one that
+    /// already includes the path (`https://x/api/v1/chat/completions`). If the
+    /// endpoint ends with `/`, it's trimmed first.
+    fn completions_url(&self) -> String {
+        let base = self.profile.endpoint.trim_end_matches('/');
+        if base.ends_with("/chat/completions") {
+            base.to_string()
+        } else {
+            format!("{base}/chat/completions")
+        }
+    }
+}
+
+/// A single message in the OpenAI chat request body. The local `ApiMessage`
+/// has a `raw_output` field the API doesn't want — this is the slim wire view.
+/// (Could `#[serde(skip)]` raw_output on ApiMessage instead, but that would
+/// couple the session type to the API wire format; a local view is cleaner.)
+#[derive(serde::Serialize)]
+struct ChatRequestMessage {
+    role: String,
+    content: String,
+}
+
+/// The streaming chunk envelope: `{ choices: [ { delta: { content: "..." } } ] }.
+/// `content` is `Option` because the first chunk typically carries only `role`,
+/// and the final chunk carries `finish_reason` instead. Everything else is
+/// ignored — we only want the delta text.
+#[derive(serde::Deserialize)]
+struct ChatStreamChunk {
+    choices: Vec<ChatStreamChoice>,
+}
+#[derive(serde::Deserialize)]
+struct ChatStreamChoice {
+    delta: ChatStreamDelta,
+}
+#[derive(serde::Deserialize)]
+struct ChatStreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+}
+
+impl GenerationClient for HttpBackend {
+    fn stream(
+        &self,
+        messages: Vec<ApiMessage>,
+        memory_block: Option<String>,
+        world_state: Option<String>,
+        _context_size: u32,
+        on_chunk: ChunkFn,
+        cancel: CancelToken,
+    ) -> StreamFuture {
+        let url = self.completions_url();
+        let model = self.profile.model.clone();
+        let temperature = self.profile.temperature;
+        let client = self.client.clone();
+        Box::pin(async move {
+            // Fold memory_block + world_state into the system message. They're
+            // already XML-tagged blocks; appending them to the existing system
+            // content keeps the retrieval/schema context that Wupi depends on.
+            let mut wire_messages: Vec<ChatRequestMessage> = Vec::with_capacity(messages.len());
+            let mut extra_ctx = String::new();
+            if let Some(mb) = memory_block.as_ref() {
+                if !mb.trim().is_empty() {
+                    extra_ctx.push_str("\n\n");
+                    extra_ctx.push_str(mb);
+                }
+            }
+            if let Some(ws) = world_state.as_ref() {
+                if !ws.trim().is_empty() {
+                    extra_ctx.push_str("\n\n");
+                    extra_ctx.push_str(ws);
+                }
+            }
+            for (i, m) in messages.into_iter().enumerate() {
+                let content = if i == 0 && m.role == "system" && !extra_ctx.is_empty() {
+                    format!("{}{extra_ctx}", m.content)
+                } else {
+                    m.content
+                };
+                wire_messages.push(ChatRequestMessage {
+                    role: m.role,
+                    content,
+                });
+            }
+
+            // Build the request body. `stream: true` requests SSE.
+            let mut body = serde_json::json!({
+                "model": model,
+                "messages": wire_messages,
+                "stream": true,
+            });
+            if let Some(t) = temperature {
+                body["temperature"] = serde_json::json!(t);
+            }
+
+            let response = client
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("API request to {url} failed: {e}"))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                return Err(anyhow::anyhow!(
+                    "API returned {status}: {}",
+                    text.chars().take(500).collect::<String>()
+                ));
+            }
+
+            // Stream the SSE body. Each `data: {json}` line is one token chunk.
+            // `data: [DONE]` terminates the stream. Lines not starting with
+            // `data:` (comments, event headers) are ignored.
+            use futures_util::StreamExt;
+            let mut stream = response.bytes_stream();
+            let mut buffer = String::new();
+            let mut full_content = String::new();
+
+            while let Some(chunk_res) = stream.next().await {
+                // Honor cancel: stop reading + return what we have so far.
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let bytes = chunk_res.map_err(|e| anyhow::anyhow!("SSE read error: {e}"))?;
+                // The chunk may not be UTF8-aligned at boundaries; lossy-convert
+                // since SSE is ASCII-framed and the JSON payloads are UTF8.
+                buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+                // Process complete lines. Keep any trailing partial line in buffer.
+                while let Some(newline_pos) = buffer.find('\n') {
+                    let line = buffer[..newline_pos].trim().to_string();
+                    buffer = buffer[newline_pos + 1..].to_string();
+                    if line.is_empty() || !line.starts_with("data:") {
+                        continue;
+                    }
+                    let data = line["data:".len()..].trim();
+                    if data == "[DONE]" {
+                        buffer.clear();
+                        break;
+                    }
+                    // Parse the JSON chunk; on failure skip (some providers
+                    // send keep-alive comments or partial events we don't care
+                    // about). A malformed chunk must never kill the stream.
+                    if let Ok(parsed) = serde_json::from_str::<ChatStreamChunk>(data) {
+                        if let Some(choice) = parsed.choices.into_iter().next() {
+                            if let Some(piece) = choice.delta.content {
+                                if !piece.is_empty() {
+                                    on_chunk(&piece);
+                                    full_content.push_str(&piece);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(ParsedOutput {
+                content: full_content,
+                reasoning: String::new(),
+                raw: String::new(),
+            })
+        })
+    }
+
+    fn is_ready(&self) -> bool {
+        // An HttpBackend exists only when a profile is connected, so it's
+        // always ready to stream (the network call itself will surface any
+        // connectivity error at stream time).
+        true
+    }
+}
+
 /// The loaded model, as loaded from disk. This is an intermediate value — it
 /// exists only between `load_blocking` and `into_static`, after which the model
 /// is leaked to `&'static` and handed to the engine. The backend is NOT owned
