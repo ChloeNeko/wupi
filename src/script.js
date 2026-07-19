@@ -485,15 +485,16 @@ function setTitleState(state) {
 (function setupBootSplash() {
   // Timing constants (ms).
   const ENTRY_DELAY = 1000;       // blank screen before paw enters (1s per spec)
-  const ENTRY_DURATION = 900;     // paw rises from bottom + quick circle → center
+  const ENTRY_DURATION = 1400;    // paw rises from bottom + circle → center (slowed per spec)
   const HOP_DURATION = 450;       // each hop (up + down) — quick per spec
   const HOP_APEX = HOP_DURATION / 2;
   const HOP_HEIGHT = 80;          // px the inner img rises per hop
   const PAUSE_BETWEEN_HOPS = 120; // tiny rest between hop 1 and hop 2
-  // Sparkle trail: a small sparkle spawns every TRAIL_INTERVAL ms along the
-  // paw's path during entry + flight (NOT during hops — those get the big
-  // escalating bursts). Each trail sparkle is short-lived.
-  const TRAIL_INTERVAL = 55;
+  // Sparkle trail: a sparkle spawns every TRAIL_INTERVAL ms along the paw's
+  // path during entry + flight (NOT during hops — those get the escalating
+  // bursts). Tight interval + bigger/longer-lived sparkles so the trail
+  // reads as an obvious glowing comet tail, not a sparse dot pattern.
+  const TRAIL_INTERVAL = 30;
   // Paw display size at center. The resting paw-img is 45px; ~2.67x makes
   // it ~120px, prominent in the middle of the screen during the hops.
   const PAW_BOOT_SCALE = 2.67;
@@ -574,17 +575,19 @@ function setTitleState(state) {
   function spawnTrailSparkle() {
     if (!bootPaw) return;
     const r = bootPaw.getBoundingClientRect();
-    // getBoundingClientRect already accounts for the paw's scale, so r is
-    // the visual box. Spawn somewhere inside it (slight jitter) so the
-    // trail doesn't look like a single dot.
-    const jx = (Math.random() - 0.5) * r.width * 0.6;
-    const jy = (Math.random() - 0.5) * r.height * 0.6;
-    const s = document.createElement('div');
-    s.className = 'boot-sparkle trail';
-    s.style.left = (r.left + r.width / 2 + jx) + 'px';
-    s.style.top = (r.top + r.height / 2 + jy) + 'px';
-    document.body.appendChild(s);
-    s.addEventListener('animationend', () => s.remove(), { once: true });
+    // Spawn 2 sparkles per tick (offset jitter) so the trail has density
+    // even when the paw is moving fast (rise + flight). Each gets independent
+    // jitter so the trail reads as a glowing band, not a single line.
+    for (let k = 0; k < 2; k++) {
+      const jx = (Math.random() - 0.5) * r.width * 0.7;
+      const jy = (Math.random() - 0.5) * r.height * 0.7;
+      const s = document.createElement('div');
+      s.className = 'boot-sparkle trail';
+      s.style.left = (r.left + r.width / 2 + jx) + 'px';
+      s.style.top = (r.top + r.height / 2 + jy) + 'px';
+      document.body.appendChild(s);
+      s.addEventListener('animationend', () => s.remove(), { once: true });
+    }
   }
 
   // Trail control: setInterval-spawned trail sparkles while `trailActive`
@@ -635,14 +638,21 @@ function setTitleState(state) {
 
     const entryAnim = bootPaw.animate(
       [
-        { transform: `translate(${restCx}px, ${parkCy}px) scale(${PAW_BOOT_SCALE})`, offset: 0 },
-        { transform: `translate(${c0.x}px, ${c0.y}px) scale(${PAW_BOOT_SCALE})`, offset: 0.45 },
-        { transform: `translate(${c1.x}px, ${c1.y}px) scale(${PAW_BOOT_SCALE})`, offset: 0.6 },
-        { transform: `translate(${c2.x}px, ${c2.y}px) scale(${PAW_BOOT_SCALE})`, offset: 0.75 },
-        { transform: `translate(${c3.x}px, ${c3.y}px) scale(${PAW_BOOT_SCALE})`, offset: 0.9 },
+        // Rise: 0 → 0.55 of the duration. easeOutQuint so it decelerates as
+        // it approaches the circle (reads as a graceful arrival, not a slam).
+        { transform: `translate(${restCx}px, ${parkCy}px) scale(${PAW_BOOT_SCALE})`, offset: 0,   easing: 'cubic-bezier(0.22, 1, 0.36, 1)' },
+        { transform: `translate(${c0.x}px, ${c0.y}px) scale(${PAW_BOOT_SCALE})`, offset: 0.55, easing: 'linear' },
+        // Circle: 0.55 → 1.0. LINEAR easing per segment so the paw moves at
+        // constant speed around the arc (ease-in/out on a circle reads as
+        // herky-jerky acceleration at each cardinal point). 4 quarter-arcs
+        // + the final settle = 5 segments at ~9% each.
+        { transform: `translate(${c1.x}px, ${c1.y}px) scale(${PAW_BOOT_SCALE})`, offset: 0.64, easing: 'linear' },
+        { transform: `translate(${c2.x}px, ${c2.y}px) scale(${PAW_BOOT_SCALE})`, offset: 0.73, easing: 'linear' },
+        { transform: `translate(${c3.x}px, ${c3.y}px) scale(${PAW_BOOT_SCALE})`, offset: 0.82, easing: 'linear' },
+        { transform: `translate(${c0.x}px, ${c0.y}px) scale(${PAW_BOOT_SCALE})`, offset: 0.91, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' },
         { transform: `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`, offset: 1 },
       ],
-      { duration: ENTRY_DURATION, easing: 'cubic-bezier(0.22, 1, 0.36, 1)', fill: 'forwards' }
+      { duration: ENTRY_DURATION, fill: 'forwards' }
     );
     entryAnim.onfinish = () => {
       entryAnim.commitStyles();
