@@ -1,6 +1,3 @@
-// Tauri 2 IPC + event APIs. Imported as ES modules now that script.js is
-// `type="module"` (Vite bundles these; withGlobalTauri is off so the
-// `window.__TAURI__` global is NOT injected: the import is the source of truth).
 import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 
@@ -104,18 +101,19 @@ window.addEventListener('resize', () => { cachedSkyGrad = null; });
 // difference is imperceptible (alpha quantized to 8 bands of 0.1).
 const STAR_COLORS = ['#ffffff', '#e8f0ff', '#fff4e6', '#ffe6ee'];
 
-// Waking Canvas: aurora ramp 0 → 1 over ~3s after the boot gate resolves.
-// `auroraIntensity` multiplies ONLY the curtain alpha inside animate() — sky,
-// stars, blur filter, composite op, and the pause logic are untouched. Starts
-// at 0 so the first canvas frame paints sky + stars only; the curtains bloom
-// in as the ramp climbs. Advanced at the top of animate() so it inherits the
-// existing pause/visibility gating for free (no separate RAF loop, no extra
-// pause wiring). The curtain DRAW block is also gated on intensity > 0.001
-// (see animate) so the cheap first frame never pays the 5x blur(30px) cost —
-// that was the lag spike when the aurora spawned in.
+// Boot reveal: aurora ramp 0 → 1 over ~1.0s after the paw lands. "Reveal all
+// the aurora curtains quickly" per spec. `auroraIntensity` multiplies ONLY
+// the curtain alpha inside animate() — sky, stars, blur filter, composite
+// op, and the pause logic are untouched. Starts at 0 so the first canvas
+// frame paints sky + stars only; the curtains bloom in as the ramp climbs.
+// Advanced at the top of animate() so it inherits the existing pause/
+// visibility gating for free (no separate RAF loop, no extra pause wiring).
+// The curtain DRAW block is also gated on intensity > 0.001 (see animate)
+// so the cheap first frame never pays the 5x blur(30px) cost — that was the
+// lag spike when the aurora spawned in.
 let auroraIntensity = 0;
 let auroraRampStart = 0;
-const AURORA_RAMP_MS = 3000;
+const AURORA_RAMP_MS = 1000;
 
 function animate() {
   if (auroraRampStart && auroraIntensity < 1) {
@@ -227,10 +225,11 @@ function animate() {
 
 // Render loop control. `paused` is set by FOUR independent signals so the
 // expensive RAF loop stops the moment the canvas isn't visible to the user:
-//   0. BOOT GATE: `bootDone` is false until wakeCanvas() runs. startLoop()
+//   0. BOOT GATE: `bootDone` is false until setupBootSplash()'s
+//      revealAfterLand() runs (~0.5s after the paw lands). startLoop()
 //      refuses to start while it's false, so no early focus/visibility event
-//      can paint stars behind the boot ring. The canvas stays dormant while
-//      the ring is showing so the body's #02040a is the only thing on screen.
+//      can paint stars behind the boot paw. The canvas stays dormant while
+//      the paw is hopping so the desktop is the only thing behind it.
 //   1. `canvas-pause` event from Rust (system_menu power_sleep).
 //   2. `document.visibilitychange` → hidden (alt-tab, minimize, another app
 //      fully covering the window). The standard browser RAF throttle isn't
@@ -244,9 +243,9 @@ let paused = true;
 let bootDone = false;
 
 function startLoop() {
-  // Boot dormancy: refuse to start until wakeCanvas() clears the gate. Without
-  // this, an early focus/visibility event during the 5s ring hold would
-  // un-pause and paint stars behind the ring.
+  // Boot dormancy: refuse to start until setupBootSplash()'s revealAfterLand()
+  // opens the gate. Without this, an early focus/visibility event during the
+  // 5s paw hop would un-pause and paint stars behind the boot paw.
   if (!bootDone) return;
   if (paused) { paused = false; requestAnimationFrame(animate); }
 }
@@ -278,11 +277,12 @@ window.addEventListener('focus', () => {
 });
 
 // NOTE: animate() is NOT kicked off here at module-load time. The canvas is
-// dormant during the boot ring phase (paused = true). wakeCanvas() starts the
-// RAF once the gate resolves — the first animate() frame paints sky + stars
-// only, then the aurora blooms in over AURORA_RAMP_MS. Calling animate() here
-// would paint stars behind the ring (the bug: "background shows with the
-// circle") AND fight the boot gate.
+// dormant during the boot paw phase (paused = true). setupBootSplash()'s
+// revealAfterLand() opens bootDone + calls startLoop() ~0.5s after the paw
+// lands — the first animate() frame paints sky + stars only, then the aurora
+// blooms in over AURORA_RAMP_MS once the ramp is armed. Calling animate() at
+// module load would paint stars behind the boot paw (the "background shows
+// with the circle" bug) AND fight the boot gate.
 
 // "WUPI OS" title: live AI-status indicator
 // The title reflects the live state of the MAIN chat model (local 12B OR the
@@ -365,48 +365,83 @@ function setTitleState(state) {
   }
 })();
 
-// ─── Boot ring → "Waking Canvas" transition ─────────────────────────────────
+// ─── Boot paw → fly home → staged reveal ────────────────────────────────────
 // The OS window boots transparent + always-on-top (tauri.conf.json) and STAYS
-// transparent for its lifetime — there is no runtime setTransparent() call
-// (this Tauri 2 version doesn't expose that permission). What controls
-// desktop bleed-through is the BODY background-color:
+// transparent for its lifetime. What controls desktop bleed-through is the
+// BODY background-color:
 //   - body.booting         → transparent (CSS) → desktop shows through, only
-//                            the boot ring is visible.
+//                            the boot paw is visible (centered, hopping).
 //   - body:not(.booting)   → #02040a (CSS)     → solid black covers desktop.
-// During the ring phase the canvas is dormant (paused=true, bootDone=false)
-// so no sky/stars leak through. The whole point of the ring: hide the model
-// load + UI init behind a 5s loading wheel so the user never sees lag.
+// During the hop phase the canvas is dormant (paused=true, bootDone=false)
+// so no sky/stars leak through. The whole point of the paw: hide the model
+// load + UI init behind a 5s loading animation so the user never sees lag.
 //
-// On resolve: canvas paints sky+stars (curtains gated to 0) → aurora ramps in
-// over 3s → body goes opaque (CSS rule fires when .booting is removed) → top
-// bar + dock fade in via opacity (NOT transform: transform slides caused the
-// backdrop-filter:blur stutter). All the GPU-expensive chrome uses opacity
-// fades so the backdrop region stays fixed.
+// On resolve: paw FLIES to its home spot (the real .paw-img rect, read via
+// getBoundingClientRect so it's robust against layout changes) and shrinks
+// from ~120px to the resting 45px. After the flight lands, a setTimeout
+// chain reveals the UI in fluid stages:
+//   land +0.0s → drop .booting (body goes opaque #02040a)
+//   land +0.1s → top-bar fade-in begins (0.6s, CSS)
+//   land +0.5s → canvas RAF starts → sky + stars paint (curtains still gated)
+//   land +0.9s → aurora ramp armed → curtains bloom over ~1.0s
+//   land +0.7s → boot-paw fades + removes → real interactive paw revealed
+//   land +1.4s → dock fade-in begins (0.6s, CSS) — "apps and tray last"
 //
 // Gate: chat `model-status: ready` (the 12B load — Rust's single source of
 // truth, Rust is untouched) AND a 5.0s minimum dwell timer. Both must resolve
-// before we transition. The dwell is the spec'd 5s; on slow hardware the
-// model load dominates and we transition immediately on ready. The existing
-// model-status listener above keeps its title-indicator job; this is a
-// SEPARATE listener so the title's `typing` no-op guard can't swallow the
-// wake signal.
+// before the flight begins. The existing model-status listener above keeps
+// its title-indicator job; this is a SEPARATE listener so the title's
+// `typing` no-op guard can't swallow the wake signal.
 (function setupBootSplash() {
   const MIN_DWELL_MS = 5000;
+  // Paw display size at center. The resting paw-img is 45px; ~2.67x makes
+  // it ~120px, prominent in the middle of the screen during the hop.
+  const PAW_BOOT_SCALE = 2.67;
+  const PAW_REST_SIZE = 45;
+  // Staged-reveal delays (ms) measured from flight-land (transitionend).
+  const DELAY_SKY = 500;
+  const DELAY_AURORA = 900;
+  const DELAY_PAW_REMOVE = 700;
+
   let modelReady = false;
   let dwellDone = false;
   let transitioned = false;
+
+  const bootPaw = document.getElementById('boot-paw');
+  const bootPawImg = bootPaw ? bootPaw.querySelector('.boot-paw-img') : null;
+  const realPaw = document.querySelector('.paw-img');
 
   // <body> already carries .booting from index.html; this is belt-and-suspenders
   // for the dev-preview case where the HTML might not have it.
   document.body.classList.add('booting');
 
+  // ── Phase 0: position the boot paw at viewport center, scaled up, BEFORE
+  //    any transition can fire. Setting transform inline at module-eval time
+  //    means the first paint already has it at center — no flash from (0,0).
+  //    The hop animation (.boot-paw-img bootHop) runs on the inner img so it
+  //    never fights #boot-paw's translate/scale flight transform.
+  if (bootPaw) {
+    // Layout box is the resting 45x45 (kept small so the pointer-events
+    // bounding box matches the resting size; #boot-paw is pointer-events:none
+    // anyway during boot). scale() grows the VISUAL around the default
+    // transform-origin (50% 50%, the box center), so to land the visual
+    // center at viewport center we translate the UNSCALED layout box's
+    // center to viewport center: translate = viewportCenter - restSize/2.
+    const restCx = (window.innerWidth - PAW_REST_SIZE) / 2;
+    const restCy = (window.innerHeight - PAW_REST_SIZE) / 2;
+    bootPaw.style.width = PAW_REST_SIZE + 'px';
+    bootPaw.style.height = PAW_REST_SIZE + 'px';
+    bootPaw.style.transform =
+      `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`;
+  }
+
   function maybeTransition() {
     if (transitioned || !(modelReady && dwellDone)) return;
     transitioned = true;
-    wakeCanvas();
+    flyPawHome();
   }
 
-  // Min-dwell timer: guarantees the splash is visible long enough to register
+  // Min-dwell timer: guarantees the hop is visible long enough to register
   // even if the model loads instantly.
   setTimeout(() => { dwellDone = true; maybeTransition(); }, MIN_DWELL_MS);
 
@@ -418,7 +453,7 @@ function setTitleState(state) {
     }
   }).catch(() => {});
   // Safety net: no_model (echo mode) / error also resolve the gate so the user
-  // is never trapped behind the splash if the model path fails. The title
+  // is never trapped behind the boot phase if the model path fails. The title
   // indicator still shows 'offline' via the listener above.
   listen('model-status', (e) => {
     const s = e?.payload?.status;
@@ -428,33 +463,76 @@ function setTitleState(state) {
     }
   }).catch(() => {});
 
-  function wakeCanvas() {
-    // 1. Open the boot gate so startLoop() will accept the RAF, then start
-    //    the canvas. `paused` was true during the boot ring phase (canvas
-    //    dormant). The first animate() frame paints sky + stars only — the
-    //    curtain block is gated on auroraIntensity > 0.001, which is still
-    //    0 here.
-    bootDone = true;
-    startLoop();
-    // 2. Arm the aurora ramp. animate() advances auroraIntensity 0 → 1 over
-    //    AURORA_RAMP_MS; the first post-gate frame paints sky + stars only,
-    //    then the curtains bloom in over ~3s.
-    auroraRampStart = performance.now();
-    // 3. Drop body.booting → body's background-color goes from transparent to
-    //    #02040a (CSS rule), which is what stops the desktop from bleeding
-    //    through. (The OS window itself stays transparent at all times per
-    //    tauri.conf.json: what hides the desktop is the body's solid
-    //    background covering it.) Also fades the top-bar/dock in via opacity
-    //    (NOT transform: avoids the backdrop-filter re-sample stutter).
-    document.body.classList.remove('booting');
-    // 4. Fade the splash out, then remove it from the DOM. transitionend +
-    //    {once:true} guarantees one-shot cleanup; pointer-events:none on
-    //    .fade-out means even a stalled transition can't block the UI.
-    const splash = document.getElementById('boot-splash');
-    if (splash) {
-      splash.classList.add('fade-out');
-      splash.addEventListener('transitionend', () => splash.remove(), { once: true });
+  // ── Phase 1: fly the paw from center → home. Reads the real .paw-img's
+  //    current rect so the landing is pixel-accurate regardless of layout.
+  function flyPawHome() {
+    if (!bootPaw) { revealAfterLand(); return; }
+    // Stop the hop so the landing is precise (no residual translateY on the
+    // inner img fighting the flight).
+    if (bootPawImg) bootPawImg.style.animation = 'none';
+
+    // Read the real paw's resting rect. During boot the top-bar is at
+    // opacity:0 but still laid out (NOT display:none), so getBoundingClientRect
+    // returns the true home coordinates.
+    let targetX = 0, targetY = 0;
+    if (realPaw) {
+      const r = realPaw.getBoundingClientRect();
+      targetX = r.left;
+      targetY = r.top;
     }
+
+    // One-shot: when the flight transition ends, run the staged reveal.
+    // transitionend fires once per property; filter to 'transform' so we
+    // don't double-fire on opacity etc.
+    const onLand = (e) => {
+      if (e.propertyName !== 'transform') return;
+      bootPaw.removeEventListener('transitionend', onLand);
+      revealAfterLand();
+    };
+    bootPaw.addEventListener('transitionend', onLand);
+
+    // Set the target transform: translate to home + scale(1). The CSS
+    // transition on #boot-paw (transform 1.2s spring) animates the flight.
+    // rAF double-buffer: wait one frame so the browser commits the start
+    // transform before we set the target, guaranteeing the transition runs.
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        bootPaw.style.transform =
+          `translate(${targetX}px, ${targetY}px) scale(1)`;
+      });
+    });
+  }
+
+  // ── Phase 2: staged reveal. Called when the paw lands. Each step is a
+  //    setTimeout off the landing moment, per the choreography table in
+  //    the header comment.
+  function revealAfterLand() {
+    // +0.0s: drop .booting. Body goes opaque #02040a (CSS), AND the top-bar
+    // + dock opacity transitions arm (their CSS rules key off :not(.booting)).
+    // The top-bar's 0.1s delay means it starts fading in almost immediately;
+    // the dock's 1.4s delay holds it for last.
+    document.body.classList.remove('booting');
+
+    // +0.5s: start the canvas RAF. First frame paints sky + stars only
+    // (curtain block gated on auroraIntensity > 0.001, still 0 here).
+    setTimeout(() => {
+      bootDone = true;
+      startLoop();
+    }, DELAY_SKY);
+
+    // +0.9s: arm the aurora ramp → curtains bloom in over AURORA_RAMP_MS.
+    setTimeout(() => {
+      auroraRampStart = performance.now();
+    }, DELAY_AURORA);
+
+    // +0.7s: fade + remove the boot paw. By now the top-bar is visible
+    // enough that the real .paw-img reads as a continuous handoff (the
+    // boot-paw was covering it). Fade avoids a hard pop.
+    setTimeout(() => {
+      if (!bootPaw) return;
+      bootPaw.classList.add('fade-out');
+      bootPaw.addEventListener('transitionend', () => bootPaw.remove(), { once: true });
+    }, DELAY_PAW_REMOVE);
   }
 })();
 

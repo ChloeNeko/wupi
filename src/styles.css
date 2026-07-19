@@ -5,8 +5,9 @@ html, body {
     height: 100%;
     overflow: hidden;
     /* During boot (body.booting) the window is transparent so the desktop
-       shows through with just the boot ring. After boot, body gets the
-       solid starry-sky base color (the canvas paints the gradient on top). */
+       shows through with just the boot paw (centered, hopping). After the
+       paw lands, body gets the solid starry-sky base color (the canvas
+       paints the gradient on top). */
     background-color: transparent;
 }
 body:not(.booting) {
@@ -44,13 +45,13 @@ body:not(.booting) {
     letter-spacing: 0.5px;
     z-index: 9999;
     user-select: none;
-    /* Waking Canvas: opacity-fade-in (NOT transform slide). The old slide
+    /* Boot reveal: opacity-fade-in (NOT transform slide). The old slide
        stuttered because backdrop-filter:blur re-samples the backdrop every
        frame as the element moves — an opacity fade keeps the backdrop region
        fixed so only the cheap alpha channel animates. Top bar stays at top:0
-       throughout; .booting sets opacity:0 + pointer-events:none. The 0.4s
-       delay stages it just as the boot ring finishes fading. */
-    transition: opacity 0.7s ease-out 0.4s;
+       throughout; .booting sets opacity:0 + pointer-events:none. The 0.1s
+       delay fires it the instant the paw lands (script.js drops .booting). */
+    transition: opacity 0.6s ease-out 0.1s;
 }
 body.booting .top-bar {
     opacity: 0;
@@ -407,13 +408,14 @@ body:not(.booting) .top-bar {
     /* The container peeks ~10px above the bottom edge; give a small hover
        margin above it so the user doesn't have to pixel-aim. */
     padding-top: 12px;
-    /* Waking Canvas: opacity-fade-in (NOT translateY slide). Same reasoning
+    /* Boot reveal: opacity-fade-in (NOT translateY slide). Same reasoning
        as .top-bar: backdrop-filter:blur re-samples the backdrop every frame
        during a transform animation, which is what stuttered. Opacity fade
        keeps the backdrop region fixed + cheap. Centered via translateX(-50%)
        which is composed with the opacity transition (no transform animation
-       on the centered element). The 1.0s delay stages it after the top bar. */
-    transition: opacity 0.7s ease-out 1.0s;
+       on the centered element). The 1.4s delay stages it LAST per spec —
+       top bar, then starry bg, then aurora, then apps/dock. */
+    transition: opacity 0.6s ease-out 1.4s;
 }
 body.booting .dock-trigger-area {
     opacity: 0;
@@ -1606,49 +1608,49 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 .chat-stop-btn:not(:disabled):hover { background: rgba(255, 80, 80, 0.25); color: #fff; }
 
 /* ───────────────────────────────────────────────────────────────────────
-   Boot splash — the aurora ring only. Paints on first frame over the
-   already-dark body (inline background in index.html guarantees no white
-   flash before styles.css loads). The window boots fullscreen directly
-   (tauri.conf.json), so this never has to mask a resize or cover the
-   desktop: it is a transparent overlay that fades + self-removes once the
-   boot gate resolves (script.js). Pure CSS: conic-gradient masked into a
-   ring + two compositor-only animations (transform rotate + filter pulse).
-   Zero RAF, zero asset weight, ~0 CPU.
+   Boot paw — the WUPI mascot paw.png flies from screen-center to its
+   resting home in the top-left paw button. Lives at z-index 100000 (above
+   the top-bar's 9999) so it can land ON TOP of the real .paw-img spot
+   during the reveal, then get removed the instant the top bar is visible.
+   Position is set entirely via JS transform on #boot-paw (translate + scale
+   composed); the inner img only carries the hop animation so the two
+   transforms never fight. GPU-accelerated end-to-end (transform + opacity
+   only, no layout properties animated).
    ─────────────────────────────────────────────────────────────────────── */
-#boot-splash {
+#boot-paw {
     position: fixed;
-    inset: 0;
-    z-index: 99999;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    /* Transparent: the body's #02040a background shows through. No panel,
-       no vignette — just the ring over the dark canvas. */
-    background: transparent;
-    transition: opacity 0.6s ease-out;
-}
-#boot-splash.fade-out {
-    opacity: 0;
+    left: 0;
+    top: 0;
+    width: 45px;
+    height: 45px;
+    z-index: 100000;
     pointer-events: none;
+    /* The flight transition. translate + scale are composed by JS into one
+       matrix so the browser animates a single compositor transform. The
+       opacity transition is for the final removal fade. */
+    transition: transform 1.2s cubic-bezier(0.175, 0.885, 0.32, 1.1),
+                opacity 0.3s ease-out;
+    /* Initial transform is set by script.js at module load (centered +
+       scaled up) BEFORE any transition can fire, so the first paint is
+       already at the start position. */
+}
+#boot-paw.fade-out {
+    opacity: 0;
 }
 
-/* Aurora ring: conic sweep magenta → sky → violet → magenta. The radial
-   mask carves the center hole so it reads as a ring, not a disc. The
-   drop-shadow gives the glow halo (NOT a box-shadow: drop-shadow follows
-   the masked ring shape, box-shadow would square off). */
-.boot-ring {
-    width: 260px;
-    height: 260px;
-    border-radius: 50%;
-    background: conic-gradient(from 0deg, #b534fa, #66e0ff, #9b5cff, #b534fa);
-    -webkit-mask: radial-gradient(circle, transparent 58%, #000 60%);
-    mask: radial-gradient(circle, transparent 58%, #000 60%);
-    animation: ringSpin 3s linear infinite, ringPulse 2.4s ease-in-out infinite;
+/* Inner img: the hop animation lives here, separate from #boot-paw's
+   translate/scale flight transform. Compositor-only (translateY). Stopped
+   by script.js (animation: none) the instant the flight begins so the
+   landing is precise. */
+.boot-paw-img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+    filter: drop-shadow(0 0 14px rgba(181, 120, 255, 0.45));
+    animation: bootHop 0.9s ease-in-out infinite;
 }
-@keyframes ringSpin {
-    to { transform: rotate(360deg); }
-}
-@keyframes ringPulse {
-    0%, 100% { filter: drop-shadow(0 0 22px rgba(181, 52, 250, 0.5)); }
-    50%      { filter: drop-shadow(0 0 42px rgba(102, 224, 255, 0.8)); }
+@keyframes bootHop {
+    0%, 100% { transform: translateY(0); }
+    50%      { transform: translateY(-14px); }
 }

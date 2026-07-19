@@ -10,13 +10,14 @@
     <!-- Boot phase: the OS window is transparent (tauri.conf.json) and STAYS
          transparent for its lifetime. What hides the desktop is the BODY
          background-color. During boot (body.booting) body is transparent, so
-         the user sees their desktop through the window — only the boot ring
-         is visible. After the 5s gate resolves, script.js drops .booting →
-         body's CSS rule gives it #02040a (solid black) which covers the
-         desktop, and the canvas paints the starry sky + aurora on top. -->
-    <div id="boot-splash">
-        <div class="boot-ring"></div>
-    </div>
+         the user sees their desktop through the window — only the boot paw
+         is visible (centered, hopping). After the 5s gate resolves, the paw
+         flies to its home spot in the top-left, then script.js drops .booting
+         → body's CSS rule gives it #02040a (solid black) which covers the
+         desktop, and the canvas paints the starry sky + aurora on top.
+         z-index 100000 puts #boot-paw above the top-bar (9999) and all
+         app-windows (1000) so it can fly over everything during landing. -->
+    <div id="boot-paw"><img src="paw.png" class="boot-paw-img" alt="" /></div>
     <div class="top-bar">
         <div class="menu-container">
             <button class="paw-btn" id="pawBtn" aria-label="System Menu">
