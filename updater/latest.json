@@ -1,0 +1,11 @@
+{
+  "version": "0.1.0",
+  "notes": "WUPI v0.1.0\n\nAuto-built + signed release from local machine.",
+  "pub_date": "2026-07-19T23:35:30.988Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTZ1FIb1g4S0JubGs1YjlPaU9QbTlOM2FvczhmNDFKVFpCTGxobmYzSWIwN2YrbTVXLzgzRkNYU202K1VMSnp0eHFodUhac0pFRnlwZi9sRnVGZ0xiRm5KWkFkYS9sUWd3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0NTA0MTE5CWZpbGU6V1VQSV8wLjEuMF94NjQtc2V0dXAuZXhlCnE4OUx6dmZpMk9tTDl3dGZHc21tR2kxOXN3cFBWMVVYcDc1WGFqRHdrSjZOLzVQREpPUThCeHpRbnVVMWkwNEhKTGlWdHk0d3hwTitMamlJN2g3T0F3PT0K",
+      "url": "https://github.com/ChloeNeko/WUPI/releases/download/v0.1.0/WUPI_0.1.0_x64-setup.exe"
+    }
+  }
+}
