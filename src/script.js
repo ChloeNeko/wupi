@@ -123,39 +123,33 @@ const STAR_COLORS = ['#ffffff', '#e8f0ff', '#fff4e6', '#ffe6ee'];
 // Boot reveal: aurora curtains reveal LEFT-TO-RIGHT (a "wipe" rather than a
 // global opacity ramp). The wipe is BOTH an aesthetic choice AND a perf fix.
 //
-// Three gates work together:
+// Two gates work together:
 //   auroraIntensity   — the overall fade-in (0 → 1 over AURORA_RAMP_MS).
 //   auroraRevealX     — the left-to-right wipe position (px).
-//   auroraBufFrozen   — when true, the offscreen buffer holds a snapshot
-//                       and isn't redrawn (the wipe only changes the blit
-//                       slice, not the curtain shapes). At rest this is
-//                       false so the aurora animates live.
 //
-// The boot-wipe stutter fix (3 layered wins):
+// The boot-wipe stutter fix (2 layered wins):
 // 1. Offscreen buffer: 5 curtains rendered with NO blur, then ONE blurred
 //    blit to main → 5x fewer Gaussian passes per frame.
-// 2. Dirty flag: during the wipe the buffer is frozen (curtain shapes barely
-//    change in 0.5s, and any frozen-frame artifacts are masked by the blur
-//    + the wipe's own motion). Zero buffer redraw cost during the wipe.
-// 3. Interpolated blur radius (10px → 30px with intensity): Gaussian cost
+// 2. Interpolated blur radius (10px → 30px with intensity): Gaussian cost
 //    scales roughly with radius², so blur(10px) at wipe-start is ~9x cheaper
 //    than blur(30px). The visual blooms as it reveals.
-// All three fire only during the wipe. At rest the buffer redraws live with
+// Both fire only during the wipe. At rest the buffer redraws live with
 // the full 30px blur, identical to the locked aesthetic.
+//
+// NOTE: the buffer is NEVER frozen during the wipe. An earlier version held
+// a snapshot (auroraBufFrozen) to skip per-frame curtain redraws, but that
+// caused a visible "frozen then resumes" color/shape snap when the freeze
+// released — `time` advanced while the buffer didn't, so the curtain waves
+// + hues jumped forward in their cycle. The single-blur-pass optimization
+// above is enough on its own; the curtain fills are cheap path operations.
 let auroraIntensity = 0;
 let auroraRampStart = 0;
-const AURORA_RAMP_MS = 1200;
+const AURORA_RAMP_MS = 900;
 // The wipe runs concurrently with the intensity ramp. Shorter than RAMP_MS
 // so the wipe front finishes ahead of the full-opacity settle.
 let auroraRevealX = 0;          // current wipe x (px, CSS px)
 let auroraRevealStart = 0;      // 0 = not yet armed
-const AURORA_WIPE_MS = 1200;
-// Buffer dirty flag: false = redraw curtains every frame (live at rest);
-// true = hold the snapshot (during the wipe, set by revealAfterLand).
-// auroraBufDirty: when frozen, render exactly once at full intensity, then
-// hold. Cleared on the first frozen render, re-armed when the freeze engages.
-let auroraBufFrozen = false;
-let auroraBufDirty = false;
+const AURORA_WIPE_MS = 950;
 // Blur radius floor/ceiling (CSS px). Gaussian cost ~ radius².
 const AURORA_BLUR_FLOOR = 10;
 const AURORA_BLUR_CEIL = 30;
@@ -231,52 +225,46 @@ function animate() {
     const curtains = 5;
     const baseCenterY = height * 0.42;
 
-    // ── Pass 1: render curtains to offscreen buffer (NO blur), UNLESS the
-    //    buffer is frozen AND already rendered this freeze. The freeze is set
-    //    during the boot wipe (curtain shapes barely move in 0.5s, and any
-    //    frozen-frame drift is masked by the blur + the wipe's own motion).
-    //    At rest the freeze is cleared so the aurora animates live.
-    if (!auroraBufFrozen || auroraBufDirty) {
-      auroraBufCtx.setTransform(1, 0, 0, 1, 0, 0);
-      auroraBufCtx.clearRect(0, 0, auroraBuf.width, auroraBuf.height);
-      auroraBufCtx.scale(dpr, dpr);
-      auroraBufCtx.globalCompositeOperation = 'source-over';
+    // ── Pass 1: render curtains to offscreen buffer every frame (live
+    //    animation through the wipe — the "frozen snapshot" optimization
+    //    was REMOVED because it caused a visible color/shape snap when the
+    //    freeze released). NO blur here; Pass 2 blurs the composite once.
+    auroraBufCtx.setTransform(1, 0, 0, 1, 0, 0);
+    auroraBufCtx.clearRect(0, 0, auroraBuf.width, auroraBuf.height);
+    auroraBufCtx.scale(dpr, dpr);
+    auroraBufCtx.globalCompositeOperation = 'source-over';
 
-      // When frozen, paint at FULL intensity — the fade-in is driven by the
-      // interpolated blur radius (10→30) + the wipe, not per-curtain alpha.
-      // This snapshot is what the wipe reveals left-to-right.
-      const a = auroraBufFrozen ? 0.18 : (0.18 * auroraIntensity);
-      for (let i = 0; i < curtains; i++) {
-        const speed = time * (0.1 + i * 0.04);
-        const thickness = 45 + i * 15;
-        const yOffset = (i - (curtains / 2)) * 12;
-        const activeCenterY = baseCenterY + yOffset;
+    // Per-curtain alpha scales with intensity so the fade-in is driven both
+    // by the interpolated blur radius (10→30) AND by alpha. The wipe then
+    // sweeps the composite left-to-right.
+    const a = 0.18 * auroraIntensity;
+    for (let i = 0; i < curtains; i++) {
+      const speed = time * (0.1 + i * 0.04);
+      const thickness = 45 + i * 15;
+      const yOffset = (i - (curtains / 2)) * 12;
+      const activeCenterY = baseCenterY + yOffset;
 
-        auroraBufCtx.beginPath();
-        for (let x = -150; x <= width + 150; x += 40) {
-          const y = activeCenterY
-                  + Math.sin(x * 0.0015 + speed + i * 2.3) * 85
-                  + Math.cos(x * 0.0008 - speed) * 45
-                  - thickness;
-          if (x === -150) auroraBufCtx.moveTo(x, y);
-          else auroraBufCtx.lineTo(x, y);
-        }
-        for (let x = width + 150; x >= -150; x -= 40) {
-          const y = activeCenterY
-                  + Math.sin(x * 0.0015 + speed + i * 2.3) * 85
-                  + Math.cos(x * 0.0008 - speed) * 45
-                  + thickness;
-          auroraBufCtx.lineTo(x, y);
-        }
-        auroraBufCtx.closePath();
-
-        const hue = currentPalette.hueBase + Math.sin(time * 1.0 + i) * currentPalette.hueRange;
-        auroraBufCtx.fillStyle = `hsla(${hue}, 100%, 65%, ${a})`;
-        auroraBufCtx.fill();
+      auroraBufCtx.beginPath();
+      for (let x = -150; x <= width + 150; x += 40) {
+        const y = activeCenterY
+                + Math.sin(x * 0.0015 + speed + i * 2.3) * 85
+                + Math.cos(x * 0.0008 - speed) * 45
+                - thickness;
+        if (x === -150) auroraBufCtx.moveTo(x, y);
+        else auroraBufCtx.lineTo(x, y);
       }
-      // If we just rendered the frozen snapshot, clear dirty so subsequent
-      // frozen frames skip the redraw.
-      if (auroraBufFrozen) auroraBufDirty = false;
+      for (let x = width + 150; x >= -150; x -= 40) {
+        const y = activeCenterY
+                + Math.sin(x * 0.0015 + speed + i * 2.3) * 85
+                + Math.cos(x * 0.0008 - speed) * 45
+                + thickness;
+        auroraBufCtx.lineTo(x, y);
+      }
+      auroraBufCtx.closePath();
+
+      const hue = currentPalette.hueBase + Math.sin(time * 1.0 + i) * currentPalette.hueRange;
+      auroraBufCtx.fillStyle = `hsla(${hue}, 100%, 65%, ${a})`;
+      auroraBufCtx.fill();
     }
 
     // ── Pass 2: blit the composite with ONE interpolated blur pass.
@@ -458,14 +446,16 @@ function setTitleState(state) {
 // CHOREOGRAPHY (per spec, refined):
 //   0.0s  Blank screen (paw parked below the bottom edge, off-screen,
 //         opacity:0 so no top-left flash).
-//   1.0s  Paw ENTERS from the bottom, RISES + does a QUICK CLOCKWISE CIRCLE
-//         around viewport center, settles at center. Sparkle TRAIL follows
-//         the paw's path (small fixed-position sparkles spawned every ~30ms).
-//   ~3.6s Two QUICK hops. Each apex spawns a sparkle burst that ESCALATES:
+//   1.0s  Paw ENTERS from the bottom, RISES to center, then ZOOMS in a
+//         sporadic fairy path: dart LEFT → dart RIGHT → return CENTER.
+//         Sparkle TRAIL follows the paw's path (small fixed-position
+//         sparkles spawned every ~25ms) — reads as a comet tail.
+//   ~3.0s Two QUICK hops. Each apex spawns a sparkle burst that ESCALATES:
 //         hop 1 = 8 small sparkles, hop 2 = 16 bigger multi-colored ones.
 //         Trail is paused during the hops so the bursts get the spotlight.
-//   ~4.6s Paw FLIES to its home spot in the top-left (the real .paw-img
-//         rect), shrinking ~120px → 45px. Trail restarts for the flight.
+//   ~3.8s Paw FLIES to its home spot in the top-left (the real .paw-img
+//         rect), shrinking ~153px → 45px as it travels. Trail restarts
+//         for the flight.
 //   land  Final big multi-colored burst (capstone), then LOADING SCREEN
 //         fades in over everything (violet abyss + "LOADING OS . . ." text
 //         + terminal stream). Runs LOADING_DURATION_MS (~8s).
@@ -491,19 +481,27 @@ function setTitleState(state) {
 (function setupBootSplash() {
   // Timing constants (ms).
   const ENTRY_DELAY = 1000;       // blank screen before paw enters (1s per spec)
-  const ENTRY_DURATION = 2800;    // paw rises + 16-point circle → center (slowed further per spec)
-  const HOP_DURATION = 550;       // each hop (up + down) — slowed per spec
+  // Fairy-zoom choreography: rise → dart LEFT → dart RIGHT → return CENTER.
+  // Each dart is ~500ms with sharp in/out easing (ZOOM_EASE) so the paw
+  // reads as a fairy teleporting with momentum, not a smooth glide. The
+  // old 16-point circle (2800ms) was too measured; this is sporadic.
+  const ENTRY_DURATION = 2000;
+  // Sharp accel + sharp decel — the "fairy dart" easing. Most of the
+  // motion happens in the middle of the segment, with hard start/stop.
+  const ZOOM_EASE = 'cubic-bezier(0.65, 0, 0.35, 1)';
+  const HOP_DURATION = 320;       // each hop (up + down) — quick per spec
   const HOP_APEX = HOP_DURATION / 2;
-  const HOP_HEIGHT = 80;          // px the inner img rises per hop
-  const PAUSE_BETWEEN_HOPS = 180; // tiny rest between hop 1 and hop 2
+  const HOP_HEIGHT = 70;          // px the inner img rises per hop
+  const PAUSE_BETWEEN_HOPS = 80;  // tight rest between hop 1 and hop 2
   // Sparkle trail: a sparkle spawns every TRAIL_INTERVAL ms along the paw's
   // path during entry + flight (NOT during hops — those get the escalating
   // bursts). Tight interval + bigger/longer-lived sparkles so the trail
   // reads as an obvious glowing comet tail, not a sparse dot pattern.
-  const TRAIL_INTERVAL = 30;
-  // Paw display size at center. The resting paw-img is 45px; ~2.67x makes
-  // it ~120px, prominent in the middle of the screen during the hops.
-  const PAW_BOOT_SCALE = 2.67;
+  const TRAIL_INTERVAL = 25;
+  // Paw display size at center. The resting paw-img is 45px; ~3.4x makes
+  // it ~153px — noticeably bigger per spec so the fairy reads at distance
+  // during the darts.
+  const PAW_BOOT_SCALE = 3.4;
   const PAW_REST_SIZE = 45;
   // Staged-reveal delays (ms) measured from flight-land (transitionend).
   // Top-bar fade is 0.6s in CSS; aurora wipe arms AFTER it finishes so the
@@ -582,17 +580,17 @@ function setTitleState(state) {
   }
 
   // ── Trail sparkle: one small sparkle spawned at the paw's current screen
-  //    position. Used by the trail timer during entry/circle/flight. The
+  //    position. Used by the trail timer during entry/darts/flight. The
   //    sparkle is appended to <body> (NOT #boot-paw) at fixed viewport
   //    coords so it stays where it spawned instead of inheriting the paw's
   //    transform. Self-cleans on animationend.
   function spawnTrailSparkle() {
     if (!bootPaw) return;
     const r = bootPaw.getBoundingClientRect();
-    // Spawn 2 sparkles per tick (offset jitter) so the trail has density
-    // even when the paw is moving fast (rise + flight). Each gets independent
-    // jitter so the trail reads as a glowing band, not a single line.
-    for (let k = 0; k < 2; k++) {
+    // Spawn 3 sparkles per tick (offset jitter) so the trail has density
+    // even when the paw is moving fast during the darts. Each gets
+    // independent jitter so the trail reads as a glowing band, not a line.
+    for (let k = 0; k < 3; k++) {
       const jx = (Math.random() - 0.5) * r.width * 0.7;
       const jy = (Math.random() - 0.5) * r.height * 0.7;
       const s = document.createElement('div');
@@ -618,8 +616,8 @@ function setTitleState(state) {
 
   // ── Entry + hops. Uses the Web Animations API so we can dispatch sparkle
   //    bursts at exact hop apexes. The inner img's translateY animates the
-  //    hops; #boot-paw's translate/scale are reserved for the entry arc +
-  //    circle and the later flight.
+  //    hops; #boot-paw's translate/scale are reserved for the entry darts +
+  //    the later flight.
   function startEntryAndHops() {
     if (!bootPaw || !bootPawImg) { hopsDone = true; maybeFly(); return; }
 
@@ -628,58 +626,42 @@ function setTitleState(state) {
     bootPaw.style.transition = 'transform 0.8s cubic-bezier(0.22, 1, 0.36, 1)';
     bootPaw.style.opacity = '1';
 
-    // Start the sparkle trail — it follows the paw through entry + circle.
+    // Start the sparkle trail — it follows the paw through the fairy-zoom.
     startTrail();
 
-    // Entry path: rise from below → smooth clockwise circle around viewport
-    // center → settle at center. Built as a WAAPI keyframe sequence.
-    //
-    // The circle uses 16 KEYFRAMES (every 22.5°) instead of the old 4 — that
-    // was the "diamond" effect: 4 cardinal points with linear interp between
-    // them produces straight chord segments, not an arc. 16 points + linear
-    // per-segment easing produces a visually round circle (the chords are
-    // short enough that the eye reads them as a smooth curve). Radius also
-    // widened 90 → 140 so the circle reads as a real flourish, not a wiggle.
+    // Entry path: rise from below → dart LEFT → dart RIGHT → return CENTER.
+    // The "fairy-zoom": each dart is a hard in/out zoom (ZOOM_EASE) so the
+    // paw reads as a fairy teleporting with momentum, leaving a sparkle
+    // trail like a comet. Sporadic, not circular.
     const restCx = (window.innerWidth - PAW_REST_SIZE) / 2;
     const restCy = (window.innerHeight - PAW_REST_SIZE) / 2;
     const parkCy = window.innerHeight + 50;
-    const CIRCLE_RADIUS = 140;
-    const CIRCLE_POINTS = 16;
-    // Rise takes 0 → 0.4 of the duration; circle takes 0.4 → 1.0 (60% — the
-    // circle is the star, the rise just gets the paw up to it).
-    const RISE_END = 0.4;
-    // Start angle = -π/2 (top of circle, where the rise merges in). Sweep
-    // clockwise = increasing angle in screen coords (y grows downward).
-    const startAngle = -Math.PI / 2;
-    // Build the circle keyframes: 16 points + the final settle-to-center.
-    const circleKeyframes = [];
-    for (let i = 0; i <= CIRCLE_POINTS; i++) {
-      const t = i / CIRCLE_POINTS;                       // 0..1 around the circle
-      const angle = startAngle + t * Math.PI * 2;        // full revolution
-      const x = restCx + Math.cos(angle) * CIRCLE_RADIUS;
-      const y = restCy + Math.sin(angle) * CIRCLE_RADIUS;
-      const offset = RISE_END + t * (1 - RISE_END);      // map into [RISE_END, 1]
-      circleKeyframes.push({
-        transform: `translate(${x}px, ${y}px) scale(${PAW_BOOT_SCALE})`,
-        offset,
-        easing: 'linear',  // constant speed around the arc — no cardinal bumps
-      });
-    }
-    // The very last circle keyframe (i = CIRCLE_POINTS) lands back at the
-    // top of the circle. Replace its target with the rest-center so the paw
-    // settles to center at the end of the loop instead of staying on the rim.
-    circleKeyframes[circleKeyframes.length - 1] = {
-      transform: `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`,
-      offset: 1,
-      easing: 'cubic-bezier(0.22, 1, 0.36, 1)',
-    };
+    // Dart endpoints. The LEFT/RIGHT darts push near the viewport edges so
+    // the zoom range reads as crossing the whole screen, not a wiggle.
+    // Vertical stays at restCy (level flight) — the darts are horizontal
+    // per spec ("zooms to the left, then zooms to the right, then zooms
+    // to the center").
+    const DART_RANGE = 0.62;       // 0.62 of half-width = energetic darts
+    const leftX = Math.max(40, restCx - window.innerWidth * DART_RANGE / 2);
+    const rightX = Math.min(window.innerWidth - PAW_REST_SIZE - 40,
+                            restCx + window.innerWidth * DART_RANGE / 2);
 
     const entryAnim = bootPaw.animate(
       [
-        // Rise: 0 → RISE_END. easeOutQuint so it decelerates as it approaches
-        // the circle (reads as a graceful arrival, not a slam).
-        { transform: `translate(${restCx}px, ${parkCy}px) scale(${PAW_BOOT_SCALE})`, offset: 0, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' },
-        ...circleKeyframes,
+        // 0 → 0.30: rise from below to center.
+        { transform: `translate(${restCx}px, ${parkCy}px) scale(${PAW_BOOT_SCALE})`,
+          offset: 0, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' },
+        { transform: `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`,
+          offset: 0.30, easing: ZOOM_EASE },
+        // 0.30 → 0.55: dart LEFT (hard accel, hard stop).
+        { transform: `translate(${leftX}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`,
+          offset: 0.55, easing: ZOOM_EASE },
+        // 0.55 → 0.80: dart RIGHT (cross the whole screen in one motion).
+        { transform: `translate(${rightX}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`,
+          offset: 0.80, easing: ZOOM_EASE },
+        // 0.80 → 1.0: return CENTER (the spot the hops + flight originate from).
+        { transform: `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`,
+          offset: 1, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' },
       ],
       { duration: ENTRY_DURATION, fill: 'forwards' }
     );
@@ -996,15 +978,13 @@ function setTitleState(state) {
     // +0.8s: arm the aurora ramp + the left-to-right wipe. Staged AFTER the
     // top-bar's 0.6s fade (which started at +0.1s) so the two blur costs
     // don't overlap — this is the real fix for "aurora load-in looks laggy".
-    // The buffer FREEZE is set here so the wipe frames don't redraw the
-    // curtain paths (they barely move in 0.5s); cleared AURORA_WIPE_MS later
-    // so the aurora animates live at rest.
+    // The buffer is NEVER frozen (an earlier version froze it to save per-
+    // frame curtain redraws, but that caused a visible snap when the freeze
+    // released because `time` advanced while the buffer didn't). The
+    // single-blur-pass optimization on the composite carries the wipe cheaply.
     setTimeout(() => {
       auroraRampStart = performance.now();
       auroraRevealStart = performance.now();
-      auroraBufFrozen = true;
-      auroraBufDirty = true;  // render the snapshot once on the next frame
-      setTimeout(() => { auroraBufFrozen = false; }, AURORA_WIPE_MS + 100);
     }, DELAY_AURORA);
   }
 })();

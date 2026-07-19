@@ -1698,7 +1698,8 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 /* Trail sparkle: spawned at a fixed viewport coord (left/top set inline by
    JS). Bigger + brighter + longer-lived than the burst sparkle's trail
    cousins so the paw reads as leaving an obvious glowing comet tail. Strong
-   multi-layer glow (drop-shadow stack) + saturated pink-white core. */
+   multi-layer glow (drop-shadow stack) + saturated pink-white core.
+   Lifetime 0.8s → 1.3s so the trail lingers visibly behind a fast paw. */
 .boot-sparkle.trail {
     position: fixed;
     margin-left: -7px;
@@ -1710,7 +1711,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
         drop-shadow(0 0 4px rgba(255, 200, 255, 1))
         drop-shadow(0 0 10px rgba(220, 120, 255, 0.9))
         drop-shadow(0 0 18px rgba(180, 80, 255, 0.6));
-    animation: bootSparkleTrail 0.8s ease-out forwards;
+    animation: bootSparkleTrail 1.3s ease-out forwards;
 }
 @keyframes bootSparkle {
     0%   { transform: translate(0, 0) scale(0) rotate(0deg);   opacity: 1; }
@@ -1756,32 +1757,36 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 #boot-loading.fade-out { opacity: 0; }
 
 /* "LOADING OS . . ." — the central progress text. Sits slightly above
-   viewport center (top: 38%) per spec. Each character is a <span> that
+   viewport center (top: 36%) per spec. Each character is a <span> that
    (a) lights up L→R as progress fills (script.js adds .lit staggered) and
    (b) floats subtly on its own — script.js sets a per-span negative
    animation-delay so the letters shimmer out-of-phase rather than the
-   whole word bobbing in unison. */
+   whole word bobbing in unison. 52px → 86px per spec ("quite a bit
+   bigger"), wider letter-spacing so the bigger glyphs breathe. */
 .boot-loading-text {
     position: absolute;
-    top: 38%;
+    top: 36%;
     left: 50%;
     transform: translate(-50%, -50%);
     /* Fredoka is the bubbly primary; the system fallback chain still reads
        thick at font-weight: 700 even before the webfont caches. */
     font-family: 'Fredoka', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-weight: 700;
-    font-size: 52px;
-    letter-spacing: 4px;
+    font-size: 86px;
+    letter-spacing: 6px;
     text-transform: uppercase;
     white-space: nowrap;
     user-select: none;
 }
 .boot-loading-text span {
     display: inline-block;
-    /* Per-character float: small vertical drift + faint horizontal sway.
-       Composed with the lit/text-shadow transition on the same element
-       (transform vs color/shadow — different properties, no conflict).
-       script.js sets animation-delay per span so they're phase-offset. */
+    /* Per-character float: bigger vertical drift + horizontal sway now that
+       the glyphs are much larger (the old 4px / 1px drift was imperceptible
+       at 52px; at 86px we scale up to 10px / 3px so the float reads
+       "obvious" per spec). Composed with the lit/text-shadow transition on
+       the same element (transform vs color/shadow — different properties,
+       no conflict). script.js sets animation-delay per span so they're
+       phase-offset. */
     animation: bootCharFloat 3.4s ease-in-out infinite;
     /* Unlit: dim violet, no glow. transition so the L→R lighting reads as a
        smooth fill rather than a hard pop per character. */
@@ -1790,26 +1795,32 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     transition: color 0.3s ease, text-shadow 0.3s ease;
 }
 .boot-loading-text span.lit {
-    /* Lit: bright magenta with a layered glow (close + far halo). */
+    /* Lit: bright magenta with a layered glow (close + far halo). Glow
+       radii scaled up for the bigger glyph size. */
     color: #ff4ecd;
     text-shadow:
-        0 0 8px rgba(255, 78, 205, 0.9),
-        0 0 18px rgba(255, 78, 205, 0.6),
-        0 0 32px rgba(181, 52, 250, 0.5);
+        0 0 12px rgba(255, 78, 205, 0.95),
+        0 0 28px rgba(255, 78, 205, 0.65),
+        0 0 52px rgba(181, 52, 250, 0.55);
 }
 @keyframes bootCharFloat {
     0%, 100% { transform: translateY(0) translateX(0); }
-    30%      { transform: translateY(-4px) translateX(1px); }
-    70%      { transform: translateY(3px) translateX(-1px); }
+    30%      { transform: translateY(-10px) translateX(3px); }
+    70%      { transform: translateY(7px) translateX(-3px); }
 }
 
-/* Terminal stream at the bottom: cosmetic OS boot lines + a real "model
-   ready" milestone (script.js). Monospace, dim cyan-green, fades per line. */
+/* Terminal stream at the bottom-center: cosmetic OS boot lines + a real
+   "model ready" milestone (script.js). Monospace, dim cyan-green, fades per
+   line. Horizontally centered (text-align: center) so each line reads as
+   floating in the middle of the violet abyss rather than left-aligned. */
 .boot-terminal {
     position: absolute;
     bottom: 24px;
-    left: 24px;
-    right: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    /* Auto-width so the column hugs its content + stays centered. Cap so
+       very long lines still wrap inside a reasonable reading width. */
+    width: min(720px, 90vw);
     max-height: 32vh;
     overflow: hidden;
     font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
@@ -1817,12 +1828,15 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     line-height: 1.55;
     color: rgba(180, 220, 255, 0.55);
     text-shadow: 0 0 4px rgba(120, 200, 255, 0.35);
+    /* text-align: center so each line is centered marginally per spec. */
+    text-align: center;
     /* Right-align text to the bottom so newest lines always sit at the
        bottom edge as they stream in (flex-direction: column-reverse keeps
        the latest visible without scrolling). */
     display: flex;
     flex-direction: column-reverse;
     justify-content: flex-start;
+    align-items: center;
 }
 .boot-terminal-line {
     opacity: 0;
@@ -1831,6 +1845,9 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    /* Each line is a centered block (full column width) so the text-align
+       on the parent centers the inline text within it. */
+    width: 100%;
 }
 .boot-terminal-line.milestone {
     color: rgba(140, 255, 180, 0.95);
