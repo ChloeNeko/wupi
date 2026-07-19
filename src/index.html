@@ -6,15 +6,14 @@
     <title>WUPI OS</title>
     <link rel="stylesheet" href="styles.css">
 </head>
-<body class="booting">
-    <!-- Boot splash: paints on first frame BEFORE the canvas initializes, so
-         the webview never shows its default white. Pure HTML/CSS — the aurora
-         ring is a conic-gradient with a CSS mask, zero asset weight, ~0 CPU.
-         Fades + removes itself once the boot gate resolves (script.js). -->
+<body class="booting" style="background-color:#02040a">
+    <!-- Boot splash: paints on first frame BEFORE the canvas initializes. The
+         inline body background above is the anti-white-flash belt: it covers
+         the webview before styles.css even loads, so there is never a frame of
+         default white. The ring is pure CSS (conic-gradient + mask, ~0 CPU);
+         fades + self-removes once the boot gate resolves (script.js). -->
     <div id="boot-splash">
         <div class="boot-ring"></div>
-        <div class="boot-wordmark">WUPI OS</div>
-        <div class="boot-caption">initializing</div>
     </div>
     <div class="top-bar">
         <div class="menu-container">

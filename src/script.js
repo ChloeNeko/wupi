@@ -3,10 +3,6 @@
 // `window.__TAURI__` global is NOT injected: the import is the source of truth).
 import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-// Window API: used ONLY by the boot splash to flip the small floating boot
-// window into fullscreen once the model is ready. Permission
-// `core:window:allow-set-fullscreen` is granted in capabilities/default.json.
-import { getCurrentWindow } from '@tauri-apps/api/window';
 
 const canvas = document.getElementById('aurora-canvas');
 const ctx = canvas.getContext('2d');
@@ -345,7 +341,14 @@ function setTitleState(state) {
   }
 })();
 
-// ─── Boot splash → fullscreen "Waking Canvas" transition ───────────────────
+// ─── Boot splash → "Waking Canvas" transition ───────────────────────────────
+// The window boots fullscreen directly (tauri.conf.json), so on resolve we do
+// NO resize — the screen was already covered from frame one. The "Waking
+// Canvas" feel comes entirely from CSS + the aurora ramp:
+//   1. Arm the aurora ramp → curtains bloom in over AURORA_RAMP_MS.
+//   2. Drop body.booting → top-bar slides down, dock slides up.
+//   3. Fade the splash (the ring) out + remove.
+//
 // Gate: chat `model-status: ready` (the 12B load — Rust's single source of
 // truth, Rust is untouched) AND a 1.2s minimum dwell timer. Both must resolve
 // before we transition. The dwell prevents an abrupt strobe on fast hardware;
@@ -353,9 +356,6 @@ function setTitleState(state) {
 // ready. The existing model-status listener above keeps its title-indicator
 // job; this is a SEPARATE listener so the title's `typing` no-op guard can't
 // swallow the wake signal.
-//
-// Sequence on resolve: start aurora ramp → setFullscreen(true) → remove
-// body.booting (CSS slides top-bar down + dock up) → fade splash → remove.
 (function setupBootSplash() {
   const MIN_DWELL_MS = 1200;
   let modelReady = false;
@@ -394,24 +394,15 @@ function setTitleState(state) {
     }
   }).catch(() => {});
 
-  async function wakeCanvas() {
+  function wakeCanvas() {
     // 1. Arm the aurora ramp. animate() advances auroraIntensity 0 → 1 over
     //    AURORA_RAMP_MS; until then curtains stay invisible (pitch-black space
     //    + stars only), which is the spec'd "Waking Canvas" opening state.
     auroraRampStart = performance.now();
-    // 2. Flip the floating 500×500 boot window into fullscreen. The window
-    //    resize fires the existing 'resize' listener, which rebuilds canvas
-    //    dims and invalidates the cached sky gradient — no special handling
-    //    needed here.
-    try {
-      await getCurrentWindow().setFullscreen(true);
-    } catch (err) {
-      console.warn('[Wupi] setFullscreen failed; continuing in windowed mode', err);
-    }
-    // 3. Drop body.booting → CSS slides the top-bar down (0.2s delay) and the
+    // 2. Drop body.booting → CSS slides the top-bar down (0.2s delay) and the
     //    dock up (0.35s delay), staged after the aurora ramp begins.
     document.body.classList.remove('booting');
-    // 4. Fade the splash out, then remove it from the DOM. transitionend +
+    // 3. Fade the splash out, then remove it from the DOM. transitionend +
     //    {once:true} guarantees one-shot cleanup; pointer-events:none on
     //    .fade-out means even a stalled transition can't block the UI.
     const splash = document.getElementById('boot-splash');

@@ -1589,25 +1589,25 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 .chat-stop-btn:not(:disabled):hover { background: rgba(255, 80, 80, 0.25); color: #fff; }
 
 /* ───────────────────────────────────────────────────────────────────────
-   Boot splash — paints on first frame before the canvas initializes, so the
-   webview never flashes its default white. Lives in the transparent 500×500
-   boot window. Fades + self-removes once the boot gate resolves (script.js).
-   Pure HTML/CSS: the ring is a conic-gradient masked into a ring + two
-   compositor-only animations (transform rotate + filter pulse). Zero RAF,
-   zero asset weight, ~0 CPU.
+   Boot splash — the aurora ring only. Paints on first frame over the
+   already-dark body (inline background in index.html guarantees no white
+   flash before styles.css loads). The window boots fullscreen directly
+   (tauri.conf.json), so this never has to mask a resize or cover the
+   desktop: it is a transparent overlay that fades + self-removes once the
+   boot gate resolves (script.js). Pure CSS: conic-gradient masked into a
+   ring + two compositor-only animations (transform rotate + filter pulse).
+   Zero RAF, zero asset weight, ~0 CPU.
    ─────────────────────────────────────────────────────────────────────── */
 #boot-splash {
     position: fixed;
     inset: 0;
     z-index: 99999;
     display: flex;
-    flex-direction: column;
     align-items: center;
     justify-content: center;
-    /* Dark-violet radial vignette: reads as a floating glass panel over the
-       desktop (transparent window) while hiding the uninitialized canvas.
-       Palette matches the .app-window glass language (#150524 / #02040a). */
-    background: radial-gradient(ellipse at center, #150524 0%, #02040a 75%);
+    /* Transparent: the body's #02040a background shows through. No panel,
+       no vignette — just the ring over the dark canvas. */
+    background: transparent;
     transition: opacity 0.6s ease-out;
 }
 #boot-splash.fade-out {
@@ -1634,20 +1634,4 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 @keyframes ringPulse {
     0%, 100% { filter: drop-shadow(0 0 14px rgba(181, 52, 250, 0.4)); }
     50%      { filter: drop-shadow(0 0 26px rgba(102, 224, 255, 0.7)); }
-}
-
-.boot-wordmark {
-    margin-top: 28px;
-    font-size: 15px;
-    letter-spacing: 4px;
-    color: rgba(255, 255, 255, 0.85);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-}
-.boot-caption {
-    margin-top: 8px;
-    font-size: 11px;
-    letter-spacing: 1.5px;
-    color: rgba(255, 255, 255, 0.4);
-    text-transform: uppercase;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 }
