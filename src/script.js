@@ -434,11 +434,164 @@ function setTitleState(state) {
       // model-status transitions affect idle/offline.
       if (titleState === 'typing') return;
       if (status === 'ready') setTitleState('idle');
-      else if (status === 'error' || status === 'no_model') setTitleState('offline');
+      else if (status === 'error' || status === 'no_model' || status === 'missing') setTitleState('offline');
     });
   } catch (err) {
     console.warn('[Wupi] model-status listen failed', err);
   }
+})();
+
+// ─── First-run model download gate ─────────────────────────────────────────
+// On a fresh install the GGUFs aren't on disk. setup() in Rust emits
+// `model-status: missing` and we proactively invoke `check_models` here.
+// If either model is missing, the #download-overlay takes over the screen
+// (z-index 100002, opaque violet abyss) BEFORE the boot paw animation
+// starts — so the user never sees the paw fly home into an empty OS. The
+// overlay drives `download_models`; on completion the page reloads so
+// setup() re-runs with WUPI.gguf present and the normal boot proceeds.
+//
+// Why reload rather than hot-load: setup() does a one-shot model spawn at
+// boot (lib.rs:320). Re-entering that path from JS would duplicate the
+// spawn-load + schema-engine + API-restore wiring. A reload is the clean
+// re-entry: the runtime state is ephemeral anyway (WUPI launches fresh
+// every time, AGENTS.md §5 "EPHEMERAL by default"), so we lose nothing.
+(async function setupModelDownloadGate() {
+  let status;
+  try {
+    status = await invoke('check_models');
+  } catch (err) {
+    console.error('[Wupi] check_models failed; assuming present to avoid blocking boot', err);
+    return; // Don't trap the user behind a broken overlay; let boot proceed.
+  }
+  const needDownload = status?.wupi === 'missing' || status?.embed === 'missing';
+  if (!needDownload) return;
+
+  const overlay = document.getElementById('download-overlay');
+  const startBtn = document.getElementById('downloadStartBtn');
+  const cancelBtn = document.getElementById('downloadCancelBtn');
+  const bar = document.getElementById('downloadProgressBar');
+  const stats = document.getElementById('downloadStats');
+  const subtitle = document.getElementById('downloadSubtitle');
+  const errorEl = document.getElementById('downloadError');
+  if (!overlay || !startBtn) {
+    console.error('[Wupi] download overlay elements missing; cannot gate boot');
+    return;
+  }
+
+  // Take over the screen immediately (before the paw animation can show
+  // through). The overlay's CSS fade-in (0.8s) gives a soft reveal.
+  overlay.classList.add('show');
+
+  // Human-readable byte formatting for the stats line.
+  const fmtBytes = (n) => {
+    if (!n || n <= 0) return '0 MB';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(0) + ' KB';
+    if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(0) + ' MB';
+    return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+  };
+
+  // Phase → subtitle text. Keeps the user oriented during the long pull.
+  const phaseText = (phase, file) => {
+    switch (phase) {
+      case 'resolving': return `Preparing ${file || 'download'}…`;
+      case 'downloading': return `Downloading ${file || 'models'}…`;
+      case 'finalizing': return `Saving ${file || 'file'}…`;
+      case 'done': return 'Download complete. Reloading…';
+      case 'failed': return 'Download failed.';
+      default: return 'First-run setup: download the AI models (~10 GB). One-time only.';
+    }
+  };
+
+  // Live progress listener (throttled to 2/sec from Rust). Updates the bar
+  // width + stats line. The poll below is the authoritative fallback.
+  let progressUnlisten = null;
+  try {
+    progressUnlisten = await listen('download-progress', (e) => {
+      const p = e?.payload;
+      if (!p) return;
+      applyProgress(p);
+    });
+  } catch (err) {
+    console.warn('[Wupi] download-progress listen failed; falling back to poll only', err);
+  }
+
+  // Apply a progress snapshot to the DOM. Shared by the event listener +
+  // the poll so both paths render identically.
+  function applyProgress(p) {
+    const pct = p.overall_total > 0
+      ? Math.min(100, (p.overall_downloaded / p.overall_total) * 100)
+      : 0;
+    bar.style.width = pct.toFixed(1) + '%';
+    if (p.current_file && p.phase === 'downloading') {
+      const filePct = p.current_file_total > 0
+        ? Math.min(100, (p.current_file_offset / p.current_file_total) * 100).toFixed(0)
+        : '?';
+      stats.textContent =
+        `${fmtBytes(p.overall_downloaded)} / ${fmtBytes(p.overall_total)} · ` +
+        `${p.current_file} ${filePct}%`;
+    } else if (p.phase === 'done') {
+      stats.textContent = `${fmtBytes(p.overall_total)} downloaded`;
+    } else {
+      stats.textContent = `${fmtBytes(p.overall_downloaded)} / ${fmtBytes(p.overall_total)}`;
+    }
+    subtitle.textContent = phaseText(p.phase, p.current_file);
+    if (p.phase === 'failed' && p.error) {
+      errorEl.textContent = p.error;
+    } else {
+      errorEl.textContent = '';
+    }
+  }
+
+  // Poll fallback: the authoritative read between throttled emits. Closes
+  // any gap if an event is dropped under load. Stops when the overlay hides.
+  const pollHandle = setInterval(async () => {
+    try {
+      const p = await invoke('get_download_progress');
+      applyProgress(p);
+    } catch (err) {
+      console.warn('[Wupi] progress poll failed', err);
+    }
+  }, 500);
+
+  // Cancel button: signal Rust to stop at the next chunk boundary. The
+  // .part files stay on disk; the next Download click resumes from there.
+  cancelBtn.addEventListener('click', () => {
+    try { invoke('cancel_download'); } catch (err) {
+      console.warn('[Wupi] cancel_download failed', err);
+    }
+  });
+
+  // Start button: kicks off download_models. Disables itself for the
+  // duration; reveals Cancel. On success → fade out + reload. On error →
+  // re-enable Start so the user can retry (resume picks up from .part).
+  startBtn.addEventListener('click', async () => {
+    startBtn.disabled = true;
+    startBtn.textContent = 'Downloading…';
+    cancelBtn.hidden = false;
+    errorEl.textContent = '';
+    try {
+      await invoke('download_models');
+      // Success: fade the overlay out, then reload so setup() re-runs with
+      // WUPI.gguf present and the normal boot choreography plays.
+      overlay.classList.add('fade-out');
+      setTimeout(() => {
+        if (progressUnlisten) progressUnlisten();
+        clearInterval(pollHandle);
+        location.reload();
+      }, 900);
+    } catch (err) {
+      console.error('[Wupi] download_models failed', err);
+      const msg = typeof err === 'string' ? err : (err?.message || 'Unknown error');
+      // "cancelled" isn't a hard failure — keep the bar where it is and let
+      // the user resume with another Download click.
+      if (!/cancelled/i.test(msg)) {
+        errorEl.textContent = msg;
+      }
+      startBtn.disabled = false;
+      startBtn.textContent = 'Download';
+      cancelBtn.hidden = true;
+    }
+  });
 })();
 
 // ─── Boot paw → fly home → staged reveal ────────────────────────────────────
@@ -868,10 +1021,42 @@ function setTitleState(state) {
     // model-status listener (see below) when the real event fires.
     startTerminalStream();
 
+    // Auto-update check: fire-and-forget during the loading window. Does
+    // NOT gate the 8s timer — the check resolves asynchronously alongside
+    // the cosmetic stream. If an update is available it's announced in the
+    // terminal ("› update available — installing on quit"); the actual
+    // install happens silently via Tauri's updater on next relaunch. If
+    // the check fails (endpoint unreachable, signature issue, dev run),
+    // it's swallowed silently — the boot path must NEVER alert() (the OS
+    // isn't "up" for the user yet). The manual paw-menu button is the
+    // surfaced path with alerts.
+    checkForUpdateDuringBoot();
+
     // End the loading screen after the full duration. revealAfterLand
     // (called by endLoadingScreen) is what drops .booting and starts the
     // starry sky + aurora wipe.
     loadingTimerHandle = setTimeout(endLoadingScreen, LOADING_DURATION_MS);
+  }
+
+  // Boot-time update check helper. Idempotent + null-safe: by the time the
+  // promise resolves the boot overlay may already be torn down, so every
+  // terminal append is guarded by `bootTerminal` still being in the DOM.
+  // Shared with the paw-menu handler below via `performUpdateCheck`.
+  async function checkForUpdateDuringBoot() {
+    try {
+      const update = await check();
+      if (update?.available) {
+        appendTerminalLine(`› update available — v${update.version}`, false);
+        appendTerminalLine('› installing on next restart', false);
+      } else {
+        appendTerminalLine('› WUPI is up to date', false);
+      }
+    } catch (err) {
+      // Silent on the boot path. Most common cause is the gh-pages manifest
+      // not yet published (no release has shipped) or running a dev build
+      // with no signing key. The paw-menu button surfaces real failures.
+      console.warn('[Wupi] boot update check failed (non-fatal)', err);
+    }
   }
 
   function endLoadingScreen() {
@@ -971,6 +1156,13 @@ function setTitleState(state) {
     if (s === 'ready') {
       milestoneEmitted = true;
       appendTerminalLine('✓ model ready — WUPI.gguf loaded', true);
+    } else if (s === 'missing') {
+      // First-run: no GGUFs. The download overlay (setupModelDownloadGate)
+      // has already taken over the screen by the time this fires, but emit
+      // a milestone line anyway so the terminal reflects reality if the
+      // overlay is ever bypassed.
+      milestoneEmitted = true;
+      appendTerminalLine('! models missing — download required', true);
     } else if (s === 'no_model' || s === 'error') {
       milestoneEmitted = true;
       appendTerminalLine('! model unavailable — echo fallback', true);

@@ -13,6 +13,7 @@ pub mod memory;
 pub mod memory_embedder;
 pub mod memory_embedder_llama;
 pub mod memory_rrf;
+pub mod model_downloader;
 pub mod narrator_prompt;
 pub mod prompts;
 pub mod schema;
@@ -146,6 +147,16 @@ pub struct AppState {
     /// system card (`__wupi_os__`) is the default; games swap to the
     /// roleplay card's id and restore on exit.
     pub pre_game_card_id: Arc<std::sync::Mutex<String>>,
+    /// First-run GGUF download progress (see `model_downloader.rs`). Polled
+    /// by `get_download_progress` and emitted as the `download-progress`
+    /// event. Held under a std Mutex: short critical sections only, never
+    /// awaited across (the download task itself runs on a tokio task and
+    /// briefly locks to update fields between awaits).
+    pub download_progress: Arc<std::sync::Mutex<model_downloader::DownloadProgress>>,
+    /// Cancel token for an in-flight first-run download. Signaled by
+    /// `cancel_download`; read at the top of each chunk in the download loop
+    /// (same `Ordering::Relaxed` invariant as the engine decode loop, §3).
+    pub download_cancel: Arc<std::sync::Mutex<Option<model_downloader::CancelToken>>>,
 }
 
 impl AppState {
@@ -176,6 +187,10 @@ impl AppState {
             game_session: Arc::new(tokio::sync::Mutex::new(session::Conversation::new())),
             active_game_card: Arc::new(std::sync::Mutex::new(None)),
             pre_game_card_id: Arc::new(std::sync::Mutex::new(memory::WUPI_OS_CARD_ID.to_owned())),
+            download_progress: Arc::new(std::sync::Mutex::new(
+                model_downloader::DownloadProgress::default(),
+            )),
+            download_cancel: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -459,11 +474,20 @@ pub fn run() {
                 }));
                 *state.backend.lock().expect("backend mutex") = Some(backend);
             } else {
-                tracing::warn!("no model file found; running without LLM (echo mode)");
+                // No GGUF found. On a fresh install (the beta-tester path),
+                // this means the first-run downloader hasn't run yet — emit
+                // "missing" so the frontend shows the download overlay instead
+                // of silently booting into echo mode. The frontend's overlay
+                // then drives `download_models`; on completion it triggers a
+                // reload that re-enters setup with the now-present WUPI.gguf.
+                // If the user explicitly dismissed the download (or it failed
+                // unrecoverably), `download_models` leaves the state as-is
+                // and the title indicator falls back to "offline".
+                tracing::info!("no model file found; emitting 'missing' for first-run downloader");
                 let app_handle = app.handle().clone();
                 let _ = app_handle.emit(
                     "model-status",
-                    serde_json::json!({ "status": "no_model" }),
+                    serde_json::json!({ "status": "missing" }),
                 );
             }
 
@@ -653,6 +677,10 @@ pub fn run() {
             api_connect,
             api_disconnect,
             model_source_get,
+            check_models,
+            download_models,
+            get_download_progress,
+            cancel_download,
             game_cards_list,
             game_start,
             game_send,
@@ -837,6 +865,149 @@ fn resolve_embed_model_dirs(app: &tauri::AppHandle) -> Option<std::path::PathBuf
         dirs.push(data.join("models"));
     }
     memory_embedder_llama::resolve_embed_model(&dirs)
+}
+
+// ── First-run GGUF downloader IPC ──────────────────────────────────────────
+//
+// Four commands power the boot download overlay:
+//   - check_models            : are WUPI.gguf / Embed.gguf present?
+//   - download_models         : stream both from HF into app_data_dir/models
+//   - get_download_progress   : polled snapshot of the in-flight download
+//   - cancel_download         : signal an in-flight download to stop
+//
+// The flow (driven from script.js's setupBootSplash gate):
+//   1. setup emits `model-status: missing` when no gguf is found (lib.rs
+//      setup() above).
+//   2. script.js calls check_models to confirm, shows #download-overlay.
+//   3. User clicks "Download" → download_models fires; the overlay subscri
+//      cribes to `download-progress` events + polls get_download_progress.
+//   4. On Done, script.js calls app_ready (which re-resolves the model and
+//      triggers a reload via the existing model-status path).
+
+/// Check whether the chat model + embedder model are present in any candidate
+/// `models/` dir. Returns a JSON object the frontend uses to decide whether
+/// to show the download overlay. Both-present ⇒ boot normally; either
+/// missing ⇒ show the overlay (the downloader fetches BOTH regardless, so
+/// the simple "either missing" gate is correct).
+#[tauri::command]
+fn check_models(app: tauri::AppHandle) -> serde_json::Value {
+    let wupi = resolve_model_path(&app).is_some();
+    let embed = resolve_embed_model_dirs(&app).is_some();
+    serde_json::json!({
+        "wupi": if wupi { "present" } else { "missing" },
+        "embed": if embed { "present" } else { "missing" },
+    })
+}
+
+/// The target `models/` dir for downloads. Always `app_data_dir/models` —
+/// the 5th candidate in `model_search_dirs`, the only one that's reliably
+/// user-writable on a fresh install (resource_dir is read-only after
+/// install, exe-parent may be Program Files). Resolving it here keeps the
+/// downloader module free of Tauri path APIs (testable in isolation).
+fn download_target_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    use tauri::Manager;
+    app.path().app_data_dir().ok().map(|d| d.join("models"))
+}
+
+/// Stream both GGUFs from HF into `app_data_dir/models`. Long-running; the
+/// frontend subscribes to `download-progress` events (throttled to 2/sec)
+/// and polls `get_download_progress` for the authoritative snapshot between
+/// emits. Returns `Ok(())` when both files land; `Err(msg)` on any failure
+/// (network, HTTP status, cancel). On cancel, the `.part` files are left in
+/// place for the next attempt to resume from.
+#[tauri::command]
+async fn download_models(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    // Resolve target dir + mint a fresh cancel token. The cancel slot is
+    // scoped into its own block so the MutexGuard drops before we await
+    // (the `!Send` guard invariant, same as api_connect at lib.rs:2092).
+    let dest_dir = download_target_dir(&app)
+        .ok_or_else(|| "could not resolve app_data_dir/models".to_owned())?;
+    let cancel = {
+        let fresh = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut slot = state
+            .download_cancel
+            .lock()
+            .expect("download_cancel mutex");
+        *slot = Some(std::sync::Arc::clone(&fresh));
+        fresh
+    };
+
+    // Reset progress to a clean Idle so a re-run after a prior failure
+    // doesn't show stale totals.
+    {
+        let mut p = state.download_progress.lock().expect("progress mutex");
+        *p = model_downloader::DownloadProgress::default();
+    }
+
+    let result = model_downloader::download_all(
+        dest_dir,
+        Arc::clone(&state.download_progress),
+        cancel,
+        app.clone(),
+    )
+    .await;
+
+    // Clear the cancel slot regardless of outcome (no in-flight download
+    // to cancel anymore).
+    {
+        let mut slot = state
+            .download_cancel
+            .lock()
+            .expect("download_cancel mutex");
+        *slot = None;
+    }
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Mark progress Failed so the overlay can show the error. The
+            // `.part` files are retained by the downloader for resume.
+            {
+                let mut p = state.download_progress.lock().expect("progress mutex");
+                if p.phase != model_downloader::DownloadPhase::Done {
+                    p.phase = model_downloader::DownloadPhase::Failed;
+                    p.error = e.clone();
+                }
+            }
+            let _ = app.emit(
+                "download-progress",
+                state.download_progress.lock().expect("progress mutex").clone(),
+            );
+            Err(e)
+        }
+    }
+}
+
+/// Polled snapshot of download progress. The frontend calls this on a timer
+/// (e.g. every 250ms) as the authoritative source between throttled
+/// `download-progress` events. Cheaper and more reliable than relying on
+/// catching every emitted event (events can coalesce or drop under load).
+#[tauri::command]
+fn get_download_progress(state: tauri::State<'_, AppState>) -> model_downloader::DownloadProgress {
+    state
+        .download_progress
+        .lock()
+        .expect("progress mutex")
+        .clone()
+}
+
+/// Cancel an in-flight download. The download loop checks the token at the
+/// top of each chunk and exits with `Err("cancelled")`; the `.part` files
+/// stay on disk for the next attempt to resume from. No-op if no download
+/// is running.
+#[tauri::command]
+fn cancel_download(state: tauri::State<'_, AppState>) {
+    if let Some(token) = state
+        .download_cancel
+        .lock()
+        .expect("download_cancel mutex")
+        .as_ref()
+    {
+        token.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Resolve the default Simulation Card (`cards/Wupi.sim`) by walking the same

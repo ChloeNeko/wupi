@@ -36,6 +36,31 @@
         <div class="boot-loading-text" id="bootLoadingText"></div>
         <div class="boot-terminal" id="bootTerminal"></div>
     </div>
+
+    <!-- First-run model download overlay: shown by script.js when
+         check_models reports the GGUFs missing (fresh install). Same violet
+         abyss aesthetic as #boot-loading so the transition from boot-paw →
+         this overlay is seamless. z-index 100002 (above #boot-loading's
+         100001) so it owns the screen when active. The button + progress
+         bar are populated/driven by script.js via invoke('download_models')
+         + the download-progress event. -->
+    <div id="download-overlay">
+        <div class="download-overlay-inner">
+            <div class="download-title">WUPI needs her models</div>
+            <div class="download-subtitle" id="downloadSubtitle">
+                First-run setup: download the AI models (~10 GB). One-time only.
+            </div>
+            <div class="download-progress-wrap">
+                <div class="download-progress-bar" id="downloadProgressBar"></div>
+            </div>
+            <div class="download-stats" id="downloadStats"></div>
+            <div class="download-actions">
+                <button id="downloadStartBtn" class="download-btn-primary">Download</button>
+                <button id="downloadCancelBtn" class="download-btn-secondary" hidden>Cancel</button>
+            </div>
+            <div class="download-error" id="downloadError"></div>
+        </div>
+    </div>
     <div class="top-bar">
         <div class="menu-container">
             <button class="paw-btn" id="pawBtn" aria-label="System Menu">

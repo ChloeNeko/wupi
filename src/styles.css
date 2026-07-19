@@ -1865,3 +1865,150 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     from { opacity: 0; transform: translateY(4px); }
     to   { opacity: 1; transform: translateY(0); }
 }
+
+/* ───────────────────────────────────────────────────────────────────────
+   First-run model download overlay
+   Shown by script.js when check_models reports the GGUFs missing (fresh
+   install). Same violet abyss aesthetic as #boot-loading so the hand-off
+   from boot-paw → this overlay reads as one continuous scene. z-index
+   100002 puts it above #boot-loading (100001) + #boot-paw (100000) so it
+   owns the whole screen when visible. Hidden by default (opacity:0 +
+   pointer-events:none); script.js adds .show when the models are missing.
+   ─────────────────────────────────────────────────────────────────────── */
+#download-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 100002;
+    opacity: 0;
+    pointer-events: none;
+    background: radial-gradient(ellipse at center, #2b0b36 0%, #150524 55%, #050010 100%);
+    transition: opacity 0.8s ease-in-out;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+#download-overlay.show {
+    opacity: 1;
+    pointer-events: auto;
+}
+#download-overlay.fade-out {
+    opacity: 0;
+}
+
+/* Centered card: title + subtitle + progress + actions. Width clamps so it
+   reads as a focused panel, not a stretched banner. */
+.download-overlay-inner {
+    width: min(620px, 90vw);
+    text-align: center;
+    user-select: none;
+    font-family: 'Fredoka', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+
+/* Title: large, bright magenta with the same layered glow as the boot
+   loading text. The voice ("WUPI needs her models") keeps the persona
+   consistent with the rest of the OS. */
+.download-title {
+    font-size: 42px;
+    font-weight: 700;
+    color: #ff4ecd;
+    text-shadow:
+        0 0 12px rgba(255, 78, 205, 0.85),
+        0 0 28px rgba(181, 52, 250, 0.55);
+    letter-spacing: 1.5px;
+    margin-bottom: 14px;
+}
+
+/* Subtitle: dim lavender explanatory text. Updates per-phase (resolving /
+   downloading / finalizing) so the user knows what's happening. */
+.download-subtitle {
+    font-size: 17px;
+    font-weight: 500;
+    color: #b98ad6;
+    line-height: 1.5;
+    margin-bottom: 28px;
+}
+
+/* Progress bar: a thin track + a magenta fill that grows with
+   overall_downloaded / overall_total. The fill has a soft glow that reads
+   as "alive" during the long 9.8 GB pull. */
+.download-progress-wrap {
+    width: 100%;
+    height: 12px;
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 6px;
+    overflow: hidden;
+    margin-bottom: 10px;
+    box-shadow: inset 0 0 8px rgba(0, 0, 0, 0.5);
+}
+.download-progress-bar {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, #ff4ecd 0%, #b534fa 100%);
+    border-radius: 6px;
+    box-shadow: 0 0 12px rgba(255, 78, 205, 0.7);
+    /* Width transitions so the bar glides between updates rather than
+       stuttering on each poll. 0.4s is smooth without lagging too far
+       behind fast bursts. */
+    transition: width 0.4s ease;
+}
+
+/* Stats line below the bar: percentage + MB/GB transferred + current file.
+   Monospace so the numbers don't jitter as digits change width. */
+.download-stats {
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+    font-size: 13px;
+    color: #8a6ba8;
+    margin-bottom: 24px;
+    min-height: 18px;
+}
+
+/* Action buttons. Primary = magenta fill (the "do the thing" button);
+   Secondary = ghosted outline (Cancel). Same shape language as the rest
+   of the OS's pink Connect button (#aiConnectBtn). */
+.download-actions {
+    display: flex;
+    gap: 12px;
+    justify-content: center;
+}
+.download-btn-primary,
+.download-btn-secondary {
+    font-family: 'Fredoka', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 600;
+    font-size: 16px;
+    padding: 11px 32px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+.download-btn-primary {
+    background: #ff4ecd;
+    color: #1a0420;
+    border: none;
+    box-shadow: 0 0 18px rgba(255, 78, 205, 0.55);
+}
+.download-btn-primary:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 0 24px rgba(255, 78, 205, 0.8);
+}
+.download-btn-primary:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+.download-btn-secondary {
+    background: transparent;
+    color: #b98ad6;
+    border: 1px solid rgba(185, 138, 214, 0.4);
+}
+.download-btn-secondary:hover {
+    background: rgba(185, 138, 214, 0.1);
+    border-color: rgba(185, 138, 214, 0.7);
+}
+
+/* Error text: shown when phase == Failed. Dim red, sits below the actions. */
+.download-error {
+    margin-top: 18px;
+    font-size: 14px;
+    color: #ff6b8a;
+    min-height: 18px;
+    line-height: 1.5;
+}
