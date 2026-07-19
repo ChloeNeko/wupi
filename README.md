@@ -44,7 +44,7 @@ Meet **Wupi**! your new digital cat maid and best friend. She lives right inside
 - [x] **Totally Modular!** Don't need the Chaos engine today? Just turn it off with one click! No annoying restarts needed! <br><br>
 - [x] **Background Magic!** Wupi updates all your lore and memories silently in the background so it never ruins your actual roleplay chat! <br><br>
 - [x] **Perfect Consistency!** Your characters will finally remember exactly who you are, what you look like, and what you did together 100 messages ago! <br><br>
-- [x] **You Don't Need to Be a Coder!** Everything is built right into a cute little menu in SillyTavern!
+- [x] **You Don't Need to Be a Coder!** Everything is built right into a cute little menu!
 
 <br>
 <br>
