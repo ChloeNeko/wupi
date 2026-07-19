@@ -481,13 +481,12 @@ function setTitleState(state) {
 (function setupBootSplash() {
   // Timing constants (ms).
   const ENTRY_DELAY = 1000;       // blank screen before paw enters (1s per spec)
-  // Fairy-tour choreography: rise from below → DART to TOP-LEFT MIDDLE
-  // (hold 1s) → DART to TOP-RIGHT MIDDLE (hold 1s) → DART to CENTER
-  // (hold 1s). Each dart is a hard ZOOM_EASE in/out so the paw reads as a
-  // fairy teleporting with momentum. The 1-second holds at each corner are
-  // per spec ("stays for 1 second" at each).
-  // Total = 500 rise + 1000 hold + 500 dart + 1000 hold + 500 dart + 1000 hold = 4500ms.
-  const ENTRY_DURATION = 4500;
+  // Fairy-tour choreography: RISE STRAIGHT TO TOP-LEFT MIDDLE → dart to
+  // TOP-RIGHT MIDDLE → dart to CENTER. Each dart is a hard ZOOM_EASE in/out
+  // so the paw reads as a fairy teleporting with momentum. Holds at each
+  // stop are ~0.6s per spec ("slightly faster" than the old 1s holds).
+  // Total ≈ 0.4 rise + 0.6 hold + 0.4 dart + 0.6 hold + 0.4 dart + 0.6 hold = 3.0s.
+  const ENTRY_DURATION = 3000;
   // Sharp accel + sharp decel — the "fairy dart" easing. Most of the
   // motion happens in the middle of the segment, with hard start/stop.
   const ZOOM_EASE = 'cubic-bezier(0.65, 0, 0.35, 1)';
@@ -497,17 +496,21 @@ function setTitleState(state) {
   const PAUSE_BETWEEN_HOPS = 80;  // tight rest between hop 1 and hop 2
   // Sparkle trail: a sparkle spawns every TRAIL_INTERVAL ms along the paw's
   // path during entry + flight (NOT during hops — those get the escalating
-  // bursts). Tight interval so the trail reads as a glowing comet tail.
-  const TRAIL_INTERVAL = 25;
+  // bursts). Tuned for perf: tighter interval was creating ~150 concurrent
+  // animated DOM nodes (the lag source). 50ms + 1/tick = ~20 nodes/sec.
+  const TRAIL_INTERVAL = 50;
   // Paw display size at center. The resting paw-img is 45px; ~2.8x makes
   // it ~126px — a touch smaller than the previous 3.4x per spec ("a little
   // smaller"), still prominent in the middle of the screen during the hops.
   const PAW_BOOT_SCALE = 2.8;
   const PAW_REST_SIZE = 45;
-  // Curved corner flight: fires IMMEDIATELY after hop 2 (no model-ready
-  // gate — that was the cause of the center loiter). The path is a
-  // parabolic arc bowing above the straight diagonal, not a straight line.
-  // Per spec: "Not a straight line but a curve as it moves into the corner."
+  // Loiter after hop 2 before the corner flight fires. Per spec: "after the
+  // 2nd hop let it loiter for .5 seconds before moving."
+  const POST_HOP_LOITER_MS = 500;
+  // Curved corner flight: fires after the post-hop loiter. The path is a
+  // SLIGHT backwards-J curve (small bow above the straight diagonal), not
+  // a big swoop. Per spec: "Have the curve be tighter it's way too crazy,
+  // it should be a slight curve."
   const FLIGHT_DURATION_MS = 650;
   // Staged-reveal delays (ms) measured from flight-land (transitionend).
   // Top-bar fade is 0.6s in CSS; aurora wipe arms AFTER it finishes so the
@@ -594,19 +597,17 @@ function setTitleState(state) {
   function spawnTrailSparkle() {
     if (!bootPaw) return;
     const r = bootPaw.getBoundingClientRect();
-    // Spawn 3 sparkles per tick (offset jitter) so the trail has density
-    // even when the paw is moving fast during the darts. Each gets
-    // independent jitter so the trail reads as a glowing band, not a line.
-    for (let k = 0; k < 3; k++) {
-      const jx = (Math.random() - 0.5) * r.width * 0.7;
-      const jy = (Math.random() - 0.5) * r.height * 0.7;
-      const s = document.createElement('div');
-      s.className = 'boot-sparkle trail';
-      s.style.left = (r.left + r.width / 2 + jx) + 'px';
-      s.style.top = (r.top + r.height / 2 + jy) + 'px';
-      document.body.appendChild(s);
-      s.addEventListener('animationend', () => s.remove(), { once: true });
-    }
+    // 1 sparkle per tick (perf: the old 3/tick + 25ms interval was creating
+    // ~150 concurrent animated DOM nodes, which was the lag source). With
+    // 50ms interval + 1/tick + 0.8s lifetime we average ~16 concurrent nodes.
+    const jx = (Math.random() - 0.5) * r.width * 0.5;
+    const jy = (Math.random() - 0.5) * r.height * 0.5;
+    const s = document.createElement('div');
+    s.className = 'boot-sparkle trail';
+    s.style.left = (r.left + r.width / 2 + jx) + 'px';
+    s.style.top = (r.top + r.height / 2 + jy) + 'px';
+    document.body.appendChild(s);
+    s.addEventListener('animationend', () => s.remove(), { once: true });
   }
 
   // Trail control: setInterval-spawned trail sparkles while `trailActive`
@@ -636,16 +637,15 @@ function setTitleState(state) {
     // Start the sparkle trail — it follows the paw through the fairy-zoom.
     startTrail();
 
-    // Entry path: rise from below → DART to TOP-LEFT MIDDLE (hold 1s) →
-    // DART to TOP-RIGHT MIDDLE (hold 1s) → DART to CENTER (hold 1s).
-    // The "fairy-tour": each dart is a hard ZOOM_EASE so the paw reads as a
-    // fairy teleporting with momentum, leaving a sparkle trail like a comet.
-    // 1-second holds at each stop per spec.
+    // Entry path: RISE STRAIGHT TO TOP-LEFT MIDDLE → dart to TOP-RIGHT
+    // MIDDLE → dart to CENTER. The "fairy-tour": each dart is a hard
+    // ZOOM_EASE so the paw reads as a fairy teleporting with momentum.
+    // Per spec: rises directly to TOP-LEFT (no center visit first).
     const restCx = (window.innerWidth - PAW_REST_SIZE) / 2;
     const restCy = (window.innerHeight - PAW_REST_SIZE) / 2;
     const parkCy = window.innerHeight + 50;
     // Dart endpoints. TOP-LEFT MIDDLE + TOP-RIGHT MIDDLE = upper quadrants,
-    // roughly y ≈ 32% of viewport height ("middle" of the upper region).
+    // roughly y ≈ 32% of viewport height.
     const DART_X_RANGE = 0.58;    // horizontal reach toward each corner
     const TOP_Y_RATIO = 0.32;     // vertical position of the side stops
     const leftX = Math.max(40, restCx - window.innerWidth * DART_X_RANGE / 2);
@@ -655,27 +655,24 @@ function setTitleState(state) {
 
     const entryAnim = bootPaw.animate(
       [
-        // 0 → 0.11: rise from below to center (brief, just to enter).
+        // 0 → 0.13: rise from below STRAIGHT TO TOP-LEFT MIDDLE (no center).
         { transform: `translate(${restCx}px, ${parkCy}px) scale(${PAW_BOOT_SCALE})`,
           offset: 0, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' },
-        { transform: `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.11, easing: ZOOM_EASE },
-        // 0.11 → 0.22: dart to TOP-LEFT MIDDLE.
         { transform: `translate(${leftX}px, ${topY}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.22, easing: 'linear' },
-        // 0.22 → 0.44: HOLD at TOP-LEFT for 1 second (same coord).
+          offset: 0.13, easing: 'linear' },
+        // 0.13 → 0.33: HOLD at TOP-LEFT for ~0.6s (same coord).
         { transform: `translate(${leftX}px, ${topY}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.44, easing: ZOOM_EASE },
-        // 0.44 → 0.56: dart to TOP-RIGHT MIDDLE (crosses the whole top).
+          offset: 0.33, easing: ZOOM_EASE },
+        // 0.33 → 0.47: dart to TOP-RIGHT MIDDLE (crosses the whole top).
         { transform: `translate(${rightX}px, ${topY}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.56, easing: 'linear' },
-        // 0.56 → 0.78: HOLD at TOP-RIGHT for 1 second (same coord).
+          offset: 0.47, easing: 'linear' },
+        // 0.47 → 0.67: HOLD at TOP-RIGHT for ~0.6s (same coord).
         { transform: `translate(${rightX}px, ${topY}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.78, easing: ZOOM_EASE },
-        // 0.78 → 0.89: dart down to CENTER.
+          offset: 0.67, easing: ZOOM_EASE },
+        // 0.67 → 0.80: dart down to CENTER.
         { transform: `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.89, easing: 'linear' },
-        // 0.89 → 1.0: HOLD at CENTER for 1 second (same coord).
+          offset: 0.80, easing: 'linear' },
+        // 0.80 → 1.0: HOLD at CENTER for ~0.6s (same coord).
         { transform: `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`,
           offset: 1, easing: 'linear' },
       ],
@@ -716,7 +713,10 @@ function setTitleState(state) {
           a.commitStyles();
           a.cancel();
           hopsDone = true;
-          maybeFly();
+          // 0.5s loiter after hop 2 before the corner flight fires.
+          // Per spec: "after the 2nd hop let it loiter for .5 seconds
+          // before moving."
+          setTimeout(maybeFly, POST_HOP_LOITER_MS);
         }
       };
     };
@@ -771,13 +771,13 @@ function setTitleState(state) {
     const startX = (startRect && isFinite(startRect.left)) ? startRect.left : restCx;
     const startY = (startRect && isFinite(startRect.top)) ? startRect.top : restCy;
 
-    // Arc midpoint: bows ABOVE the straight diagonal. We take the geometric
-    // midpoint then push it up by ~25% of the vertical travel so the path
-    // reads as a swoop up-and-over rather than a straight diagonal. Cap the
-    // bow so it can't push the midpoint off the top of the viewport.
+    // Arc midpoint: SLIGHT backwards-J bow above the straight diagonal.
+    // The old bow (25% of vertical travel + 80px) was way too dramatic
+    // ("way too crazy" per spec). Tightened to a subtle ~12% bow with a
+    // small floor so the path reads as a gentle J-curve, not a swoop.
     const midX = (startX + targetX) / 2;
     const verticalTravel = Math.abs(targetY - startY);
-    const bow = Math.min(verticalTravel * 0.25 + 80, window.innerHeight * 0.22);
+    const bow = Math.min(verticalTravel * 0.12 + 24, window.innerHeight * 0.10);
     const midY = Math.min(startY, targetY) - bow;
 
     // Restart the sparkle trail for the flight (it was stopped when hops
