@@ -1723,3 +1723,108 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     30%  { opacity: 1; }
     100% { transform: scale(0.2) rotate(120deg); opacity: 0; }
 }
+
+/* ───────────────────────────────────────────────────────────────────────
+   Boot loading screen — appears after the paw lands, runs ~8s, then
+   crossfades into the starry sky + aurora as revealAfterLand fires.
+   z-index 100001 (above #boot-paw's 100000) so it fully takes over.
+   ─────────────────────────────────────────────────────────────────────── */
+#boot-loading {
+    position: fixed;
+    inset: 0;
+    z-index: 100001;
+    pointer-events: none;
+    /* Violet abyss: deep radial violet fading to near-black at the edges.
+       Reads as an infinite purple void behind the loading text. */
+    background: radial-gradient(ellipse at center, #2b0b36 0%, #150524 55%, #050010 100%);
+    opacity: 0;
+    /* The fade-in (when .show is added by script.js) + the crossfade-out
+       (when .fade-out is added). 1.2s feels like a melt, not a hard cut. */
+    transition: opacity 1.2s ease-in-out;
+    display: flex;
+    flex-direction: column;
+}
+#boot-loading.show { opacity: 1; }
+#boot-loading.fade-out { opacity: 0; }
+
+/* "LOADING OS . . ." — the central progress text. Sits slightly above
+   viewport center (top: 38%) per spec. The whole word gently floats via
+   bootLoadingFloat (subtle 4px bob). Each character is a <span> that
+   lights up L→R as progress fills (script.js adds .lit staggered). */
+.boot-loading-text {
+    position: absolute;
+    top: 38%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    /* Fredoka is the bubbly primary; the system fallback chain still reads
+       thick at font-weight: 700 even before the webfont caches. */
+    font-family: 'Fredoka', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 700;
+    font-size: 52px;
+    letter-spacing: 4px;
+    text-transform: uppercase;
+    white-space: nowrap;
+    user-select: none;
+    animation: bootLoadingFloat 3s ease-in-out infinite;
+    /* space between span characters stays as letter-spacing; spans themselves
+       are inline so they flow as a single word. */
+}
+.boot-loading-text span {
+    display: inline-block;
+    /* Unlit: dim violet, no glow. transition so the L→R lighting reads as a
+       smooth fill rather than a hard pop per character. */
+    color: #3a1850;
+    text-shadow: none;
+    transition: color 0.3s ease, text-shadow 0.3s ease;
+}
+.boot-loading-text span.lit {
+    /* Lit: bright magenta with a layered glow (close + far halo). */
+    color: #ff4ecd;
+    text-shadow:
+        0 0 8px rgba(255, 78, 205, 0.9),
+        0 0 18px rgba(255, 78, 205, 0.6),
+        0 0 32px rgba(181, 52, 250, 0.5);
+}
+@keyframes bootLoadingFloat {
+    0%, 100% { transform: translate(-50%, -50%); }
+    50%      { transform: translate(-50%, calc(-50% - 5px)); }
+}
+
+/* Terminal stream at the bottom: cosmetic OS boot lines + a real "model
+   ready" milestone (script.js). Monospace, dim cyan-green, fades per line. */
+.boot-terminal {
+    position: absolute;
+    bottom: 24px;
+    left: 24px;
+    right: 24px;
+    max-height: 32vh;
+    overflow: hidden;
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+    font-size: 12px;
+    line-height: 1.55;
+    color: rgba(180, 220, 255, 0.55);
+    text-shadow: 0 0 4px rgba(120, 200, 255, 0.35);
+    /* Right-align text to the bottom so newest lines always sit at the
+       bottom edge as they stream in (flex-direction: column-reverse keeps
+       the latest visible without scrolling). */
+    display: flex;
+    flex-direction: column-reverse;
+    justify-content: flex-start;
+}
+.boot-terminal-line {
+    opacity: 0;
+    animation: bootTerminalFadeIn 0.25s ease-out forwards;
+    /* Truncate long lines so layout never overflows the max-height. */
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.boot-terminal-line.milestone {
+    color: rgba(140, 255, 180, 0.95);
+    text-shadow: 0 0 6px rgba(140, 255, 180, 0.7);
+    font-weight: 600;
+}
+@keyframes bootTerminalFadeIn {
+    from { opacity: 0; transform: translateY(4px); }
+    to   { opacity: 1; transform: translateY(0); }
+}

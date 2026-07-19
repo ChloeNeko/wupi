@@ -5,6 +5,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>WUPI OS</title>
     <link rel="stylesheet" href="styles.css">
+    <!-- Fredoka: thick bubbly font for the boot loading screen. Graceful
+         fallback if offline: the loading-text CSS specifies Fredoka first
+         then a thick-weight system stack, so it still reads chunky even
+         before the webfont caches. -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&display=swap" rel="stylesheet">
 </head>
 <body class="booting">
     <!-- Boot phase: the OS window is transparent (tauri.conf.json) and STAYS
@@ -19,6 +26,16 @@
          z-index 100000 puts #boot-paw above the top-bar (9999) and all
          app-windows (1000) so it can fly over everything during landing. -->
     <div id="boot-paw"><img src="paw.png" class="boot-paw-img" alt="" /></div>
+
+    <!-- Boot loading screen: appears AFTER the paw lands, runs ~8s, then
+         crossfades into the starry sky + aurora. z-index 100001 (above
+         #boot-paw's 100000) so it can fully take over the screen. The text
+         spans + terminal lines are populated by script.js; CSS handles the
+         violet abyss bg, float animation, and per-span glow transitions. -->
+    <div id="boot-loading">
+        <div class="boot-loading-text" id="bootLoadingText"></div>
+        <div class="boot-terminal" id="bootTerminal"></div>
+    </div>
     <div class="top-bar">
         <div class="menu-container">
             <button class="paw-btn" id="pawBtn" aria-label="System Menu">

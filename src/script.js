@@ -460,15 +460,21 @@ function setTitleState(state) {
 //         opacity:0 so no top-left flash).
 //   1.0s  Paw ENTERS from the bottom, RISES + does a QUICK CLOCKWISE CIRCLE
 //         around viewport center, settles at center. Sparkle TRAIL follows
-//         the paw's path (small fixed-position sparkles spawned every ~55ms).
-//   ~1.9s Two QUICK hops. Each apex spawns a sparkle burst that ESCALATES:
+//         the paw's path (small fixed-position sparkles spawned every ~30ms).
+//   ~3.6s Two QUICK hops. Each apex spawns a sparkle burst that ESCALATES:
 //         hop 1 = 8 small sparkles, hop 2 = 16 bigger multi-colored ones.
 //         Trail is paused during the hops so the bursts get the spotlight.
-//   ~3.0s Paw FLIES to its home spot in the top-left (the real .paw-img
+//   ~4.6s Paw FLIES to its home spot in the top-left (the real .paw-img
 //         rect), shrinking ~120px → 45px. Trail restarts for the flight.
-//   land  Final big multi-colored burst (capstone), then staged reveal (see
-//         revealAfterLand): body opaque → top-bar fades in → canvas paints
-//         sky+stars → aurora LEFT-TO-RIGHT wipe → boot-paw removed → dock.
+//   land  Final big multi-colored burst (capstone), then LOADING SCREEN
+//         fades in over everything (violet abyss + "LOADING OS . . ." text
+//         + terminal stream). Runs LOADING_DURATION_MS (~8s).
+//   load  The loading text lights L→R as progress fills; terminal streams
+//         cosmetic boot lines; the real "✓ model ready" milestone appears
+//         only when Rust's model-status:ready fires (honest sync).
+//   done  Loading screen crossfades out → staged reveal (revealAfterLand):
+//         body opaque → top-bar fades in → canvas paints sky+stars → aurora
+//         LEFT-TO-RIGHT wipe → boot-paw removed → dock.
 //
 // STAGING NOTE: the top-bar's backdrop-filter:blur and the aurora's blur(30px)
 // are the two heavy GPU costs. They are now staged so they DON'T overlap —
@@ -485,7 +491,7 @@ function setTitleState(state) {
 (function setupBootSplash() {
   // Timing constants (ms).
   const ENTRY_DELAY = 1000;       // blank screen before paw enters (1s per spec)
-  const ENTRY_DURATION = 1400;    // paw rises from bottom + circle → center (slowed per spec)
+  const ENTRY_DURATION = 2200;    // paw rises + 16-point circle → center (slowed + smoother per spec)
   const HOP_DURATION = 450;       // each hop (up + down) — quick per spec
   const HOP_APEX = HOP_DURATION / 2;
   const HOP_HEIGHT = 80;          // px the inner img rises per hop
@@ -508,6 +514,11 @@ function setTitleState(state) {
   // Min-dwell: gate the FLIGHT on the model being ready + a floor so the
   // hops always play out even if the model loads instantly.
   const MIN_DWELL_MS = ENTRY_DELAY + ENTRY_DURATION + 2 * HOP_DURATION + PAUSE_BETWEEN_HOPS + 200;
+  // Loading screen (runs AFTER the paw lands, BEFORE the staged reveal).
+  // 8s per spec — adjustable. The text spans light L→R across this window;
+  // the terminal streams fake boot lines + the real "model ready" milestone.
+  const LOADING_DURATION_MS = 8000;
+  const LOADING_TEXT = 'LOADING OS . . .';
 
   let modelReady = false;
   let dwellDone = false;
@@ -517,6 +528,9 @@ function setTitleState(state) {
   const bootPaw = document.getElementById('boot-paw');
   const bootPawImg = bootPaw ? bootPaw.querySelector('.boot-paw-img') : null;
   const realPaw = document.querySelector('.paw-img');
+  const bootLoading = document.getElementById('boot-loading');
+  const bootLoadingText = document.getElementById('bootLoadingText');
+  const bootTerminal = document.getElementById('bootTerminal');
 
   // <body> already carries .booting from index.html; this is belt-and-suspenders
   // for the dev-preview case where the HTML might not have it.
@@ -617,40 +631,55 @@ function setTitleState(state) {
     // Start the sparkle trail — it follows the paw through entry + circle.
     startTrail();
 
-    // Entry path: rise from below → arc into a quick clockwise circle
-    // around viewport center → settle at center. Built as a WAAPI keyframe
-    // sequence so the whole motion is one fluid animation. The circle is
-    // small (CIRCLE_RADIUS px) so it reads as a flourish, not a detour.
+    // Entry path: rise from below → smooth clockwise circle around viewport
+    // center → settle at center. Built as a WAAPI keyframe sequence.
+    //
+    // The circle uses 16 KEYFRAMES (every 22.5°) instead of the old 4 — that
+    // was the "diamond" effect: 4 cardinal points with linear interp between
+    // them produces straight chord segments, not an arc. 16 points + linear
+    // per-segment easing produces a visually round circle (the chords are
+    // short enough that the eye reads them as a smooth curve). Radius also
+    // widened 90 → 140 so the circle reads as a real flourish, not a wiggle.
     const restCx = (window.innerWidth - PAW_REST_SIZE) / 2;
     const restCy = (window.innerHeight - PAW_REST_SIZE) / 2;
     const parkCy = window.innerHeight + 50;
-    const CIRCLE_RADIUS = 90;
-    // 4 keyframes around the circle (top, right, bottom, left) after the
-    // rise. Offset uses CSS px from the rest center.
-    const circlePoint = (angle) => ({
-      x: restCx + Math.cos(angle) * CIRCLE_RADIUS,
-      y: restCy + Math.sin(angle) * CIRCLE_RADIUS,
-    });
-    const c0 = circlePoint(-Math.PI / 2); // top of circle (entry merges here)
-    const c1 = circlePoint(0);            // right
-    const c2 = circlePoint(Math.PI / 2);  // bottom
-    const c3 = circlePoint(Math.PI);      // left
+    const CIRCLE_RADIUS = 140;
+    const CIRCLE_POINTS = 16;
+    // Rise takes 0 → 0.4 of the duration; circle takes 0.4 → 1.0 (60% — the
+    // circle is the star, the rise just gets the paw up to it).
+    const RISE_END = 0.4;
+    // Start angle = -π/2 (top of circle, where the rise merges in). Sweep
+    // clockwise = increasing angle in screen coords (y grows downward).
+    const startAngle = -Math.PI / 2;
+    // Build the circle keyframes: 16 points + the final settle-to-center.
+    const circleKeyframes = [];
+    for (let i = 0; i <= CIRCLE_POINTS; i++) {
+      const t = i / CIRCLE_POINTS;                       // 0..1 around the circle
+      const angle = startAngle + t * Math.PI * 2;        // full revolution
+      const x = restCx + Math.cos(angle) * CIRCLE_RADIUS;
+      const y = restCy + Math.sin(angle) * CIRCLE_RADIUS;
+      const offset = RISE_END + t * (1 - RISE_END);      // map into [RISE_END, 1]
+      circleKeyframes.push({
+        transform: `translate(${x}px, ${y}px) scale(${PAW_BOOT_SCALE})`,
+        offset,
+        easing: 'linear',  // constant speed around the arc — no cardinal bumps
+      });
+    }
+    // The very last circle keyframe (i = CIRCLE_POINTS) lands back at the
+    // top of the circle. Replace its target with the rest-center so the paw
+    // settles to center at the end of the loop instead of staying on the rim.
+    circleKeyframes[circleKeyframes.length - 1] = {
+      transform: `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`,
+      offset: 1,
+      easing: 'cubic-bezier(0.22, 1, 0.36, 1)',
+    };
 
     const entryAnim = bootPaw.animate(
       [
-        // Rise: 0 → 0.55 of the duration. easeOutQuint so it decelerates as
-        // it approaches the circle (reads as a graceful arrival, not a slam).
-        { transform: `translate(${restCx}px, ${parkCy}px) scale(${PAW_BOOT_SCALE})`, offset: 0,   easing: 'cubic-bezier(0.22, 1, 0.36, 1)' },
-        { transform: `translate(${c0.x}px, ${c0.y}px) scale(${PAW_BOOT_SCALE})`, offset: 0.55, easing: 'linear' },
-        // Circle: 0.55 → 1.0. LINEAR easing per segment so the paw moves at
-        // constant speed around the arc (ease-in/out on a circle reads as
-        // herky-jerky acceleration at each cardinal point). 4 quarter-arcs
-        // + the final settle = 5 segments at ~9% each.
-        { transform: `translate(${c1.x}px, ${c1.y}px) scale(${PAW_BOOT_SCALE})`, offset: 0.64, easing: 'linear' },
-        { transform: `translate(${c2.x}px, ${c2.y}px) scale(${PAW_BOOT_SCALE})`, offset: 0.73, easing: 'linear' },
-        { transform: `translate(${c3.x}px, ${c3.y}px) scale(${PAW_BOOT_SCALE})`, offset: 0.82, easing: 'linear' },
-        { transform: `translate(${c0.x}px, ${c0.y}px) scale(${PAW_BOOT_SCALE})`, offset: 0.91, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' },
-        { transform: `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`, offset: 1 },
+        // Rise: 0 → RISE_END. easeOutQuint so it decelerates as it approaches
+        // the circle (reads as a graceful arrival, not a slam).
+        { transform: `translate(${restCx}px, ${parkCy}px) scale(${PAW_BOOT_SCALE})`, offset: 0, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' },
+        ...circleKeyframes,
       ],
       { duration: ENTRY_DURATION, fill: 'forwards' }
     );
@@ -731,7 +760,7 @@ function setTitleState(state) {
   //    current rect so the landing is pixel-accurate regardless of layout.
   function flyPawHome() {
     flightApproved = true;
-    if (!bootPaw) { revealAfterLand(); return; }
+    if (!bootPaw) { startLoadingScreen(); return; }
 
     // Read the real paw's resting rect. During boot the top-bar is at
     // opacity:0 but still laid out (NOT display:none), so getBoundingClientRect
@@ -747,14 +776,16 @@ function setTitleState(state) {
     // began). Stopped again on land.
     startTrail();
 
-    // One-shot: when the flight transition ends, run the staged reveal.
+    // One-shot: when the flight transition ends, start the loading screen
+    // phase. (The staged reveal is now reached only AFTER the 8s loading
+    // screen finishes — see endLoadingScreen → revealAfterLand.)
     const onLand = (e) => {
       if (e.propertyName !== 'transform') return;
       bootPaw.removeEventListener('transitionend', onLand);
       stopTrail();
       // One final big burst on landing — a celebratory capstone.
       spawnSparkles(14, 1);
-      revealAfterLand();
+      startLoadingScreen();
     };
     bootPaw.addEventListener('transitionend', onLand);
 
@@ -770,8 +801,154 @@ function setTitleState(state) {
     });
   }
 
-  // ── Phase 3: staged reveal. Called when the paw lands. Each step is a
-  //    setTimeout off the landing moment.
+  // ── Loading screen phase (between paw-land and the staged reveal).
+  //    Fades in the violet abyss overlay, populates "LOADING OS . . ." as
+  //    per-character spans that light L→R across LOADING_DURATION_MS,
+  //    streams cosmetic boot lines into the terminal, and emits the real
+  //    "✓ model ready" milestone line when Rust's model-status:ready fires.
+  //    After LOADING_DURATION_MS, fades out and calls revealAfterLand().
+  let loadingTimerHandle = null;
+  let loadingEnded = false;
+
+  function startLoadingScreen() {
+    if (!bootLoading) { revealAfterLand(); return; }
+
+    // Populate the loading text as one <span> per character so each can be
+    // lit independently. Non-space chars get a span; spaces get a plain
+    // space text node so layout spacing stays correct.
+    if (bootLoadingText) {
+      bootLoadingText.innerHTML = '';
+      for (const ch of LOADING_TEXT) {
+        if (ch === ' ') bootLoadingText.appendChild(document.createTextNode(' '));
+        else {
+          const s = document.createElement('span');
+          s.textContent = ch;
+          bootLoadingText.appendChild(s);
+        }
+      }
+    }
+
+    // Fade the overlay in.
+    bootLoading.classList.add('show');
+
+    // Light the spans L→R staggered across the duration. Each span gets
+    // .lit at progressively later moments so the magenta fill sweeps across
+    // the whole word as progress climbs to 100%.
+    const spans = bootLoadingText ? bootLoadingText.querySelectorAll('span') : [];
+    const perChar = LOADING_DURATION_MS / Math.max(spans.length, 1);
+    spans.forEach((sp, i) => {
+      setTimeout(() => sp.classList.add('lit'), i * perChar);
+    });
+
+    // Terminal stream: cosmetic OS-flavored boot lines, one every ~330ms.
+    // The "✓ model ready" milestone is emitted separately by the
+    // model-status listener (see below) when the real event fires.
+    startTerminalStream();
+
+    // End the loading screen after the full duration. revealAfterLand
+    // (called by endLoadingScreen) is what drops .booting and starts the
+    // starry sky + aurora wipe.
+    loadingTimerHandle = setTimeout(endLoadingScreen, LOADING_DURATION_MS);
+  }
+
+  function endLoadingScreen() {
+    if (loadingEnded) return;
+    loadingEnded = true;
+    stopTerminalStream();
+    if (bootLoading) {
+      bootLoading.classList.add('fade-out');
+      // Remove from DOM after the crossfade completes so it can't intercept
+      // clicks (pointer-events:none in CSS, but cleanliness).
+      bootLoading.addEventListener('transitionend', () => bootLoading.remove(), { once: true });
+    }
+    // If the model-ready milestone never fired (still loading), emit it
+    // anyway so the terminal doesn't look like it gave up. Honest-ish: the
+    // reveal will proceed regardless because the boot gate already required
+    // modelReady for the flight.
+    if (!milestoneEmitted) appendTerminalLine('› still loading — proceeding to UI', false);
+    // The staged reveal: drop .booting → starry sky paints → aurora wipes.
+    revealAfterLand();
+  }
+
+  // ── Terminal stream. Cosmetic OS boot lines. The "model ready" milestone
+  //    is special: it's only emitted when the real model-status:ready event
+  //    fires (listened below). Other lines are fake but flavored to look real.
+  const TERMINAL_LINES = [
+    '› wupi-os v0.1.0 (gemma-4 12B)',
+    '› initializing kernel...',
+    '› mounting shared_backend()...',
+    '› allocating LlamaContext: chat (n_ctx=4000)',
+    '› allocating LlamaContext: embedder (n_ctx=512)',
+    '› allocating LlamaContext: schema (n_ctx=2048)',
+    '› allocating LlamaContext: game (n_ctx=4000)',
+    '› loading WUPI.gguf (9.79 GB, Q6_K)...',
+    '› calibrating bge-small-en-v1.5 embedder...',
+    '› embedder self-test: cosine check...',
+    '› mounting memory.sqlite (WAL, FTS5, vec0)...',
+    '› seeding codex from docs/...',
+    '› loading Operator.xml (user profile)...',
+    '› loading Wupi.sim (persona card)...',
+    '› arming schema-delta engine...',
+    '› arming narrator engine...',
+    '› KV cache: Q8_0 type-k/type-v',
+    '› sampler: temp(1.0) top_p(0.95) min_p(0.1) greedy',
+    '› canvas: aurora borealis (5 curtains, blur 30px)',
+    '› render loop: paused=true (dormant)',
+    '› boot paw: parked below viewport',
+    '› awaiting model-ready milestone...',
+  ];
+  let terminalTimer = null;
+  let terminalIdx = 0;
+  let milestoneEmitted = false;
+
+  function appendTerminalLine(text, isMilestone) {
+    if (!bootTerminal) return;
+    const line = document.createElement('div');
+    line.className = 'boot-terminal-line' + (isMilestone ? ' milestone' : '');
+    line.textContent = text;
+    // flex-direction: column-reverse on .boot-terminal means prepend = newest
+    // at the bottom. insertBefore(firstChild) achieves the same effect.
+    bootTerminal.insertBefore(line, bootTerminal.firstChild);
+    // Cap the line count so very long boots don't accumulate DOM forever.
+    while (bootTerminal.children.length > 40) {
+      bootTerminal.removeChild(bootTerminal.lastChild);
+    }
+  }
+
+  function startTerminalStream() {
+    terminalIdx = 0;
+    const tick = () => {
+      if (terminalIdx < TERMINAL_LINES.length) {
+        appendTerminalLine(TERMINAL_LINES[terminalIdx], false);
+        terminalIdx++;
+      }
+    };
+    // First line immediately, then steady drip.
+    tick();
+    terminalTimer = setInterval(tick, 330);
+  }
+
+  function stopTerminalStream() {
+    if (terminalTimer) { clearInterval(terminalTimer); terminalTimer = null; }
+  }
+
+  // ── Model-ready milestone listener. SEPARATE from the modelReady gate
+  //    listener (that one drives maybeFly; this one just emits the terminal
+  //    line). Both fire off the same Tauri event; harmless duplicate work.
+  listen('model-status', (e) => {
+    if (milestoneEmitted) return;
+    const s = e?.payload?.status;
+    if (s === 'ready') {
+      milestoneEmitted = true;
+      appendTerminalLine('✓ model ready — WUPI.gguf loaded', true);
+    } else if (s === 'no_model' || s === 'error') {
+      milestoneEmitted = true;
+      appendTerminalLine('! model unavailable — echo fallback', true);
+    }
+  }).catch(() => {});
+
+  // ── Phase 3: staged reveal. Called when the loading screen ends. Each
+  //    step is a setTimeout off that moment.
   function revealAfterLand() {
     // +0.0s: drop .booting. Body goes opaque #02040a (CSS), AND the top-bar
     // + dock opacity transitions arm (their CSS rules key off :not(.booting)).
