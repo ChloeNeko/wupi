@@ -1761,8 +1761,8 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
    (a) lights up L→R as progress fills (script.js adds .lit staggered) and
    (b) floats subtly on its own — script.js sets a per-span negative
    animation-delay so the letters shimmer out-of-phase rather than the
-   whole word bobbing in unison. 52px → 86px per spec ("quite a bit
-   bigger"), wider letter-spacing so the bigger glyphs breathe. */
+   whole word bobbing in unison. 86px → 120px per spec ("even bigger"),
+   wider letter-spacing so the bigger glyphs breathe. */
 .boot-loading-text {
     position: absolute;
     top: 36%;
@@ -1772,20 +1772,18 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
        thick at font-weight: 700 even before the webfont caches. */
     font-family: 'Fredoka', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     font-weight: 700;
-    font-size: 86px;
-    letter-spacing: 6px;
+    font-size: 120px;
+    letter-spacing: 8px;
     text-transform: uppercase;
     white-space: nowrap;
     user-select: none;
 }
 .boot-loading-text span {
     display: inline-block;
-    /* Per-character float: bigger vertical drift + horizontal sway now that
-       the glyphs are much larger (the old 4px / 1px drift was imperceptible
-       at 52px; at 86px we scale up to 10px / 3px so the float reads
-       "obvious" per spec). Composed with the lit/text-shadow transition on
-       the same element (transform vs color/shadow — different properties,
-       no conflict). script.js sets animation-delay per span so they're
+    /* Per-character float: subtle drift now (was 10px/3px — "float around
+       less" per spec). Composed with the lit/text-shadow transition on the
+       same element (transform vs color/shadow — different properties, no
+       conflict). script.js sets animation-delay per span so they're
        phase-offset. */
     animation: bootCharFloat 3.4s ease-in-out infinite;
     /* Unlit: dim violet, no glow. transition so the L→R lighting reads as a
@@ -1799,14 +1797,14 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
        radii scaled up for the bigger glyph size. */
     color: #ff4ecd;
     text-shadow:
-        0 0 12px rgba(255, 78, 205, 0.95),
-        0 0 28px rgba(255, 78, 205, 0.65),
-        0 0 52px rgba(181, 52, 250, 0.55);
+        0 0 14px rgba(255, 78, 205, 0.95),
+        0 0 32px rgba(255, 78, 205, 0.65),
+        0 0 60px rgba(181, 52, 250, 0.55);
 }
 @keyframes bootCharFloat {
     0%, 100% { transform: translateY(0) translateX(0); }
-    30%      { transform: translateY(-10px) translateX(3px); }
-    70%      { transform: translateY(7px) translateX(-3px); }
+    30%      { transform: translateY(-4px) translateX(1px); }
+    70%      { transform: translateY(3px) translateX(-1px); }
 }
 
 /* Terminal stream at the bottom-center: cosmetic OS boot lines + a real
@@ -1815,7 +1813,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
    floating in the middle of the violet abyss rather than left-aligned. */
 .boot-terminal {
     position: absolute;
-    bottom: 24px;
+    bottom: 80px;
     left: 50%;
     transform: translateX(-50%);
     /* Auto-width so the column hugs its content + stays centered. Cap so

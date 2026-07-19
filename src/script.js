@@ -481,11 +481,13 @@ function setTitleState(state) {
 (function setupBootSplash() {
   // Timing constants (ms).
   const ENTRY_DELAY = 1000;       // blank screen before paw enters (1s per spec)
-  // Fairy-zoom choreography: rise → dart LEFT → dart RIGHT → return CENTER.
-  // Each dart is ~500ms with sharp in/out easing (ZOOM_EASE) so the paw
-  // reads as a fairy teleporting with momentum, not a smooth glide. The
-  // old 16-point circle (2800ms) was too measured; this is sporadic.
-  const ENTRY_DURATION = 2000;
+  // Fairy-zoom choreography: rise → dart TOP-LEFT (dwell) → dart TOP-RIGHT
+  // (dwell) → drop to CENTER. Each dart is a hard ZOOM_EASE in/out so the
+  // paw reads as a fairy teleporting with momentum. The dwells on the sides
+  // are deliberate holds (same-coord keyframes) so the paw lingers visibly
+  // at each side before darting across — per spec ("stay in the left and
+  // right side a little bit longer").
+  const ENTRY_DURATION = 2200;
   // Sharp accel + sharp decel — the "fairy dart" easing. Most of the
   // motion happens in the middle of the segment, with hard start/stop.
   const ZOOM_EASE = 'cubic-bezier(0.65, 0, 0.35, 1)';
@@ -498,11 +500,16 @@ function setTitleState(state) {
   // bursts). Tight interval + bigger/longer-lived sparkles so the trail
   // reads as an obvious glowing comet tail, not a sparse dot pattern.
   const TRAIL_INTERVAL = 25;
-  // Paw display size at center. The resting paw-img is 45px; ~3.4x makes
-  // it ~153px — noticeably bigger per spec so the fairy reads at distance
-  // during the darts.
-  const PAW_BOOT_SCALE = 3.4;
+  // Paw display size at center. The resting paw-img is 45px; ~2.8x makes
+  // it ~126px — a touch smaller than the previous 3.4x per spec ("a little
+  // smaller"), still prominent in the middle of the screen during the hops.
+  const PAW_BOOT_SCALE = 2.8;
   const PAW_REST_SIZE = 45;
+  // Flight speed: the post-hop dash from center → top-left corner. Snappy
+  // per spec ("moves quickly and not just stays in the middle any longer").
+  // The entry transition is overridden with this faster curve right before
+  // the flight target is set in flyPawHome().
+  const FLIGHT_DURATION_MS = 500;
   // Staged-reveal delays (ms) measured from flight-land (transitionend).
   // Top-bar fade is 0.6s in CSS; aurora wipe arms AFTER it finishes so the
   // two blur costs never overlap.
@@ -629,37 +636,46 @@ function setTitleState(state) {
     // Start the sparkle trail — it follows the paw through the fairy-zoom.
     startTrail();
 
-    // Entry path: rise from below → dart LEFT → dart RIGHT → return CENTER.
-    // The "fairy-zoom": each dart is a hard in/out zoom (ZOOM_EASE) so the
-    // paw reads as a fairy teleporting with momentum, leaving a sparkle
-    // trail like a comet. Sporadic, not circular.
+    // Entry path: rise from below → dart to TOP-LEFT quadrant → dart to
+    // TOP-RIGHT quadrant → drop to CENTER. The "fairy-zoom": each dart is
+    // a hard in/out ZOOM_EASE so the paw reads as a fairy teleporting with
+    // momentum, leaving a sparkle trail like a comet. Sporadic, not circular.
     const restCx = (window.innerWidth - PAW_REST_SIZE) / 2;
     const restCy = (window.innerHeight - PAW_REST_SIZE) / 2;
     const parkCy = window.innerHeight + 50;
-    // Dart endpoints. The LEFT/RIGHT darts push near the viewport edges so
-    // the zoom range reads as crossing the whole screen, not a wiggle.
-    // Vertical stays at restCy (level flight) — the darts are horizontal
-    // per spec ("zooms to the left, then zooms to the right, then zooms
-    // to the center").
-    const DART_RANGE = 0.62;       // 0.62 of half-width = energetic darts
-    const leftX = Math.max(40, restCx - window.innerWidth * DART_RANGE / 2);
+    // Dart endpoints. TOP-LEFT + TOP-RIGHT quadrants: the paw darts to the
+    // upper corners (not the full-width sides) per spec ("top left middle
+    // then top right middle, then the center" — "middle" = mid-height of
+    // the upper region, roughly y ≈ 32% of the viewport).
+    const DART_X_RANGE = 0.58;    // horizontal reach toward each corner
+    const TOP_Y_RATIO = 0.32;     // vertical position of the side dwells
+    const leftX = Math.max(40, restCx - window.innerWidth * DART_X_RANGE / 2);
     const rightX = Math.min(window.innerWidth - PAW_REST_SIZE - 40,
-                            restCx + window.innerWidth * DART_RANGE / 2);
+                            restCx + window.innerWidth * DART_X_RANGE / 2);
+    const topY = window.innerHeight * TOP_Y_RATIO - PAW_REST_SIZE / 2;
 
     const entryAnim = bootPaw.animate(
       [
-        // 0 → 0.30: rise from below to center.
+        // 0 → 0.22: rise from below to center.
         { transform: `translate(${restCx}px, ${parkCy}px) scale(${PAW_BOOT_SCALE})`,
           offset: 0, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' },
         { transform: `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.30, easing: ZOOM_EASE },
-        // 0.30 → 0.55: dart LEFT (hard accel, hard stop).
-        { transform: `translate(${leftX}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.55, easing: ZOOM_EASE },
-        // 0.55 → 0.80: dart RIGHT (cross the whole screen in one motion).
-        { transform: `translate(${rightX}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.80, easing: ZOOM_EASE },
-        // 0.80 → 1.0: return CENTER (the spot the hops + flight originate from).
+          offset: 0.22, easing: ZOOM_EASE },
+        // 0.22 → 0.40: dart to TOP-LEFT quadrant.
+        { transform: `translate(${leftX}px, ${topY}px) scale(${PAW_BOOT_SCALE})`,
+          offset: 0.40, easing: 'linear' },
+        // 0.40 → 0.52: DWELL at TOP-LEFT (same coord — holds ~260ms so the
+        // paw lingers visibly on the left side before darting across).
+        { transform: `translate(${leftX}px, ${topY}px) scale(${PAW_BOOT_SCALE})`,
+          offset: 0.52, easing: ZOOM_EASE },
+        // 0.52 → 0.70: dart to TOP-RIGHT quadrant (crosses the whole top).
+        { transform: `translate(${rightX}px, ${topY}px) scale(${PAW_BOOT_SCALE})`,
+          offset: 0.70, easing: 'linear' },
+        // 0.70 → 0.82: DWELL at TOP-RIGHT (same coord — holds ~260ms so the
+        // paw lingers visibly on the right side before dropping to center).
+        { transform: `translate(${rightX}px, ${topY}px) scale(${PAW_BOOT_SCALE})`,
+          offset: 0.82, easing: ZOOM_EASE },
+        // 0.82 → 1.0: drop to CENTER (the spot the hops + flight originate).
         { transform: `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`,
           offset: 1, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' },
       ],
@@ -779,12 +795,16 @@ function setTitleState(state) {
     };
     bootPaw.addEventListener('transitionend', onLand);
 
-    // Set the target transform. The CSS transition on #boot-paw
-    // (transform 0.8s easeOutQuint, no overshoot) animates the flight.
+    // Set the target transform. Override the CSS transition with a SHORTER,
+    // FASTER flight curve per spec ("moves quickly and not just stays in the
+    // middle any longer") — the entry's 0.8s easeOutQuint was too leisurely
+    // for the corner dash. Snappy ease-in-out, no overshoot, ~0.5s.
     // rAF double-buffer so the browser commits the start transform before
     // we set the target, guaranteeing the transition runs.
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
+        bootPaw.style.transition =
+          `transform ${FLIGHT_DURATION_MS}ms cubic-bezier(0.45, 0, 0.55, 1), opacity 0.3s ease-out`;
         bootPaw.style.transform =
           `translate(${targetX}px, ${targetY}px) scale(1)`;
       });
