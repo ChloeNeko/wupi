@@ -1632,8 +1632,8 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
        matrix so the browser animates a single compositor transform. The
        opacity transition is for the final removal fade. Easing is
        easeOutQuint (cubic-bezier(0.22, 1, 0.36, 1)) — a smooth decel with
-       NO overshoot. The old 1.1 final y caused the rubberband snap-back. */
-    transition: transform 1.2s cubic-bezier(0.22, 1, 0.36, 1),
+       NO overshoot. 0.8s per spec (faster trip to the corner). */
+    transition: transform 0.8s cubic-bezier(0.22, 1, 0.36, 1),
                 opacity 0.3s ease-out;
     /* Initial transform is set by script.js at module load (centered +
        scaled up) BEFORE any transition can fire, so the first paint is

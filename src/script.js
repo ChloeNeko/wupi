@@ -121,24 +121,44 @@ window.addEventListener('resize', () => { cachedSkyGrad = null; });
 const STAR_COLORS = ['#ffffff', '#e8f0ff', '#fff4e6', '#ffe6ee'];
 
 // Boot reveal: aurora curtains reveal LEFT-TO-RIGHT (a "wipe" rather than a
-// global opacity ramp). This is BOTH an aesthetic choice AND a perf fix: the
-// old global-alpha ramp drew all 5 curtains across the full viewport every
-// frame through blur(30px), which is what stuttered. The wipe only draws the
-// revealed portion of each curtain per frame, so the blur cost scales with
-// how much is visible — way cheaper during the reveal, identical at rest.
+// global opacity ramp). The wipe is BOTH an aesthetic choice AND a perf fix.
 //
-// Two gates (both must climb to 1.0 before the curtain is fully shown):
-//   auroraIntensity  — the overall fade-in (0 → 1 over AURORA_RAMP_MS).
-//   auroraRevealX    — the left-to-right wipe position (px).
-// At rest both are 1 / width+300 and the full aurora paints as before.
+// Three gates work together:
+//   auroraIntensity   — the overall fade-in (0 → 1 over AURORA_RAMP_MS).
+//   auroraRevealX     — the left-to-right wipe position (px).
+//   auroraBufFrozen   — when true, the offscreen buffer holds a snapshot
+//                       and isn't redrawn (the wipe only changes the blit
+//                       slice, not the curtain shapes). At rest this is
+//                       false so the aurora animates live.
+//
+// The boot-wipe stutter fix (3 layered wins):
+// 1. Offscreen buffer: 5 curtains rendered with NO blur, then ONE blurred
+//    blit to main → 5x fewer Gaussian passes per frame.
+// 2. Dirty flag: during the wipe the buffer is frozen (curtain shapes barely
+//    change in 0.5s, and any frozen-frame artifacts are masked by the blur
+//    + the wipe's own motion). Zero buffer redraw cost during the wipe.
+// 3. Interpolated blur radius (10px → 30px with intensity): Gaussian cost
+//    scales roughly with radius², so blur(10px) at wipe-start is ~9x cheaper
+//    than blur(30px). The visual blooms as it reveals.
+// All three fire only during the wipe. At rest the buffer redraws live with
+// the full 30px blur, identical to the locked aesthetic.
 let auroraIntensity = 0;
 let auroraRampStart = 0;
-const AURORA_RAMP_MS = 1000;
-// The wipe runs concurrently with the intensity ramp. AURORA_WIPE_MS is kept
-// slightly longer so the wipe tail (the soft alpha edge) finishes smooth.
-let auroraRevealX = 0;       // current wipe x (px, in canvas CSS px)
-let auroraRevealStart = 0;   // 0 = not yet armed
-const AURORA_WIPE_MS = 1400;
+const AURORA_RAMP_MS = 600;
+// The wipe runs concurrently with the intensity ramp. Shorter than RAMP_MS
+// so the wipe front finishes ahead of the full-opacity settle.
+let auroraRevealX = 0;          // current wipe x (px, CSS px)
+let auroraRevealStart = 0;      // 0 = not yet armed
+const AURORA_WIPE_MS = 500;
+// Buffer dirty flag: false = redraw curtains every frame (live at rest);
+// true = hold the snapshot (during the wipe, set by revealAfterLand).
+// auroraBufDirty: when frozen, render exactly once at full intensity, then
+// hold. Cleared on the first frozen render, re-armed when the freeze engages.
+let auroraBufFrozen = false;
+let auroraBufDirty = false;
+// Blur radius floor/ceiling (CSS px). Gaussian cost ~ radius².
+const AURORA_BLUR_FLOOR = 10;
+const AURORA_BLUR_CEIL = 30;
 
 function animate() {
   if (auroraRampStart && auroraIntensity < 1) {
@@ -211,68 +231,68 @@ function animate() {
     const curtains = 5;
     const baseCenterY = height * 0.42;
 
-    // ── Pass 1: render curtains to offscreen buffer (NO blur).
-    // Clear to transparent black. 'source-over' compositing: curtains are
-    // very-low-alpha hsla fills (0.18 × intensity), so painting them over
-    // each other produces a soft multi-hue stack that — once screened onto
-    // the sky in pass 2 — reads nearly identically to the old per-curtain
-    // screen-on-sky render. The difference is sub-perceptual at these
-    // alphas; the perf win (5 blur passes → 1) is structural.
-    auroraBufCtx.setTransform(1, 0, 0, 1, 0, 0);
-    auroraBufCtx.clearRect(0, 0, auroraBuf.width, auroraBuf.height);
-    auroraBufCtx.scale(dpr, dpr);
-    auroraBufCtx.globalCompositeOperation = 'source-over';
+    // ── Pass 1: render curtains to offscreen buffer (NO blur), UNLESS the
+    //    buffer is frozen AND already rendered this freeze. The freeze is set
+    //    during the boot wipe (curtain shapes barely move in 0.5s, and any
+    //    frozen-frame drift is masked by the blur + the wipe's own motion).
+    //    At rest the freeze is cleared so the aurora animates live.
+    if (!auroraBufFrozen || auroraBufDirty) {
+      auroraBufCtx.setTransform(1, 0, 0, 1, 0, 0);
+      auroraBufCtx.clearRect(0, 0, auroraBuf.width, auroraBuf.height);
+      auroraBufCtx.scale(dpr, dpr);
+      auroraBufCtx.globalCompositeOperation = 'source-over';
 
-    for (let i = 0; i < curtains; i++) {
-      const speed = time * (0.1 + i * 0.04);
-      const thickness = 45 + i * 15;
-      const yOffset = (i - (curtains / 2)) * 12;
-      const activeCenterY = baseCenterY + yOffset;
+      // When frozen, paint at FULL intensity — the fade-in is driven by the
+      // interpolated blur radius (10→30) + the wipe, not per-curtain alpha.
+      // This snapshot is what the wipe reveals left-to-right.
+      const a = auroraBufFrozen ? 0.18 : (0.18 * auroraIntensity);
+      for (let i = 0; i < curtains; i++) {
+        const speed = time * (0.1 + i * 0.04);
+        const thickness = 45 + i * 15;
+        const yOffset = (i - (curtains / 2)) * 12;
+        const activeCenterY = baseCenterY + yOffset;
 
-      auroraBufCtx.beginPath();
-      // Full-width path on the buffer (the wipe happens at blit time, not
-      // here — keeping the path full-width means the curtain shape is
-      // identical to the at-rest render; only the visible slice changes).
-      for (let x = -150; x <= width + 150; x += 40) {
-        const y = activeCenterY
-                + Math.sin(x * 0.0015 + speed + i * 2.3) * 85
-                + Math.cos(x * 0.0008 - speed) * 45
-                - thickness;
-        if (x === -150) auroraBufCtx.moveTo(x, y);
-        else auroraBufCtx.lineTo(x, y);
+        auroraBufCtx.beginPath();
+        for (let x = -150; x <= width + 150; x += 40) {
+          const y = activeCenterY
+                  + Math.sin(x * 0.0015 + speed + i * 2.3) * 85
+                  + Math.cos(x * 0.0008 - speed) * 45
+                  - thickness;
+          if (x === -150) auroraBufCtx.moveTo(x, y);
+          else auroraBufCtx.lineTo(x, y);
+        }
+        for (let x = width + 150; x >= -150; x -= 40) {
+          const y = activeCenterY
+                  + Math.sin(x * 0.0015 + speed + i * 2.3) * 85
+                  + Math.cos(x * 0.0008 - speed) * 45
+                  + thickness;
+          auroraBufCtx.lineTo(x, y);
+        }
+        auroraBufCtx.closePath();
+
+        const hue = currentPalette.hueBase + Math.sin(time * 1.0 + i) * currentPalette.hueRange;
+        auroraBufCtx.fillStyle = `hsla(${hue}, 100%, 65%, ${a})`;
+        auroraBufCtx.fill();
       }
-      for (let x = width + 150; x >= -150; x -= 40) {
-        const y = activeCenterY
-                + Math.sin(x * 0.0015 + speed + i * 2.3) * 85
-                + Math.cos(x * 0.0008 - speed) * 45
-                + thickness;
-        auroraBufCtx.lineTo(x, y);
-      }
-      auroraBufCtx.closePath();
-
-      const hue = currentPalette.hueBase + Math.sin(time * 1.0 + i) * currentPalette.hueRange;
-      // Alpha gated by the global intensity ramp (the wipe is handled by
-      // the source-crop below, not by per-curtain alpha).
-      auroraBufCtx.fillStyle = `hsla(${hue}, 100%, 65%, ${0.18 * auroraIntensity})`;
-      auroraBufCtx.fill();
+      // If we just rendered the frozen snapshot, clear dirty so subsequent
+      // frozen frames skip the redraw.
+      if (auroraBufFrozen) auroraBufDirty = false;
     }
 
-    // ── Pass 2: blit the composite to the main canvas with ONE blur pass.
-    // The wipe is a source-crop: only x ∈ [0, wipeXCss] of the buffer is
-    // sampled, so the blur only processes the revealed region. At rest
-    // wipeXCss >= width and the full buffer blits. Source rect is in
-    // physical pixels (buffer is physical-res), dest rect in CSS px
-    // (the main ctx has dpr scale applied via setTransform in resize()).
+    // ── Pass 2: blit the composite with ONE interpolated blur pass.
+    // Gaussian cost ~ radius², so scaling the radius 10→30 with intensity
+    // makes the early wipe frames ~9x cheaper than the locked 30px. The
+    // visual blooms as it reveals. At rest (intensity=1) the full 30px
+    // returns and the look is identical to the locked aesthetic.
     ctx.globalCompositeOperation = 'screen';
-    ctx.filter = 'blur(30px)';
+    const blurPx = AURORA_BLUR_FLOOR +
+      (AURORA_BLUR_CEIL - AURORA_BLUR_FLOOR) * auroraIntensity;
+    ctx.filter = `blur(${blurPx.toFixed(1)}px)`;
 
     const wipeXCss = Math.min(Math.max(auroraRevealX, 0), width);
-    const srcX = 0;
-    const srcY = 0;
     const srcW = Math.floor(wipeXCss * dpr);
-    const srcH = auroraBuf.height;
     if (srcW > 0) {
-      ctx.drawImage(auroraBuf, srcX, srcY, srcW, srcH, 0, 0, wipeXCss, height);
+      ctx.drawImage(auroraBuf, 0, 0, srcW, auroraBuf.height, 0, 0, wipeXCss, height);
     }
 
     ctx.filter = 'none';
@@ -460,12 +480,12 @@ function setTitleState(state) {
 // so the title's `typing` no-op guard can't swallow the wake signal.
 (function setupBootSplash() {
   // Timing constants (ms).
-  const ENTRY_DELAY = 1000;       // blank screen before paw enters
+  const ENTRY_DELAY = 3000;       // blank screen before paw enters (+2s per spec)
   const ENTRY_DURATION = 700;     // paw rises from bottom → center
-  const HOP_DURATION = 700;       // each hop (up + down)
+  const HOP_DURATION = 450;       // each hop (up + down) — faster per spec
   const HOP_APEX = HOP_DURATION / 2;
   const HOP_HEIGHT = 80;          // px the inner img rises per hop
-  const PAUSE_BETWEEN_HOPS = 150; // tiny rest between hop 1 and hop 2
+  const PAUSE_BETWEEN_HOPS = 120; // tiny rest between hop 1 and hop 2
   // Paw display size at center. The resting paw-img is 45px; ~2.67x makes
   // it ~120px, prominent in the middle of the screen during the hops.
   const PAW_BOOT_SCALE = 2.67;
@@ -695,9 +715,15 @@ function setTitleState(state) {
     // +0.8s: arm the aurora ramp + the left-to-right wipe. Staged AFTER the
     // top-bar's 0.6s fade (which started at +0.1s) so the two blur costs
     // don't overlap — this is the real fix for "aurora load-in looks laggy".
+    // The buffer FREEZE is set here so the wipe frames don't redraw the
+    // curtain paths (they barely move in 0.5s); cleared AURORA_WIPE_MS later
+    // so the aurora animates live at rest.
     setTimeout(() => {
       auroraRampStart = performance.now();
       auroraRevealStart = performance.now();
+      auroraBufFrozen = true;
+      auroraBufDirty = true;  // render the snapshot once on the next frame
+      setTimeout(() => { auroraBufFrozen = false; }, AURORA_WIPE_MS + 100);
     }, DELAY_AURORA);
   }
 })();
