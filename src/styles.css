@@ -4,6 +4,12 @@ html, body {
     width: 100%;
     height: 100%;
     overflow: hidden;
+    /* During boot (body.booting) the window is transparent so the desktop
+       shows through with just the boot ring. After boot, body gets the
+       solid starry-sky base color (the canvas paints the gradient on top). */
+    background-color: transparent;
+}
+body:not(.booting) {
     background-color: #02040a;
 }
 
@@ -38,20 +44,23 @@ html, body {
     letter-spacing: 0.5px;
     z-index: 9999;
     user-select: none;
-    /* Waking Canvas: hidden above the top edge while body.booting, slides
-       down on transition. The 0.6s delay stages it just as the boot ring
-       finishes fading (0.6s splash fade-out), so the starry background is
-       briefly visible on its own before the UI chrome enters. cubic-bezier
-       is the house spring curve (see .dock-container). */
-    transform: translateY(-100%);
-    transition: transform 0.9s cubic-bezier(0.175, 0.885, 0.32, 1.1) 0.6s;
+    /* Waking Canvas: opacity-fade-in (NOT transform slide). The old slide
+       stuttered because backdrop-filter:blur re-samples the backdrop every
+       frame as the element moves — an opacity fade keeps the backdrop region
+       fixed so only the cheap alpha channel animates. Top bar stays at top:0
+       throughout; .booting sets opacity:0 + pointer-events:none. The 0.4s
+       delay stages it just as the boot ring finishes fading. */
+    transition: opacity 0.7s ease-out 0.4s;
 }
-/* Reset to rest position once the boot gate resolves (script.js removes
-   .booting from <body>). */
+body.booting .top-bar {
+    opacity: 0;
+    pointer-events: none;
+}
 body:not(.booting) .top-bar {
-    transform: translateY(0);
+    opacity: 1;
 }
 
+/* ── "WUPI OS" title — live AI-status indicator ──────────────────────
    The title never pulses on its own. It is one of three states, driven
    by the title-state controller in script.js:
      - idle/boot: steady medium white glow, no animation
@@ -398,15 +407,20 @@ body:not(.booting) .top-bar {
     /* The container peeks ~10px above the bottom edge; give a small hover
        margin above it so the user doesn't have to pixel-aim. */
     padding-top: 12px;
-    /* Waking Canvas: hidden below the bottom edge while body.booting, slides
-       up on transition (1.2s delay = clearly after the top-bar so their
-       backdrop-filter blurs don't both spin up on the same frame). The
-       translateX(-50%) centering is composed, not replaced. */
-    transform: translateX(-50%) translateY(120%);
-    transition: transform 0.9s cubic-bezier(0.175, 0.885, 0.32, 1.1) 1.2s;
+    /* Waking Canvas: opacity-fade-in (NOT translateY slide). Same reasoning
+       as .top-bar: backdrop-filter:blur re-samples the backdrop every frame
+       during a transform animation, which is what stuttered. Opacity fade
+       keeps the backdrop region fixed + cheap. Centered via translateX(-50%)
+       which is composed with the opacity transition (no transform animation
+       on the centered element). The 1.0s delay stages it after the top bar. */
+    transition: opacity 0.7s ease-out 1.0s;
+}
+body.booting .dock-trigger-area {
+    opacity: 0;
+    pointer-events: none;
 }
 body:not(.booting) .dock-trigger-area {
-    transform: translateX(-50%) translateY(0);
+    opacity: 1;
 }
 
 .dock-container {

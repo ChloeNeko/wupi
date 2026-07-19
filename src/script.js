@@ -3,6 +3,11 @@
 // `window.__TAURI__` global is NOT injected: the import is the source of truth).
 import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+// Window API: used ONLY by the boot sequence to flip the boot window from
+// transparent (ring-only phase, desktop shows through) to opaque once the
+// WUPI UI materializes (so the starry canvas isn't bleed-through from the
+// desktop). Permissions granted in capabilities/default.json.
+import { getCurrentWindow } from '@tauri-apps/api/window';
 
 const canvas = document.getElementById('aurora-canvas');
 const ctx = canvas.getContext('2d');
@@ -245,7 +250,7 @@ let bootDone = false;
 
 function startLoop() {
   // Boot dormancy: refuse to start until wakeCanvas() clears the gate. Without
-  // this, an early focus/visibility event during the 4s ring hold would
+  // this, an early focus/visibility event during the 5s ring hold would
   // un-pause and paint stars behind the ring.
   if (!bootDone) return;
   if (paused) { paused = false; requestAnimationFrame(animate); }
@@ -365,23 +370,28 @@ function setTitleState(state) {
   }
 })();
 
-// ─── Boot splash → "Waking Canvas" transition ───────────────────────────────
-// The window boots fullscreen directly (tauri.conf.json), so on resolve we do
-// NO resize — the screen was already covered from frame one. The "Waking
-// Canvas" feel comes entirely from CSS + the aurora ramp:
-//   1. Arm the aurora ramp → curtains bloom in over AURORA_RAMP_MS.
-//   2. Drop body.booting → top-bar slides down, dock slides up.
-//   3. Fade the splash (the ring) out + remove.
+// ─── Boot ring → "Waking Canvas" transition ─────────────────────────────────
+// The window boots transparent + always-on-top (tauri.conf.json). During the
+// ring phase you see your DESKTOP through the window — only the boot ring is
+// drawn. The canvas is dormant (paused=true, bootDone=false) so no sky/stars
+// leak through. The whole point of the ring: hide the model load + UI init
+// behind a 5s loading wheel so the user never sees lag.
+//
+// On resolve: canvas paints sky+stars (curtains gated to 0) → aurora ramps in
+// over 3s → body goes opaque (setTransparent(false)) so the desktop stops
+// bleeding through → top bar + dock fade in via opacity (NOT transform:
+// transform slides caused the backdrop-filter:blur stutter). All the
+// GPU-expensive chrome uses opacity fades so the backdrop region stays fixed.
 //
 // Gate: chat `model-status: ready` (the 12B load — Rust's single source of
-// truth, Rust is untouched) AND a 1.2s minimum dwell timer. Both must resolve
-// before we transition. The dwell prevents an abrupt strobe on fast hardware;
-// on slow hardware the model load dominates and we transition immediately on
-// ready. The existing model-status listener above keeps its title-indicator
-// job; this is a SEPARATE listener so the title's `typing` no-op guard can't
-// swallow the wake signal.
+// truth, Rust is untouched) AND a 5.0s minimum dwell timer. Both must resolve
+// before we transition. The dwell is the spec'd 5s; on slow hardware the
+// model load dominates and we transition immediately on ready. The existing
+// model-status listener above keeps its title-indicator job; this is a
+// SEPARATE listener so the title's `typing` no-op guard can't swallow the
+// wake signal.
 (function setupBootSplash() {
-  const MIN_DWELL_MS = 4000;
+  const MIN_DWELL_MS = 5000;
   let modelReady = false;
   let dwellDone = false;
   let transitioned = false;
@@ -418,23 +428,33 @@ function setTitleState(state) {
     }
   }).catch(() => {});
 
-  function wakeCanvas() {
+  async function wakeCanvas() {
     // 1. Open the boot gate so startLoop() will accept the RAF, then start
     //    the canvas. `paused` was true during the boot ring phase (canvas
-    //    dormant, body #02040a was the only thing on screen). The first
-    //    animate() frame paints sky + stars only — the curtain block is
-    //    gated on auroraIntensity > 0.001, which is still 0 here.
+    //    dormant). The first animate() frame paints sky + stars only — the
+    //    curtain block is gated on auroraIntensity > 0.001, which is still
+    //    0 here.
     bootDone = true;
     startLoop();
     // 2. Arm the aurora ramp. animate() advances auroraIntensity 0 → 1 over
     //    AURORA_RAMP_MS; the first post-gate frame paints sky + stars only,
     //    then the curtains bloom in over ~3s.
     auroraRampStart = performance.now();
-    // 3. Drop body.booting → CSS slides the top-bar down (0.6s delay) and the
-    //    dock up (1.2s delay), staged after the ring fades so their
-    //    backdrop-filter blurs don't spike the GPU on the same frame.
+    // 3. Drop body.booting → body goes opaque (CSS) + top-bar/dock fade in
+    //    (opacity, not transform: avoids the backdrop-filter re-sample
+    //    stutter that plagued the slide-in). The splash starts fading.
     document.body.classList.remove('booting');
-    // 4. Fade the splash out, then remove it from the DOM. transitionend +
+    // 4. Flip the OS window from transparent → opaque so the desktop stops
+    //    showing through the now-opaque WUPI UI. Done AFTER .booting is
+    //    removed so body's #02040a is in place the instant transparency
+    //    drops. Best-effort: if it fails, the app still runs (just with a
+    //    transparent background).
+    try {
+      await getCurrentWindow().setTransparent(false);
+    } catch (err) {
+      console.warn('[Wupi] setTransparent(false) failed; window stays transparent', err);
+    }
+    // 5. Fade the splash out, then remove it from the DOM. transitionend +
     //    {once:true} guarantees one-shot cleanup; pointer-events:none on
     //    .fade-out means even a stalled transition can't block the UI.
     const splash = document.getElementById('boot-splash');

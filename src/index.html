@@ -6,12 +6,13 @@
     <title>WUPI OS</title>
     <link rel="stylesheet" href="styles.css">
 </head>
-<body class="booting" style="background-color:#02040a">
-    <!-- Boot splash: paints on first frame BEFORE the canvas initializes. The
-         inline body background above is the anti-white-flash belt: it covers
-         the webview before styles.css even loads, so there is never a frame of
-         default white. The ring is pure CSS (conic-gradient + mask, ~0 CPU);
-         fades + self-removes once the boot gate resolves (script.js). -->
+<body class="booting">
+    <!-- Boot phase: the window is transparent (tauri.conf.json) so the user
+         sees their desktop through it. The body has NO background here; the
+         only thing visible is the boot ring. After the 5s gate resolves,
+         script.js drops .booting → body gets #02040a (CSS) + the canvas paints
+         the starry sky + aurora, and the window is flipped to opaque via
+         setTransparent(false) so the desktop no longer bleeds through. -->
     <div id="boot-splash">
         <div class="boot-ring"></div>
     </div>
