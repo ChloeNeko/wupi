@@ -420,11 +420,15 @@ body:not(.booting) .top-bar {
        is the structural fix. */
     transition: opacity 0.6s ease-out 2.3s;
 }
-body.booting .dock-trigger-area {
+body.booting .dock-trigger-area,
+body.loading .dock-trigger-area {
     opacity: 0;
     pointer-events: none;
 }
-body:not(.booting) .dock-trigger-area {
+/* Dock only appears once BOTH boot AND loading are done. The top bar
+   (above) only checks :not(.booting) so it can be visible through the
+   loading screen. */
+body:not(.booting):not(.loading) .dock-trigger-area {
     opacity: 1;
 }
 
@@ -1732,7 +1736,11 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 #boot-loading {
     position: fixed;
     inset: 0;
-    z-index: 100001;
+    /* BELOW the top bar (9999) and dock (9998) so the chrome stays visible
+       through the loading screen — the top bar fades in at paw-land and
+       floats over the violet abyss the whole 8s. Above the canvas (1) so
+       the violet covers any paint during the crossfade-out. */
+    z-index: 9990;
     pointer-events: none;
     /* Violet abyss: deep radial violet fading to near-black at the edges.
        Reads as an infinite purple void behind the loading text. */
@@ -1748,9 +1756,11 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 #boot-loading.fade-out { opacity: 0; }
 
 /* "LOADING OS . . ." — the central progress text. Sits slightly above
-   viewport center (top: 38%) per spec. The whole word gently floats via
-   bootLoadingFloat (subtle 4px bob). Each character is a <span> that
-   lights up L→R as progress fills (script.js adds .lit staggered). */
+   viewport center (top: 38%) per spec. Each character is a <span> that
+   (a) lights up L→R as progress fills (script.js adds .lit staggered) and
+   (b) floats subtly on its own — script.js sets a per-span negative
+   animation-delay so the letters shimmer out-of-phase rather than the
+   whole word bobbing in unison. */
 .boot-loading-text {
     position: absolute;
     top: 38%;
@@ -1765,12 +1775,14 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     text-transform: uppercase;
     white-space: nowrap;
     user-select: none;
-    animation: bootLoadingFloat 3s ease-in-out infinite;
-    /* space between span characters stays as letter-spacing; spans themselves
-       are inline so they flow as a single word. */
 }
 .boot-loading-text span {
     display: inline-block;
+    /* Per-character float: small vertical drift + faint horizontal sway.
+       Composed with the lit/text-shadow transition on the same element
+       (transform vs color/shadow — different properties, no conflict).
+       script.js sets animation-delay per span so they're phase-offset. */
+    animation: bootCharFloat 3.4s ease-in-out infinite;
     /* Unlit: dim violet, no glow. transition so the L→R lighting reads as a
        smooth fill rather than a hard pop per character. */
     color: #3a1850;
@@ -1785,9 +1797,10 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
         0 0 18px rgba(255, 78, 205, 0.6),
         0 0 32px rgba(181, 52, 250, 0.5);
 }
-@keyframes bootLoadingFloat {
-    0%, 100% { transform: translate(-50%, -50%); }
-    50%      { transform: translate(-50%, calc(-50% - 5px)); }
+@keyframes bootCharFloat {
+    0%, 100% { transform: translateY(0) translateX(0); }
+    30%      { transform: translateY(-4px) translateX(1px); }
+    70%      { transform: translateY(3px) translateX(-1px); }
 }
 
 /* Terminal stream at the bottom: cosmetic OS boot lines + a real "model

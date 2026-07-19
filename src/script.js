@@ -144,12 +144,12 @@ const STAR_COLORS = ['#ffffff', '#e8f0ff', '#fff4e6', '#ffe6ee'];
 // the full 30px blur, identical to the locked aesthetic.
 let auroraIntensity = 0;
 let auroraRampStart = 0;
-const AURORA_RAMP_MS = 600;
+const AURORA_RAMP_MS = 1200;
 // The wipe runs concurrently with the intensity ramp. Shorter than RAMP_MS
 // so the wipe front finishes ahead of the full-opacity settle.
 let auroraRevealX = 0;          // current wipe x (px, CSS px)
 let auroraRevealStart = 0;      // 0 = not yet armed
-const AURORA_WIPE_MS = 500;
+const AURORA_WIPE_MS = 1200;
 // Buffer dirty flag: false = redraw curtains every frame (live at rest);
 // true = hold the snapshot (during the wipe, set by revealAfterLand).
 // auroraBufDirty: when frozen, render exactly once at full intensity, then
@@ -491,11 +491,11 @@ function setTitleState(state) {
 (function setupBootSplash() {
   // Timing constants (ms).
   const ENTRY_DELAY = 1000;       // blank screen before paw enters (1s per spec)
-  const ENTRY_DURATION = 2200;    // paw rises + 16-point circle → center (slowed + smoother per spec)
-  const HOP_DURATION = 450;       // each hop (up + down) — quick per spec
+  const ENTRY_DURATION = 2800;    // paw rises + 16-point circle → center (slowed further per spec)
+  const HOP_DURATION = 550;       // each hop (up + down) — slowed per spec
   const HOP_APEX = HOP_DURATION / 2;
   const HOP_HEIGHT = 80;          // px the inner img rises per hop
-  const PAUSE_BETWEEN_HOPS = 120; // tiny rest between hop 1 and hop 2
+  const PAUSE_BETWEEN_HOPS = 180; // tiny rest between hop 1 and hop 2
   // Sparkle trail: a sparkle spawns every TRAIL_INTERVAL ms along the paw's
   // path during entry + flight (NOT during hops — those get the escalating
   // bursts). Tight interval + bigger/longer-lived sparkles so the trail
@@ -785,6 +785,14 @@ function setTitleState(state) {
       stopTrail();
       // One final big burst on landing — a celebratory capstone.
       spawnSparkles(14, 1);
+      // Drop .booting NOW so the top bar fades in immediately and stays
+      // visible through the loading screen (the loading screen sits BELOW
+      // the top bar in z-order — see #boot-loading in styles.css). The
+      // body's bg also flips transparent → #02040a here, but the loading
+      // overlay covers it. The dock is held back by .loading until the
+      // loading screen ends.
+      document.body.classList.remove('booting');
+      document.body.classList.add('loading');
       startLoadingScreen();
     };
     bootPaw.addEventListener('transitionend', onLand);
@@ -818,12 +826,20 @@ function setTitleState(state) {
     // space text node so layout spacing stays correct.
     if (bootLoadingText) {
       bootLoadingText.innerHTML = '';
+      let spanIdx = 0;
       for (const ch of LOADING_TEXT) {
         if (ch === ' ') bootLoadingText.appendChild(document.createTextNode(' '));
         else {
           const s = document.createElement('span');
           s.textContent = ch;
+          // Per-span negative animation-delay so each letter floats
+          // out-of-phase (the bootCharFloat keyframe loops infinitely;
+          // offsetting the start makes them shimmer independently instead
+          // of bobbing in unison). ~0.32s between letters = clearly
+          // desynchronized but still reads as one word.
+          s.style.animationDelay = `-${(spanIdx * 0.32).toFixed(2)}s`;
           bootLoadingText.appendChild(s);
+          spanIdx++;
         }
       }
     }
@@ -861,12 +877,18 @@ function setTitleState(state) {
       // clicks (pointer-events:none in CSS, but cleanliness).
       bootLoading.addEventListener('transitionend', () => bootLoading.remove(), { once: true });
     }
+    // Drop .loading → releases the dock (its CSS rule keys on
+    // :not(.loading)). The top bar is already visible (it faded in at
+    // paw-land and stayed visible through loading).
+    document.body.classList.remove('loading');
     // If the model-ready milestone never fired (still loading), emit it
     // anyway so the terminal doesn't look like it gave up. Honest-ish: the
     // reveal will proceed regardless because the boot gate already required
     // modelReady for the flight.
     if (!milestoneEmitted) appendTerminalLine('› still loading — proceeding to UI', false);
-    // The staged reveal: drop .booting → starry sky paints → aurora wipes.
+    // The staged reveal: starry sky paints → aurora wipes. (.booting was
+    // already dropped at paw-land so the top bar could appear; revealAfterLand
+    // tolerates a redundant classList.remove.)
     revealAfterLand();
   }
 
