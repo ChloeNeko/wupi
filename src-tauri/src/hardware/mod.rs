@@ -1,4 +1,4 @@
-//! Hardware integrations — Windows API bridges for the status-bar modules.
+//! Hardware integrations: Windows API bridges for the status-bar modules.
 //!
 //! Each submodule wraps a Windows subsystem (Core Audio, WLAN, Bluetooth) and
 //! exposes plain `#[tauri::command]`s returning JSON values to the frontend.

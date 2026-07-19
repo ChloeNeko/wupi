@@ -1,4 +1,4 @@
-//! Wupi-as-game-manager intent router (Games app Seam E — the pivot's
+//! Wupi-as-game-manager intent router (Games app Seam E: the pivot's
 //! headline feature).
 //!
 //! When a game is active (`GameEngine.is_some()`), Wupi's chat context
@@ -6,18 +6,18 @@
 //! scoped `<world_state>` via natural language. This module classifies the
 //! player's message to Wupi and decides whether it's:
 //!
-//! - `MutateWorldState(delta)` — apply a state mutation ("make it stormy"
+//! - `MutateWorldState(delta)`: apply a state mutation ("make it stormy"
 //!   → `{entities: {weather: "stormy"}}`).
-//! - `QueryWorldState(what)` — return part of the state for Wupi to narrate
+//! - `QueryWorldState(what)`: return part of the state for Wupi to narrate
 //!   ("what's the weather?").
-//! - `NotACommand` — fall through to normal Wupi-assistant chat.
+//! - `NotACommand`: fall through to normal Wupi-assistant chat.
 //!
 //! # MVP compromise
 //!
 //! Intent detection is **heuristic** (keyword matching) for the MVP. This
 //! WILL misroute edge cases. Phase 2 replaces it with an LLM-judge pre-pass
 //! or a small classifier. Documented as a known limitation, not a hidden
-//! bug — see the inline comments for what each branch covers and what it
+//! bug: see the inline comments for what each branch covers and what it
 //! misses.
 
 use crate::schema::SchemaDelta;
@@ -31,7 +31,7 @@ pub enum GameCommand {
     MutateWorldState(SchemaDelta),
     /// The player is asking about the game state. `what` is the focus
     /// (e.g. "weather", "inventory", "npcs"). Wupi will narrate the answer
-    /// in her own voice — no mutation.
+    /// in her own voice: no mutation.
     QueryWorldState(String),
     /// Not a game-management request. Fall through to normal Wupi chat.
     NotACommand,
@@ -45,7 +45,7 @@ pub enum GameCommand {
 ///
 /// The heuristic is **conservative toward `NotACommand`**: false-positives
 /// (treating normal chat as a command) are worse than false-negatives
-/// (missing a command — the player can rephrase). The bar to route to a
+/// (missing a command: the player can rephrase). The bar to route to a
 /// command is HIGH.
 pub fn classify(text: &str) -> GameCommand {
     let lower = text.to_lowercase();
@@ -55,7 +55,6 @@ pub fn classify(text: &str) -> GameCommand {
         return GameCommand::NotACommand;
     }
 
-    // ── Query signals ───────────────────────────────────────────────────
     // "what's the X", "show me X", "how is X", "status of X".
     let query_starters = [
         "what's ", "what is ", "whats ", "show me ", "show ",
@@ -67,7 +66,6 @@ pub fn classify(text: &str) -> GameCommand {
         return GameCommand::QueryWorldState(extract_focus(trimmed));
     }
 
-    // ── Mutation signals ────────────────────────────────────────────────
     // "make it X", "set X to Y", "change X to Y", "give me X", "remove X",
     // "teleport/travel to X", "fast-travel to X".
     let mutation_starters = [
@@ -79,7 +77,7 @@ pub fn classify(text: &str) -> GameCommand {
         "spawn ",
     ];
     if mutation_starters.iter().any(|s| trimmed.starts_with(s)) {
-        // For the MVP we return a PLACEHOLDER delta — the actual LLM
+        // For the MVP we return a PLACEHOLDER delta: the actual LLM
         // translation ("make it stormy" → {weather: stormy}) happens in
         // `game_command::translate_to_delta`, called from `chat_send` after
         // classification. Returning an empty delta here keeps the type
@@ -87,7 +85,6 @@ pub fn classify(text: &str) -> GameCommand {
         return GameCommand::MutateWorldState(SchemaDelta::default());
     }
 
-    // ── Keyword fallbacks ───────────────────────────────────────────────
     // Some management intents don't start with a clear verb but contain
     // strong domain keywords. Match a few high-value ones.
     let keyword_signals = ["inventory", "weather", "time of day", "fast travel"];
@@ -225,7 +222,7 @@ mod tests {
 
     #[test]
     fn keyword_without_verb_routes_to_query() {
-        // "the weather is nice" — mentions weather but no mutation verb.
+        // "the weather is nice": mentions weather but no mutation verb.
         match classify("the weather is nice today") {
             GameCommand::QueryWorldState(_) => {}
             other => panic!("expected QueryWorldState, got {other:?}"),
@@ -234,7 +231,7 @@ mod tests {
 
     #[test]
     fn keyword_with_verb_routes_to_mutate() {
-        // "change the weather" — keyword + mutation verb.
+        // "change the weather": keyword + mutation verb.
         assert!(matches!(
             classify("change the weather"),
             GameCommand::MutateWorldState(_)
@@ -259,7 +256,7 @@ mod tests {
 
 // Top-level `Display` impl (Phase E cleanup, 2026-07-18). Was previously
 // inside `#[cfg(test)]` to silence unused-Debug-format warnings on `_` match
-// arms in tests. Promoted to the module level — it's useful for log lines in
+// arms in tests. Promoted to the module level: it's useful for log lines in
 // the route helpers too (`tracing::info!(?cmd, ...)` falls back to Display
 // when Debug isn't used). No behavior change.
 impl std::fmt::Display for GameCommand {

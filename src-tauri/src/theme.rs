@@ -4,7 +4,7 @@
 //!
 //! The current defaults are `theme = "Aurora"` and `color_code = "Vibrant"`.
 //! These are the ONLY names recognized today; the frontend owns the list of
-//! options in the cascade panels. New themes/color codes are additive — add
+//! options in the cascade panels. New themes/color codes are additive: add
 //! an entry to the frontend `COLOR_CODES` map and they light up live.
 
 use std::path::PathBuf;
@@ -43,7 +43,7 @@ impl ThemeSettings {
     }
 
     /// Persist atomically: temp file + rename (same pattern as session.rs::save).
-    /// On failure we log and continue — theme state still lives in memory and
+    /// On failure we log and continue: theme state still lives in memory and
     /// can be re-saved on the next change.
     pub fn save(&self, path: &std::path::Path) {
         let tmp = path.with_extension("json.tmp");
@@ -58,7 +58,7 @@ impl ThemeSettings {
             tracing::error!(error = %e, "theme: write tmp failed");
             return;
         }
-        // Windows rename over existing uses MOVEFILE_REPLACE_EXISTING — atomic.
+        // Windows rename over existing uses MOVEFILE_REPLACE_EXISTING: atomic.
         if let Err(e) = std::fs::rename(&tmp, path) {
             tracing::error!(error = %e, "theme: rename failed");
             let _ = std::fs::remove_file(&tmp);

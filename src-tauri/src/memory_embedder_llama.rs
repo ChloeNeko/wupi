@@ -20,7 +20,7 @@
 //!
 //! A `LlamaContext` is configured once at creation and cannot be reconfigured.
 //! Sharing one thread would force either context recreation per call (expensive)
-//! or hand-rolled request multiplexing (complex + reintroduces mutual blocking —
+//! or hand-rolled request multiplexing (complex + reintroduces mutual blocking -
 //! generation stalls while embedding runs on the same thread). Two threads +
 //! two contexts coordinate only through the shared [`crate::memory::MemoryEngine`]
 //! handle in `AppState`; neither blocks the other.
@@ -34,7 +34,7 @@
 //!
 //! # What this does NOT do (Phase 2.6+)
 //!
-//! This module is unwired scaffolding — it builds and type-checks but nothing
+//! This module is unwired scaffolding: it builds and type-checks but nothing
 //! calls it. AppState wiring + eager load at startup + the §2F cache-invalidation
 //! decision all land in the next phase. Until then the `StubEmbedder` stands in.
 
@@ -50,7 +50,7 @@ use crate::llm::shared_backend;
 use crate::memory_embedder::{EmbedFuture, Embedder, EMBED_DIM};
 
 /// BERT context length (hard input limit). Inputs longer than this are
-/// truncated after tokenization — long inputs silently degrade into garbage
+/// truncated after tokenization: long inputs silently degrade into garbage
 /// embeddings otherwise. Sourced from `bert.context_length` in `Embed.gguf`.
 const BERT_CONTEXT_LENGTH: u32 = 512;
 
@@ -72,22 +72,22 @@ const BERT_TRUNCATE_TOKENS: usize = 512;
 /// before embedding; documents (archived memories) are embedded raw.
 ///
 /// Without it, query embeddings collapse toward the document centroid and the
-/// cosine range compresses — irrelevant matches score too high to be floored
+/// cosine range compresses: irrelevant matches score too high to be floored
 /// out. Runtime-measured 2026-07-14 (post embedder-fix verification, healthy
 /// encoder): querying "gold" against "the weather is nice today" scored cosine
-/// 0.53 with no prefix — well above the dense floor, so it would have surfaced
+/// 0.53 with no prefix: well above the dense floor, so it would have surfaced
 /// as a false positive. The asymmetric prefix is what separates the relevant
 /// from the irrelevant. (Real-data calibration later showed the floor belongs
-/// at 0.25, not 0.40 — see [`crate::memory_rrf::DENSE_COSINE_FLOOR`].)
+/// at 0.25, not 0.40: see [`crate::memory_rrf::DENSE_COSINE_FLOOR`].)
 ///
-/// The leading space is intentional — bge's instruction is `instruction + " " + text`.
+/// The leading space is intentional: bge's instruction is `instruction + " " + text`.
 /// The trailing newline in the model-card example is not load-bearing; the
 /// tokenizer treats `: ` then text the same as `:\n` then text.
 const BGE_QUERY_INSTRUCTION: &str =
     "Represent this sentence for searching relevant passages: ";
 
 // ---------------------------------------------------------------------------
-// Control plane — channel types
+// Control plane: channel types
 // ---------------------------------------------------------------------------
 
 /// A request posted to the embedder thread by [`LlamaCppEmbedder::embed`].
@@ -95,7 +95,7 @@ struct EmbedRequest {
     text: String,
     /// One-shot reply channel. Using a separate mpsc (not the Embedder trait's
     /// boxed future) keeps the embedder thread decoupled from async-runtime
-    /// types — same shape as `EngineRequest::reply` in `engine.rs`.
+    /// types: same shape as `EngineRequest::reply` in `engine.rs`.
     reply: mpsc::Sender<EmbedReply>,
 }
 
@@ -108,14 +108,13 @@ enum EmbedReply {
 /// Control messages for the embedder thread's main loop.
 enum EmbedMsg {
     Request(Box<EmbedRequest>),
-    Shutdown,
 }
 
 // ---------------------------------------------------------------------------
 // Handle (held by callers; fully Send + Sync)
 // ---------------------------------------------------------------------------
 
-/// The handle callers hold. Fully `Send + Sync` — it's just a channel sender,
+/// The handle callers hold. Fully `Send + Sync`: it's just a channel sender,
 /// no `LlamaContext` or `!Send` type crosses out of the embedder thread.
 /// Mirrors [`crate::engine::ChatEngine`].
 pub struct LlamaCppEmbedder {
@@ -133,7 +132,7 @@ impl LlamaCppEmbedder {
     /// the embedding context is live (or `Err` if init failed).
     ///
     /// The caller MUST `recv()` from the returned receiver before treating
-    /// the embedder as ready — context creation happens on the embedder
+    /// the embedder as ready: context creation happens on the embedder
     /// thread, and if it fails the caller must not report "ready". Same
     /// readiness contract as `ChatEngine::spawn` (Bug #6).
     ///
@@ -211,12 +210,8 @@ impl LlamaCppEmbedder {
                                 }
                             };
                             // Send can fail only if the caller dropped the
-                            // receiver (gave up) — ignore.
+                            // receiver (gave up): ignore.
                             let _ = req.reply.send(reply_msg);
-                        }
-                        Ok(EmbedMsg::Shutdown) => {
-                            tracing::info!("wupi-embedder shutting down");
-                            break;
                         }
                         Err(mpsc::RecvError) => {
                             tracing::info!(
@@ -232,20 +227,11 @@ impl LlamaCppEmbedder {
         (LlamaCppEmbedder { tx }, init_rx)
     }
 
-    /// Signal the embedder to shut down. Best-effort — kept for future
-    /// hot-swap, not currently called.
-    #[allow(dead_code)]
-    pub fn shutdown(&self) {
-        let _ = self.tx.send(EmbedMsg::Shutdown);
-    }
-
     /// Drain + fail any early requests queued before init failed, then exit.
     /// Mirrors `ChatEngine::drain_failed`.
     fn drain_failed(rx: &mpsc::Receiver<EmbedMsg>, why: String) {
-        while let Ok(msg) = rx.recv_timeout(std::time::Duration::from_millis(50)) {
-            if let EmbedMsg::Request(req) = msg {
-                let _ = req.reply.send(EmbedReply::Err(why.clone()));
-            }
+        while let Ok(EmbedMsg::Request(req)) = rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            let _ = req.reply.send(EmbedReply::Err(why.clone()));
         }
     }
 
@@ -266,13 +252,13 @@ impl LlamaCppEmbedder {
             .map_err(|e| anyhow::anyhow!("n_embd doesn't fit usize: {e}"))?;
         anyhow::ensure!(
             n_embd == EMBED_DIM,
-            "Embed.gguf n_embd={n_embd} but EMBED_DIM={EMBED_DIM} — wrong model file? \
+            "Embed.gguf n_embd={n_embd} but EMBED_DIM={EMBED_DIM}: wrong model file? \
              (expected bge-small-en-v1.5, 384-dim)"
         );
         tracing::info!(n_embd, "embed model loaded");
 
         // Leak the model to &'static so the context can borrow it for its
-        // whole life. Same rationale as llm.rs::into_static — LlamaContext<'a>
+        // whole life. Same rationale as llm.rs::into_static: LlamaContext<'a>
         // borrows &'a LlamaModel, and storing both is self-referential.
         // backend is already &'static (from shared_backend).
         let model_ref: &'static LlamaModel = Box::leak(Box::new(model));
@@ -280,7 +266,7 @@ impl LlamaCppEmbedder {
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(BERT_CONTEXT_LENGTH))
             .with_n_batch(BERT_N_BATCH)
-            // REQUIRED — without this, embeddings_seq_ith returns NotEnabled
+            // REQUIRED: without this, embeddings_seq_ith returns NotEnabled
             // and every embed fails.
             .with_embeddings(true)
             // bge-small-en-v1.5 is designed for CLS pooling (pooling_type=2
@@ -316,14 +302,14 @@ impl LlamaCppEmbedder {
 /// is embedded AS A QUERY (with [`BGE_QUERY_INSTRUCTION`]) and each target is
 /// embedded AS A DOCUMENT (raw). This is what the dense cosine floor will see
 /// in production, so the numbers here are the calibration reference for
-/// [`crate::memory_rrf::DENSE_COSINE_FLOOR`] — not a theoretical doc-doc score.
+/// [`crate::memory_rrf::DENSE_COSINE_FLOOR`]: not a theoretical doc-doc score.
 ///
 /// Expected ordering for a healthy bge-small-en-v1.5 with the query prefix:
 ///   - "gold" vs "gold is a precious metal"     → HIGH   (0.6-0.9)
 ///   - "gold" vs "silver is a precious metal"   → MEDIUM (0.4-0.7)
-///   - "gold" vs "the weather is nice today"    → LOW    (~0.40-0.45 — synthetic
+///   - "gold" vs "the weather is nice today"    → LOW    (~0.40-0.45: synthetic
 ///     worst case; real multi-topic data separates far more cleanly, with
-///     irrelevant matches landing ≤0.10 — see DENSE_COSINE_FLOOR's doc)
+///     irrelevant matches landing ≤0.10: see DENSE_COSINE_FLOOR's doc)
 ///
 /// If all three are ~0.05 (random unit vectors), the EMBEDDER is broken and
 /// vec0 is exonerated. If they make sense here but the 🧠 panel shows garbage,
@@ -334,8 +320,8 @@ fn run_self_test(runtime: &mut EmbedderRuntime) {
         ("gold", "silver is a precious metal", "MEDIUM"),
         ("gold", "the weather is nice today", "LOW"),
     ];
-    // Embed "gold" AS A QUERY — this is the path search() takes, prefix and all.
-    // The targets are embedded AS DOCUMENTS (raw) — the archival path. Matching
+    // Embed "gold" AS A QUERY: this is the path search() takes, prefix and all.
+    // The targets are embedded AS DOCUMENTS (raw): the archival path. Matching
     // the data plane's asymmetry is what makes these numbers the floor's true
     // calibration reference.
     let probe = match runtime.embed_one(&format!("{BGE_QUERY_INSTRUCTION}gold")) {
@@ -371,7 +357,7 @@ impl Embedder for LlamaCppEmbedder {
         // `request()` so the channel-send error mapping lives in one place.
         let this_tx = self.tx.clone();
         Box::pin(async move {
-            // Fresh oneshot per request — exactly the shape
+            // Fresh oneshot per request: exactly the shape
             // `LlamaCppBackend::stream` uses to await an engine reply.
             let (reply_tx, reply_rx) = mpsc::channel::<EmbedReply>();
             let req = EmbedRequest {
@@ -385,7 +371,7 @@ impl Embedder for LlamaCppEmbedder {
                 .send(EmbedMsg::Request(Box::new(req)))
                 .map_err(|_| anyhow::anyhow!("embedder thread closed"))?;
 
-            // Await off the async runtime — embedding takes milliseconds on
+            // Await off the async runtime: embedding takes milliseconds on
             // GPU but we must not block a tokio worker for that duration.
             let reply = tokio::task::spawn_blocking(move || reply_rx.recv())
                 .await
@@ -402,7 +388,7 @@ impl Embedder for LlamaCppEmbedder {
     /// bge-small is asymmetric: queries get the [`BGE_QUERY_INSTRUCTION`] prefix,
     /// documents are embedded raw (via [`embed`](Embedder::embed)). Without the
     /// prefix the cosine range compresses and irrelevant matches clear the dense
-    /// floor — see the const's doc for the measured failure.
+    /// floor: see the const's doc for the measured failure.
     fn embed_query(&self, text: String) -> EmbedFuture {
         let prefixed = format!("{BGE_QUERY_INSTRUCTION}{text}");
         self.embed(prefixed)
@@ -445,32 +431,32 @@ impl EmbedderRuntime {
     ///
     /// # The encode vs decode distinction (2026-07-14 bug fix)
     ///
-    /// `bge-small-en-v1.5` is a BERT encoder — bidirectional (non-causal).
+    /// `bge-small-en-v1.5` is a BERT encoder: bidirectional (non-causal).
     /// llama.cpp has two entry points:
-    /// - `llama_decode` — causal mask (each token attends only to EARLIER
+    /// - `llama_decode`: causal mask (each token attends only to EARLIER
     ///   tokens). For autoregressive chat models (Gemma, Llama).
-    /// - `llama_encode` — full bidirectional mask (every token attends to
+    /// - `llama_encode`: full bidirectional mask (every token attends to
     ///   every other token). For encoder/embedding models (BERT).
     ///
     /// The earlier revision called `ctx.decode(...)`. That's wrong for BERT.
-    /// With a causal mask, position 0 ([CLS]) attends ONLY to itself — it
+    /// With a causal mask, position 0 ([CLS]) attends ONLY to itself: it
     /// never sees the rest of the sequence. Its hidden state is nearly
     /// context-free. The result: healthy-looking L2 norm (~9) but inverted /
-    /// length-dependent semantics — short inputs scored high cosine to
+    /// length-dependent semantics: short inputs scored high cosine to
     /// everything (CLS self-attention dominated), long inputs scored near
     /// zero (no bidirectional context to build meaning). Runtime-observed:
     /// "continue" scored cos 0.969 to "cow"; "Write me a short story about
-    /// cows" scored cos 0.008 to "cow". Inverted and length-correlated —
+    /// cows" scored cos 0.008 to "cow". Inverted and length-correlated -
     /// the signature of causal attention on a bidirectional model.
     ///
     /// The fix: `ctx.encode(...)`. The C++ `encode()` path also clears the
     /// pooled-embedding buffer (`embd_seq.clear()`, llama-context.cpp:1376)
     /// at the start of every call, so no manual KV/embd clear is needed
-    /// between embeds — the encoder is self-cleaning.
+    /// between embeds: the encoder is self-cleaning.
     ///
     /// # The logits flag (also fixed 2026-07-14)
     ///
-    /// `batch.add(..., logits=true)` for EVERY position — the pooling layer
+    /// `batch.add(..., logits=true)` for EVERY position: the pooling layer
     /// reads position 0's hidden state from the output buffer, so every
     /// position's embedding must be stored. The chat engine's `is_last`
     /// optimization (logits only on the final token) is wrong for encoders.
@@ -480,12 +466,12 @@ impl EmbedderRuntime {
         // parameter (see llama-cpp-2's str_to_token: it passes add_bos as
         // the 6th arg to llama_tokenize, which llama.h documents as
         // `add_special`). For BERT, `add_special=true` is what inserts
-        // [CLS] at position 0 and [SEP] at the end — WITHOUT them, CLS
+        // [CLS] at position 0 and [SEP] at the end: WITHOUT them, CLS
         // pooling reads position 0 = the first content token, producing
         // embeddings with healthy magnitude but inverted/garbled semantics
         // (runtime-observed 2026-07-14: "gold" scored HIGHER cosine to
         // "the weather is nice today" than to "gold is a precious metal").
-        // The earlier "AddBos::Never" comment was wrong — it confused this
+        // The earlier "AddBos::Never" comment was wrong: it confused this
         // flag with the chat engine's Gemma BOS, which is a different
         // mechanism entirely.
         let mut tokens = self
@@ -505,7 +491,7 @@ impl EmbedderRuntime {
         // log at debug so silent truncation becomes observable in the live
         // exe's tracing output. The caller (`add_memory`) is supposed to chunk
         // first (see `memory::chunk_text`) so this should never fire on the
-        // archival path post-chunking — but queries, codex entries, or future
+        // archival path post-chunking: but queries, codex entries, or future
         // callers can still exceed it. If this fires frequently, the chunk
         // budget may need lowering OR a caller is bypassing chunking.
         let pre_truncate_len = tokens.len();
@@ -518,7 +504,7 @@ impl EmbedderRuntime {
         }
         tokens.truncate(BERT_TRUNCATE_TOKENS);
 
-        // Build the batch. logits=true for EVERY position — the pooling layer
+        // Build the batch. logits=true for EVERY position: the pooling layer
         // (CLS) reads position 0's hidden state from the output buffer, so
         // every position's embedding must be stored. The chat engine's
         // `is_last` optimization (logits only on the final token) is WRONG
@@ -540,8 +526,8 @@ impl EmbedderRuntime {
             .map_err(|e| anyhow::anyhow!("embed encode: {e:?}"))?;
 
         // Read the pooled sequence embedding. embeddings_seq_ith borrows from
-        // &self — to_vec before returning so the borrow ends with this fn.
-        // Failure variants: NotEnabled (forgot with_embeddings(true) — can't
+        // &self: to_vec before returning so the borrow ends with this fn.
+        // Failure variants: NotEnabled (forgot with_embeddings(true): can't
         // happen here), NonePoolType (pooling misconfig).
         let slice = self
             .ctx
@@ -551,7 +537,7 @@ impl EmbedderRuntime {
         // L2-normalize. bge-small's raw CLS output needs normalization for
         // vec0's cosine MATCH to produce correct rankings (cosine = dot
         // product only when both vectors are unit-length). Doing it here means
-        // every stored vector is already unit-length — single responsibility,
+        // every stored vector is already unit-length: single responsibility,
         // the embedder owns vector quality.
         let mut vec = slice.to_vec();
         // Diagnostic: log the pre-normalization L2 norm on the first embed
@@ -575,7 +561,7 @@ impl EmbedderRuntime {
 }
 
 /// In-place L2 normalization. Empty/zero vectors are left as-is (their norm
-/// is 0; dividing would NaN) — callers should not embed empty text, and the
+/// is 0; dividing would NaN): callers should not embed empty text, and the
 /// `tokenized text is empty` guard above prevents it.
 fn l2_normalize(v: &mut [f32]) {
     let sum_sq: f32 = v.iter().map(|x| x * x).sum();
@@ -589,13 +575,13 @@ fn l2_normalize(v: &mut [f32]) {
 }
 
 // ---------------------------------------------------------------------------
-// Model discovery — sibling to lib.rs::pick_main_model
+// Model discovery: sibling to lib.rs::pick_main_model
 // ---------------------------------------------------------------------------
 
 /// Resolve the embed model file from the same search paths as the chat model.
 ///
 /// Locked naming convention (AGENTS.md §2): the embeddings model is ALWAYS
-/// `Embed.gguf`. Exact-match (case-insensitive), no size fallback — only one
+/// `Embed.gguf`. Exact-match (case-insensitive), no size fallback: only one
 /// file will ever have that name. Returns `None` if no embed model is present,
 /// in which case Memory should fall back to `StubEmbedder` (graceful
 /// degradation, not a crash).
@@ -611,7 +597,7 @@ pub fn pick_embed_model(dir: &Path) -> Option<PathBuf> {
 }
 
 /// Walk the same candidate dirs `resolve_model_path` uses for the chat model.
-/// Kept here (not in lib.rs) so the embedder is self-contained — its loader
+/// Kept here (not in lib.rs) so the embedder is self-contained: its loader
 /// lives with its discovery. Callers (the future AppState wiring) pass the
 /// list of dirs to check.
 pub fn resolve_embed_model(dirs: &[PathBuf]) -> Option<PathBuf> {
@@ -623,7 +609,7 @@ pub fn resolve_embed_model(dirs: &[PathBuf]) -> Option<PathBuf> {
             }
         }
     }
-    tracing::warn!("no Embed.gguf found — memory engine will fall back to StubEmbedder");
+    tracing::warn!("no Embed.gguf found: memory engine will fall back to StubEmbedder");
     None
 }
 
@@ -659,7 +645,7 @@ mod tests {
 
     #[test]
     fn embed_dim_const_matches_gguf_header() {
-        // Regression guard mirroring memory_embedder.rs — if the const drifts
+        // Regression guard mirroring memory_embedder.rs: if the const drifts
         // from the model's actual dimension, this fails loudly.
         assert_eq!(EMBED_DIM, 384, "Embed.gguf is bge-small-en-v1.5 (384-dim)");
         assert_eq!(BERT_CONTEXT_LENGTH, 512, "bert.context_length from GGUF header");

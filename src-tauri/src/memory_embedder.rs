@@ -7,7 +7,7 @@
 //! with a [`StubEmbedder`]; production will construct it with a real
 //! `LlamaCppEmbedder` once the BERT load path lands (Phase 2.5).
 //!
-//! This file is deliberately dependency-free — no `llama-cpp-2`, no `rusqlite`,
+//! This file is deliberately dependency-free: no `llama-cpp-2`, no `rusqlite`,
 //! no `sqlite-vec`. Pure trait + alias + const + one trivial impl. If a future
 //! change adds a CUDA import here, the §3A invariant has been broken.
 //!
@@ -16,7 +16,7 @@
 //! [`EMBED_DIM`] is the vector length every embedder MUST produce and the
 //! width declared in the `vec0` DDL in `memory.rs`. A mismatch crashes `vec0`
 //! at insert time with a confusing size error. The value is read directly from
-//! `Embed.gguf`'s GGUF metadata header (`bert.embedding_length`) — see the
+//! `Embed.gguf`'s GGUF metadata header (`bert.embedding_length`): see the
 //! citation on the const.
 
 use std::future::Future;
@@ -24,7 +24,7 @@ use std::pin::Pin;
 
 /// Vector width produced by `Embed.gguf`.
 ///
-/// `Embed.gguf` is `bge-small-en-v1.5` — a BERT-architecture encoder, NOT
+/// `Embed.gguf` is `bge-small-en-v1.5`: a BERT-architecture encoder, NOT
 /// Gemma-family. Its GGUF header declares `bert.embedding_length = 384`
 /// (parsed 2026-07-13). A 768 guess would have crashed `vec0` at first insert:
 /// the virtual table is declared `float[384]` and the dimension is checked at
@@ -40,7 +40,7 @@ pub const EMBED_DIM: usize = 384;
 ///
 /// Mirrors the `StreamFuture` pattern in `llm.rs`: the codebase convention is
 /// boxed futures returned from trait methods, NOT `async fn` in traits (neither
-/// existing trait — `GenerationClient` nor `ChatFormat` — uses `async fn`).
+/// existing trait: `GenerationClient` nor `ChatFormat` - uses `async fn`).
 /// Owned `String` input → `'static` future, avoiding lifetime gymnastics on
 /// the borrow held across the await.
 pub type EmbedFuture = Pin<Box<dyn Future<Output = anyhow::Result<Vec<f32>>> + Send>>;
@@ -48,7 +48,7 @@ pub type EmbedFuture = Pin<Box<dyn Future<Output = anyhow::Result<Vec<f32>>> + S
 /// Produces a dense vector embedding for a text.
 ///
 /// Implementations MUST return a `Vec<f32>` of length [`EMBED_DIM`]. The
-/// `vec0` insert path in `memory.rs` does not re-check the length — it would
+/// `vec0` insert path in `memory.rs` does not re-check the length: it would
 /// be a redundant per-insert scan that the embedder contract already covers.
 ///
 /// Receivers are `&self` (not `&mut self`), matching both existing traits.
@@ -56,17 +56,17 @@ pub type EmbedFuture = Pin<Box<dyn Future<Output = anyhow::Result<Vec<f32>>> + S
 /// channel, like `LlamaCppBackend` does for chat) provide it themselves behind
 /// an `Arc<Mutex<...>>` or a channel handle.
 pub trait Embedder: Send + Sync {
-    /// Embed `text` as a DOCUMENT — the archived/storage side of retrieval.
+    /// Embed `text` as a DOCUMENT: the archived/storage side of retrieval.
     /// Asymmetric models (e.g. bge-small) embed documents raw.
     fn embed(&self, text: String) -> EmbedFuture;
 
-    /// Embed `text` as a QUERY — the search side of retrieval. Asymmetric
+    /// Embed `text` as a QUERY: the search side of retrieval. Asymmetric
     /// models apply a query instruction prefix here (see the concrete impl's
     /// doc); symmetric models (and [`StubEmbedder`]) default to [`embed`].
     ///
     /// The data plane calls this for search and [`embed`](Self::embed) for
     /// archival, so the model-specific query/document asymmetry lives entirely
-    /// in the embedder — not in the retrieval math (AGENTS.md §3A). "This text
+    /// in the embedder: not in the retrieval math (AGENTS.md §3A). "This text
     /// is a query" is retrieval logic; "the query gets a prefix" is model
     /// behavior, and only the impl knows the latter.
     fn embed_query(&self, text: String) -> EmbedFuture {
@@ -82,13 +82,13 @@ pub trait Embedder: Send + Sync {
 /// Blanket forward `Embedder` through `Box<E>`. Without this, `Box<dyn Embedder>`
 /// does NOT auto-implement `Embedder` (trait objects don't self-forward), so
 /// `MemoryEngine<Box<dyn Embedder>>` would not satisfy the `E: Embedder` bound.
-/// This is the standard Rust pattern — the same blanket impl `std` provides for
+/// This is the standard Rust pattern: the same blanket impl `std` provides for
 /// `Box<dyn Read>`/`Box<dyn Write>`. `?Sized` is required so `dyn Embedder`
 /// (which is `!Sized`) is covered, and it additionally covers `Box<ConcreteType>`.
 ///
 /// Lets `AppState` hold one concrete `MemoryEngine<Box<dyn Embedder + Send + Sync>>`
 /// regardless of which backend (`LlamaCppEmbedder` or `StubEmbedder`) was chosen
-/// at startup — decided once in `setup()`, dispatched through one virtual call
+/// at startup: decided once in `setup()`, dispatched through one virtual call
 /// per embed (negligible next to multi-ms GPU work).
 impl<E: Embedder + ?Sized> Embedder for Box<E> {
     fn embed(&self, text: String) -> EmbedFuture {
@@ -112,7 +112,7 @@ impl<E: Embedder + ?Sized> Embedder for Box<E> {
 /// plumbing end-to-end; says nothing about semantic quality.
 ///
 /// Cheaper than any real embedder by orders of magnitude, and crucially does
-/// not link `llama-cpp-2` — so unit tests against this stay CUDA-free.
+/// not link `llama-cpp-2`: so unit tests against this stay CUDA-free.
 pub struct StubEmbedder {
     /// Vector width this stub will produce. Tests should pass [`EMBED_DIM`]
     /// so they exercise the same code path as production.
@@ -124,7 +124,7 @@ impl Embedder for StubEmbedder {
         let dim = self.dim;
         Box::pin(async move {
             // Byte-bucket histogram. ASCII letters collapse into buckets that
-            // overlap across similar English text — enough for cosine > 0.
+            // overlap across similar English text: enough for cosine > 0.
             let mut v = vec![0.0f32; dim];
             for b in text.as_bytes() {
                 v[(*b as usize) % dim] += 1.0;
@@ -147,7 +147,7 @@ mod tests {
         let s = StubEmbedder { dim: 384 };
         // Runtime doesn't matter; block on a futures executor by polling in a
         // single-threaded context. Use tokio since the crate already depends
-        // on it — no new dep.
+        // on it: no new dep.
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("test rt");

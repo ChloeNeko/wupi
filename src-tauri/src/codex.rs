@@ -1,4 +1,4 @@
-//! Codex — authored reference lore, seeded from disk at startup.
+//! Codex: authored reference lore, seeded from disk at startup.
 //!
 //! A Codex entry is reference knowledge (system documentation, world
 //! background) that lives in the SAME `memories` table as episodic turns,
@@ -10,10 +10,10 @@
 //! distrust). See AGENTS.md §2P.
 //!
 //! Source format: plain `.md` files in a `docs/` directory (renamed from
-//! `codex/` on 2026-07-17 — `resolve_codex_dir` in `lib.rs` walks for `docs`),
+//! `codex/` on 2026-07-17: `resolve_codex_dir` in `lib.rs` walks for `docs`),
 //! each with an optional YAML-ish front-matter block (`---\ntitle: X\ntags:
 //! a, b\n---`) + a prose body. The seed loader parses each file, computes a
-//! content hash, and reconciles the source set against what's already stored —
+//! content hash, and reconciles the source set against what's already stored -
 //! inserting new entries, updating changed ones (delete + re-insert), and
 //! purging orphans (source file deleted). This is idempotent: re-running
 //! against an unchanged source set produces no writes.
@@ -27,7 +27,7 @@
 //! chars). `Embed.gguf` (bge-small) truncates silently at 512 tokens, so a
 //! long reference doc gets a garbage embedding and scores near the floor even
 //! on a perfect match. Split long docs into multiple small files rather than
-//! building a chunking engine (Codex v1 deliberately defers chunking — see
+//! building a chunking engine (Codex v1 deliberately defers chunking: see
 //! §2N landmine #6). The loader warns (does not reject) when a body exceeds
 //! the heuristic budget.
 
@@ -38,7 +38,7 @@ use std::path::Path;
 use crate::memory::{MemoryEngine, MemoryId};
 use crate::memory_embedder::Embedder;
 
-/// The result of a seed run — logged at startup so the operator can see at a
+/// The result of a seed run: logged at startup so the operator can see at a
 /// glance whether the Codex synced cleanly. All four counts are mutually
 /// exclusive (each source file resolves to exactly one outcome).
 #[derive(Debug, Clone, Default)]
@@ -53,7 +53,7 @@ pub struct ReconcileReport {
     pub unchanged: usize,
 }
 
-/// One parsed Codex source file — title + tags from front-matter, body is the
+/// One parsed Codex source file: title + tags from front-matter, body is the
 /// prose, hash is over the raw file bytes. Ephemeral; lives only for the
 /// reconcile pass.
 struct ParsedEntry {
@@ -67,10 +67,10 @@ struct ParsedEntry {
 /// Codex entries already stored in the active card partition, and apply the
 /// minimal set of inserts/updates/deletes.
 ///
-/// The reconcile matches on `title` (the stable key — a renamed file is a
+/// The reconcile matches on `title` (the stable key: a renamed file is a
 /// delete + insert, by design) and detects changes via `hash` (over raw file
 /// bytes). All DB ops go through the existing `MemoryEngine` async methods;
-/// this fn is async and awaits them in sequence (N is small, ~5–10 files).
+/// this fn is async and awaits them in sequence (N is small, ~5-10 files).
 ///
 /// `codex_dir` missing or empty → returns an empty report (graceful, not an
 /// error). A parse failure on one file → logs a warning and skips that file;
@@ -83,7 +83,7 @@ struct ParsedEntry {
 /// downstream (so the per-class floor + render frame apply automatically); the
 /// `namespace` field is for future filtering and the audit log. The two seed
 /// paths (user codex from `docs/`, Wupi-system from `cards/wupi_knowledge/`)
-/// write to disjoint `card_id` partitions — see `CODEX_CARD_ID` and
+/// write to disjoint `card_id` partitions: see `CODEX_CARD_ID` and
 /// `WUPI_SYSTEM_CARD_ID` in `memory.rs`.
 pub async fn seed_codex(
     engine: &MemoryEngine<impl Embedder>,
@@ -93,7 +93,7 @@ pub async fn seed_codex(
 ) -> anyhow::Result<ReconcileReport> {
     let mut report = ReconcileReport::default();
 
-    // Parse all source files first. A missing dir is not an error — the
+    // Parse all source files first. A missing dir is not an error: the
     // Codex is optional.
     let sources = match parse_dir(codex_dir) {
         Ok(s) => s,
@@ -114,7 +114,7 @@ pub async fn seed_codex(
     }
 
     // Load the existing Codex entries for this card. Keyed by title for the
-    // reconcile diff. Each value carries (id, hash) — id for delete, hash for
+    // reconcile diff. Each value carries (id, hash): id for delete, hash for
     // change detection.
     let existing = engine.list_codex_entries(card_id).await?;
     let mut existing_by_title: HashMap<String, (MemoryId, Option<String>)> = HashMap::new();
@@ -135,12 +135,12 @@ pub async fn seed_codex(
 
         match stored_hash_u64 {
             Some(h) if h == src.hash => {
-                // Unchanged — no write.
+                // Unchanged: no write.
                 report.unchanged += 1;
                 consumed.insert(&src.title);
             }
             Some(_) => {
-                // Changed — delete old, insert new (re-embed with new text).
+                // Changed: delete old, insert new (re-embed with new text).
                 if let Some(&(old_id, _)) = existing_by_title.get(&src.title) {
                     if let Err(e) = engine.delete_memory(old_id).await {
                         tracing::warn!(
@@ -162,7 +162,7 @@ pub async fn seed_codex(
                 }
             }
             None => {
-                // New — insert.
+                // New: insert.
                 match insert_entry(engine, src, card_id, namespace).await {
                     Ok(()) => {
                         report.seeded += 1;
@@ -201,7 +201,7 @@ async fn insert_entry(
     namespace: &str,
 ) -> anyhow::Result<()> {
     // Body-length guard: warn (don't reject) when the body exceeds the
-    // ~350-token heuristic budget. The entry still seeds — the operator sees
+    // ~350-token heuristic budget. The entry still seeds: the operator sees
     // the warning and can split the file.
     const BUDGET_CHARS: usize = 1400;
     if src.body.len() > BUDGET_CHARS {
@@ -220,7 +220,6 @@ async fn insert_entry(
         .map(|_| ())
 }
 
-// ── File-backed CRUD (the Codex UI surface) ────────────────────────────────
 // The Codex UI treats the `.md` files in docs/ as the source of truth: the
 // DB is a derived retrieval index, re-seeded at boot. These functions read and
 // write the FILES directly, so edits persist across reboots and stay
@@ -228,7 +227,7 @@ async fn insert_entry(
 // sync within the running session.
 
 /// One Codex file as the UI sees it. `filename` is the stem (no `.md`, no
-/// path) — it's the stable identity of the entry across edits. A rename =
+/// path): it's the stable identity of the entry across edits. A rename =
 /// delete-old + save-new (the caller's job).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CodexFile {
@@ -336,7 +335,6 @@ fn render_md(title: &str, tags: &[String], body: &str) -> String {
     )
 }
 
-// ── Source parsing ─────────────────────────────────────────────────────────
 
 /// Parse every `.md` file in `dir` (non-recursive). Returns an empty Vec for
 /// an empty/missing dir (caller treats as "nothing to seed"). Files are sorted
@@ -362,7 +360,7 @@ fn parse_dir(dir: &Path) -> anyhow::Result<Vec<ParsedEntry>> {
 }
 
 /// Parse one `.md` file into a `ParsedEntry`. Reads bytes, computes the hash
-/// over the raw bytes (not the parsed fields — so whitespace-only edits to
+/// over the raw bytes (not the parsed fields: so whitespace-only edits to
 /// front-matter still register as a change), then splits front-matter from body.
 fn parse_file(path: &Path) -> anyhow::Result<ParsedEntry> {
     let bytes = std::fs::read(path).map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
@@ -391,7 +389,7 @@ fn parse_file(path: &Path) -> anyhow::Result<ParsedEntry> {
 
 /// Split a markdown file into `(front_matter, body)`. Front-matter is the
 /// text between leading `---\n` and the next `\n---\n` (or end). If the file
-/// doesn't start with `---`, there's no front-matter — the whole thing is body.
+/// doesn't start with `---`, there's no front-matter: the whole thing is body.
 fn split_front_matter(text: &str) -> (Option<&str>, &str) {
     let after_opener = text.strip_prefix("---\n").or_else(|| text.strip_prefix("---\r\n"));
     let Some(rest) = after_opener else {
@@ -407,15 +405,15 @@ fn split_front_matter(text: &str) -> (Option<&str>, &str) {
         let body = &rest[end + "\n---\r\n".len()..];
         (Some(front), body)
     } else {
-        // Opening fence but no closer — treat the whole thing as body (no
+        // Opening fence but no closer: treat the whole thing as body (no
         // front-matter). Malformed, but don't lose the content.
         (None, text)
     }
 }
 
-/// Parse front-matter text into `(title, tags)`. Hand-rolled — recognizes
+/// Parse front-matter text into `(title, tags)`. Hand-rolled: recognizes
 /// `title: X` and `tags: a, b, c` lines via `split_once(':')`. Unknown keys
-/// are ignored. No YAML engine (Prime Directive §1B.4 — compose, don't nest).
+/// are ignored. No YAML engine (Prime Directive §1B.4: compose, don't nest).
 fn parse_front_matter(front: Option<&str>, fallback_stem: &str) -> (String, Vec<String>) {
     let front = match front {
         Some(f) => f,
@@ -462,7 +460,7 @@ fn build_metadata_json(title: &str, tags: &[String], hash: u64, namespace: &str)
         .collect::<Vec<_>>()
         .join(",");
     // `kind=codex` is the downstream discriminator (is_codex / codex floor /
-    // render frame). `namespace` is the origin tag — "codex" for user-authored
+    // render frame). `namespace` is the origin tag: "codex" for user-authored
     // lore, "wupi_system" for Wupi's non-editable system docs. Both reuse the
     // same retrieval/render pipeline; namespace is for future filtering + audit.
     format!(
@@ -495,7 +493,7 @@ fn escape_json_string(s: &str) -> String {
 
 /// Extract a string field's value from a `metadata_json` blob. Shared with
 /// `memory::codex_title` in spirit but lives here too (the seed pass needs
-/// `title` AND `hash`). Substring probe — finds `"key":"..."` and returns the
+/// `title` AND `hash`). Substring probe: finds `"key":"..."` and returns the
 /// unescaped value. Returns `None` if the key is absent.
 fn extract_metadata_field(metadata_json: Option<&str>, key: &str) -> Option<String> {
     let s = metadata_json?;
@@ -559,7 +557,7 @@ mod tests {
 
     #[test]
     fn front_matter_unclosed_fence_treats_all_as_body() {
-        // Opening `---` but no closing fence — don't lose the content.
+        // Opening `---` but no closing fence: don't lose the content.
         let md = "---\ntitle: Broken\nNo closing fence.";
         let (front, body) = split_front_matter(md);
         assert!(front.is_none());

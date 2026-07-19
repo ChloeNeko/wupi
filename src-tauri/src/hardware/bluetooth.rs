@@ -1,14 +1,14 @@
 //! Bluetooth integration (WinRT via the `windows` crate).
 //!
 //! Exposes:
-//! - `bluetooth_get_state` — whether the Bluetooth radio is on.
-//! - `bluetooth_toggle_radio` — turn the radio on/off (WinRT Radio.SetStateAsync).
-//! - `bluetooth_list_devices` — paired/known devices via DeviceInformation.
-//! - `bluetooth_pair` — pair a device; Windows owns the PIN/confirmation UI.
+//! - `bluetooth_get_state`: whether the Bluetooth radio is on.
+//! - `bluetooth_toggle_radio`: turn the radio on/off (WinRT Radio.SetStateAsync).
+//! - `bluetooth_list_devices`: paired/known devices via DeviceInformation.
+//! - `bluetooth_pair`: pair a device; Windows owns the PIN/confirmation UI.
 //!
 //! WinRT is apartment-aware, so each command runs on a worker thread with an
 //! MTA init (CoInitializeEx), and blocks on the IAsyncOperation via `.get()`
-//! (the crate's built-in blocking wait — simpler than wiring the Future impl
+//! (the crate's built-in blocking wait: simpler than wiring the Future impl
 //! through tokio). Tauri's own runtime is left untouched.
 
 use serde::{Deserialize, Serialize};
@@ -57,7 +57,6 @@ where
     rx.recv().map_err(|e| format!("winrt worker disconnected: {e}"))?
 }
 
-// ── Tauri commands ──────────────────────────────────────────────────────────
 
 #[tauri::command]
 pub fn bluetooth_get_state() -> Result<BluetoothState, String> {
@@ -108,7 +107,7 @@ pub fn bluetooth_list_devices() -> Result<Vec<BluetoothDevice>, String> {
         // DeviceClass has no Bluetooth variant, so use the canonical Bluetooth
         // AQS selector via FindAllAsyncAqsFilter. The GUID
         // {e0cbf06c-cd8b-4647-bb8a-263b43f0f974} is the Bluetooth device
-        // interface class — this returns ONLY Bluetooth devices, not the whole
+        // interface class: this returns ONLY Bluetooth devices, not the whole
         // PnP tree (which is why the panel previously showed "a million
         // devices": FindAllAsync returns every HID/USB/audio/etc. device).
         let aqs = HSTRING::from(
@@ -146,7 +145,7 @@ pub fn bluetooth_list_devices() -> Result<Vec<BluetoothDevice>, String> {
 }
 
 /// Discover in-range, unpaired Bluetooth devices (for the "Add Device" flow).
-/// Same AQS filter as bluetooth_list_devices but returns UNPAIRED entries —
+/// Same AQS filter as bluetooth_list_devices but returns UNPAIRED entries -
 /// these are devices actively advertising and available to pair. Windows
 /// handles the actual PIN/confirmation handshake when bluetooth_pair is called.
 #[tauri::command]
@@ -191,7 +190,7 @@ pub fn bluetooth_pair(device_id: String) -> Result<bool, String> {
         let dev = op.get().map_err(|e| format!("CreateFromIdAsync.get: {e}"))?;
         let pairing = dev.Pairing().map_err(|e| format!("Pairing: {e}"))?;
         // PairAsync surfaces the native Windows PIN/confirmation dialog when
-        // the device requires it — we don't reimplement the handshake.
+        // the device requires it: we don't reimplement the handshake.
         let pop = pairing
             .PairAsync()
             .map_err(|e| format!("PairAsync: {e}"))?;

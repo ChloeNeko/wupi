@@ -2,7 +2,7 @@
 //!
 //! The narrator is the AI's role in a roleplay game: it portrays the world,
 //! the environment, the sensory detail, and (for MVP) the named NPCs'
-//! observable behavior — but it is forbidden from speaking for the player
+//! observable behavior: but it is forbidden from speaking for the player
 //! or generating the player's actions. The contract is borrowed from UIE's
 //! `omniscientEngine.js:8-28` (the "narrator agency split"), adapted to
 //! WUPI's strict-XML-prompt aesthetic (Prime Directive §1B.3).
@@ -12,12 +12,12 @@
 //! The narrator emits bracket commands alongside its prose so the engine
 //! can route structured events to the UI deterministically:
 //!
-//! - `[CHARACTER_TURN:npc_id]` — signals an NPC is about to speak; the
+//! - `[CHARACTER_TURN:npc_id]`: signals an NPC is about to speak; the
 //!   Phase 2 NPC sidecar will produce the line. For MVP the narrator is
 //!   told to skip this and instead narrate the NPC's reaction in prose
-//!   (documented MVP compromise — true handoffs need the Phase 2 engine).
-//! - `[OBJECT id=iron_chest state=open]` — an object's state changed.
-//! - `[FX rain]`, `[FX letterbox]`, `[FX shake-heavy]` — a scene-FX class
+//!   (documented MVP compromise: true handoffs need the Phase 2 engine).
+//! - `[OBJECT id=iron_chest state=open]`: an object's state changed.
+//! - `[FX rain]`, `[FX letterbox]`, `[FX shake-heavy]`: a scene-FX class
 //!   should activate. The names match UIE's `sceneEffects.js` vocabulary
 //!   so the eventual UI port is direct.
 //!
@@ -29,7 +29,7 @@ use crate::sim_card::SimCard;
 /// injected as the `<|turn>system` block of the Gemma4 chat format. It tells
 /// the model:
 ///   1. It is the Narrator, not any character.
-///   2. It must never speak for the player (Alex) — third-person references
+///   2. It must never speak for the player (Alex): third-person references
 ///      only, never decide what Alex does/says/feels.
 ///   3. The setting + tone (from the card's `<scenario>` block).
 ///   4. The bracket-command protocol (see module doc).
@@ -70,7 +70,7 @@ pub fn build_narrator_system_prompt(
     out.push_str(BRACKET_PROTOCOL);
     out.push_str("\n</bracket_commands>\n\n");
 
-    // World state (card-scoped schema snapshot — what's true right now).
+    // World state (card-scoped schema snapshot: what's true right now).
     if let Some(state) = world_state {
         if !state.trim().is_empty() {
             out.push_str("<world_state>\n");
@@ -79,8 +79,7 @@ pub fn build_narrator_system_prompt(
         }
     }
 
-    // ── Active-reality anchor (tail of system prompt, 2026-07-18) ──────────
-    // DELIBERATELY last — closest to the user input — so it's the loudest
+    // DELIBERATELY last: closest to the user input - so it's the loudest
     // signal the model sees when generating. The GameEngine's KV cache may
     // hold residual state from a PRIOR card (the 2026-07-18 "Alex
     // hallucination": the cyberpunk narrator used the dungeon protagonist's
@@ -96,7 +95,7 @@ pub fn build_narrator_system_prompt(
     ));
     if let Some(name) = card.protagonist_name.as_deref() {
         out.push_str(&format!(
-            "The protagonist is {name} — use this name exclusively; never use a different protagonist's name. "
+            "The protagonist is {name}: use this name exclusively; never use a different protagonist's name. "
         ));
     } else {
         out.push_str("Refer to the protagonist generically (e.g. \"the traveler\"); never invent or import a protagonist name. ");
@@ -107,7 +106,7 @@ pub fn build_narrator_system_prompt(
         let brief: String = setting.trim().chars().take(160).collect();
         out.push_str(&format!("Setting recap: {brief}… "));
     }
-    out.push_str("Do NOT reference characters, locations, items, or elements from any other scenario — only what belongs to this one.\n");
+    out.push_str("Do NOT reference characters, locations, items, or elements from any other scenario: only what belongs to this one.\n");
     out.push_str("</active_reality>\n\n");
 
     out
@@ -117,7 +116,7 @@ pub fn build_narrator_system_prompt(
 /// const so it's byte-identical across cards (the card-specific bits are the
 /// scenario + world_state sections appended after).
 const NARRATOR_CORE: &str = "\
-You are the NARRATOR of this scenario — not a character, not the player.
+You are the NARRATOR of this scenario: not a character, not the player.
 
 Your job:
 - Portray the WORLD: the environment, the weather, the sounds, the smells, the small details that make it feel lived-in.
@@ -148,7 +147,7 @@ Emit bracket commands alongside your prose to drive the UI deterministically:
 - [FX effect_name]
     Trigger a scene effect. Valid names: rain, snow, fog, letterbox, flash,
     vignette, shake-light, shake-heavy, spotlight, thunder, glitch, blackout,
-    whiteout. Use sparingly — only when the ambiance meaningfully shifts.
+    whiteout. Use sparingly: only when the ambiance meaningfully shifts.
 
 Bracket commands are machine-read; keep their syntax exact (square brackets,
 colon for character turns, equals sign for object state). Put them on their
@@ -222,7 +221,7 @@ mod tests {
 
     #[test]
     fn narrator_prompt_handles_minimal_card() {
-        // A card missing scenario fields degrades gracefully — empty
+        // A card missing scenario fields degrades gracefully: empty
         // <scenario> block, no panic.
         let card = SimCard {
             id: "minimal".into(),
@@ -264,7 +263,7 @@ mod tests {
 
     /// When `protagonist_name` is None (a card that doesn't declare one),
     /// the anchor falls back to generic phrasing and explicitly forbids
-    /// inventing a name — which is the actual defense against the Alex
+    /// inventing a name: which is the actual defense against the Alex
     /// hallucination when no protagonist is named.
     #[test]
     fn narrator_prompt_active_reality_falls_back_when_no_protagonist() {
@@ -289,7 +288,7 @@ mod tests {
         };
         let prompt = build_narrator_system_prompt(&card, None);
         assert!(prompt.contains("<active_reality>"));
-        // Generic fallback — must NOT contain a hardcoded name.
+        // Generic fallback: must NOT contain a hardcoded name.
         assert!(!prompt.contains("The protagonist is Alex"));
         assert!(prompt.contains("never invent or import a protagonist name"));
         assert!(prompt.contains("Some Scene"));

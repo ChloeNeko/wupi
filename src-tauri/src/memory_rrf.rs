@@ -1,10 +1,10 @@
-//! Score-aware Reciprocal Rank Fusion (RRF) — the merge step of hybrid search.
+//! Score-aware Reciprocal Rank Fusion (RRF): the merge step of hybrid search.
 //!
-//! Given two ranked lists — sparse (FTS5) and dense (vec0) — each carrying its
+//! Given two ranked lists: sparse (FTS5) and dense (vec0) - each carrying its
 //! raw score, this module:
 //!
 //! 1. Floors the dense list on an absolute cosine threshold (the rejection
-//!    authority — see [`DENSE_COSINE_FLOOR`]).
+//!    authority: see [`DENSE_COSINE_FLOOR`]).
 //! 2. Ranks the survivors within each list (position = 1-based rank).
 //! 3. Fuses via weighted RRF:
 //!
@@ -24,24 +24,24 @@
 //! scores. That meant a near-random dense hit at cosine 0.25 would still
 //! contribute `1/(k+rank)` and could fuse-promote into the prompt. The
 //! cross-topic bleed that surfaced in the schema-engine full-system test
-//! (a dungeon query retrieving an unrelated cyberpunk memory — §2L) was a
+//! (a dungeon query retrieving an unrelated cyberpunk memory: §2L) was a
 //! direct consequence: rank-based RRF has no rejection signal.
 //!
 //! The fix is an ABSOLUTE cosine floor on the dense path. Dense (semantic)
 //! similarity is the signal that catches "Alex in dungeon" vs "Alex in
-//! cyberpunk" — the shared name gives weak lexical overlap but the scenes are
+//! cyberpunk": the shared name gives weak lexical overlap but the scenes are
 //! semantically distant, landing cosine around 0.25-0.35, below the floor.
 //!
 //! The sparse (BM25) path is deliberately NOT floored. Two reasons:
 //! 1. BM25's absolute scale is model-dependent (document-length normalization,
-//!    IDF behavior) and unreliable as a universal threshold — a floor that
+//!    IDF behavior) and unreliable as a universal threshold: a floor that
 //!    works for one corpus mis-tunes for another.
 //! 2. The dense floor is already the rejection authority. Sparse only adds
 //!    precision-boost on memories that PASSED the dense floor. Flooring sparse
 //!    too would be a second rejection gate with no calibration story, and
 //!    min-max on it would be RELATIVE to the retrieved set (it maps the
 //!    best-of-the-batch to 1.0 regardless of whether the batch is all garbage)
-//!    — exactly the failure mode that defeated v1.
+//!    - exactly the failure mode that defeated v1.
 //!
 //! # Rank indexing is 1-BASED (not 0)
 //!
@@ -58,7 +58,7 @@
 //! weight). `60` is the value from the original paper and is the de-facto
 //! standard across hybrid-search systems; it gives the long tail enough pull
 //! to surface a memory that ranks e.g. dense-30 but sparse-1, without letting
-//! noise overwhelm the top. It is NOT the final `limit` — those are
+//! noise overwhelm the top. It is NOT the final `limit`: those are
 //! independent knobs.
 
 use std::collections::{HashMap, HashSet};
@@ -72,7 +72,7 @@ use crate::memory::{DebugScores, MemoryId, RankedMemory};
 pub const RRF_K: u32 = 60;
 
 /// Default hard cosine floor for the dense path. Memories whose query→memory
-/// cosine similarity falls below this are REJECTED before fusion — they never
+/// cosine similarity falls below this are REJECTED before fusion: they never
 /// contribute to the prompt. This is the rejection authority for cross-topic
 /// bleed (AGENTS.md §2L problem #1, §2M fix).
 ///
@@ -80,19 +80,19 @@ pub const RRF_K: u32 = 60;
 /// asymmetric query-prefix verification). A multi-topic seed conversation
 /// (butter, platinum, diamonds, tiramisu, carbon) queried with the single
 /// word "butter" showed a clean ~4× gap between relevant and irrelevant:
-///   - relevant (butter Q&A)      : cosine 0.317 – 0.376
-///   - irrelevant (all 7 others)  : cosine 0.006 – 0.094
-/// A floor of 0.25 sits in the wide gap — keeps the relevant matches with
+///   - relevant (butter Q&A)      : cosine 0.317: 0.376
+///   - irrelevant (all 7 others)  : cosine 0.006: 0.094
+/// A floor of 0.25 sits in the wide gap: keeps the relevant matches with
 /// ~0.07 margin and rejects every off-topic result with ~0.16 margin.
 ///
 /// The earlier 0.40 const was a guess from the synthetic self-test probe;
-/// it sat ABOVE the real relevant matches (0.32–0.38) and would have
+/// it sat ABOVE the real relevant matches (0.32-0.38) and would have
 /// rejected the very memories it should keep. Single-word queries score
 /// lower than full-sentence queries because there's little context to build
 /// meaning from, so the floor must accommodate the weak end of legitimate
 /// matches, not the strong end.
 ///
-/// This is a PROVISIONAL value — recalibrate as more query shapes come in.
+/// This is a PROVISIONAL value: recalibrate as more query shapes come in.
 /// The 🧠 debug panel's `dense_floor` override (`cos ≥`) lets you test
 /// alternatives live without a rebuild (AGENTS.md §2M Checkpoint E).
 pub const DENSE_COSINE_FLOOR: f32 = 0.25;
@@ -104,7 +104,7 @@ pub const DENSE_COSINE_FLOOR: f32 = 0.25;
 /// reference prose doesn't use the same vocabulary, filler, or sentence
 /// structure as chat turns. bge-small (and asymmetric retrieval models in
 /// general) score these declarative docs lower on dense cosine even when they
-/// are 100% relevant — a textbook passage about "Simulation Card XML format"
+/// are 100% relevant: a textbook passage about "Simulation Card XML format"
 /// doesn't embed like a chat turn asking "how do I write a sim card?", even
 /// though they're the same topic. This is standard domain asymmetry in RAG
 /// retrieval (Codex v1, 2026-07-14, §2P).
@@ -113,14 +113,14 @@ pub const DENSE_COSINE_FLOOR: f32 = 0.25;
 /// chat history is like expecting a textbook to read like a DM. The lower
 /// floor for Codex is the principled fix: per-domain flooring is best-
 /// practice RAG design, not a hack. The 🧠 panel's `cos ≥` override does NOT
-/// affect this — it overrides the EPISODIC floor only; the Codex floor is
+/// affect this: it overrides the EPISODIC floor only; the Codex floor is
 /// applied independently in `fuse_scored_rrf` via the `codex_ids` set.
 pub const CODEX_DENSE_FLOOR: f32 = 0.10;
 
-/// Per-list weights for weighted RRF. Both default to 0.5 (standard RRF —
+/// Per-list weights for weighted RRF. Both default to 0.5 (standard RRF -
 /// equal contribution). Tilting `dense` higher biases toward semantic
 /// relevance (the rejection authority); tilting `sparse` higher biases toward
-/// keyword precision. The weights need not sum to 1 — RRF is rank-based, so
+/// keyword precision. The weights need not sum to 1: RRF is rank-based, so
 /// only the RATIO between them matters.
 #[derive(Debug, Clone, Copy)]
 pub struct FusionWeights {
@@ -140,7 +140,7 @@ impl Default for FusionWeights {
 /// # Inputs
 ///
 /// - `sparse`: `(id, bm25_raw)` best-first. Lower (more-negative) BM25 is a
-///   better match. UNFLOORED — see module docs for why.
+///   better match. UNFLOORED: see module docs for why.
 /// - `dense`: `(id, distance)` best-first. Lower distance is better;
 ///   cosine = `1 - distance`. Floored on `dense_cosine_floor`.
 /// - `dense_cosine_floor`: drop dense candidates whose cosine < floor.
@@ -154,14 +154,14 @@ impl Default for FusionWeights {
 /// per-list ranks) so the 🧠 panel can show why each memory was pulled.
 ///
 /// An id appearing in BOTH (floored) lists gets both score contributions
-/// summed — this is the whole point of fusion: a memory that matches on both
+/// summed: this is the whole point of fusion: a memory that matches on both
 /// axes deserves to outrank one that matches on only one.
 ///
 /// # Per-class dense floor (Codex v1, §2P)
 ///
 /// `codex_ids` carries the ids of Codex (authored reference lore) entries.
 /// Codex entries are declarative technical documents whose embedding style
-/// differs fundamentally from conversational episodic memory — bge-small
+/// differs fundamentally from conversational episodic memory: bge-small
 /// scores them lower on dense cosine even at 100% relevance (domain
 /// asymmetry). Entries in `codex_ids` are floored on `codex_floor` instead
 /// of `dense_cosine_floor`. Pass an empty set when no Codex entries exist
@@ -175,14 +175,13 @@ pub fn fuse_scored_rrf(
     weights: FusionWeights,
     limit: usize,
 ) -> Vec<RankedMemory> {
-    // ── Floor the dense list on absolute cosine ──────────────────────────
     // distance = 1 - cosine  →  cosine = 1 - distance. Keep cosine >= floor.
     // The rejected candidates never enter the fusion map, so they contribute
     // nothing to any id's score. This is the cross-topic rejection gate.
     //
     // PER-CLASS FLOOR: Codex entries (in `codex_ids`) use the lower
     // `codex_floor`; everything else uses `dense_cosine_floor`. This is the
-    // domain-asymmetry fix (§2P) — declarative reference docs embed lower
+    // domain-asymmetry fix (§2P): declarative reference docs embed lower
     // than conversational turns at equal relevance, so they get a lower bar.
     let dense_survivors: Vec<(MemoryId, f32)> = dense
         .iter()
@@ -198,10 +197,9 @@ pub fn fuse_scored_rrf(
         .cloned()
         .collect();
 
-    // ── Accumulate fused scores + record per-list ranks ──────────────────
     // Each entry in the map carries: accumulated weighted score, dense rank
     // (if present), sparse rank (if present), and the raw dense cosine (for
-    // the debug panel — read off borderline hits to calibrate the floor).
+    // the debug panel: read off borderline hits to calibrate the floor).
     #[derive(Default, Clone)]
     struct Accum {
         score: f32,
@@ -214,7 +212,7 @@ pub fn fuse_scored_rrf(
         sparse.len() + dense_survivors.len(),
     );
 
-    // Sparse contributions (unfloored — rank order is the input order).
+    // Sparse contributions (unfloored: rank order is the input order).
     for (i, (id, _bm25)) in sparse.iter().enumerate() {
         let rank = (i as u32) + 1; // 1-based
         let contribution = weights.sparse / (RRF_K as f32 + rank as f32);
@@ -236,7 +234,6 @@ pub fn fuse_scored_rrf(
         a.dense_cosine = Some(cosine);
     }
 
-    // ── Sort by fused score descending ───────────────────────────────────
     // Tie-break by id ascending so output is deterministic (tests + the debug
     // panel both rely on stable ordering across runs).
     let mut ranked: Vec<(MemoryId, Accum)> = acc.into_iter().collect();
@@ -345,7 +342,7 @@ mod tests {
 
     #[test]
     fn codex_floor_still_rejects_garbage() {
-        // A Codex entry at cosine 0.05 — below even the Codex floor (0.10).
+        // A Codex entry at cosine 0.05: below even the Codex floor (0.10).
         // It must still be rejected; the lower floor is not zero.
         let d = vec![dense(1, 0.05)];
         let codex_ids: HashSet<MemoryId> = [1].into_iter().collect();

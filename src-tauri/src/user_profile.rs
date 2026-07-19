@@ -1,35 +1,35 @@
 //! User Profile (`Operator.xml`) loader, parser, and renderer.
 //!
-//! The User Profile is the operator's static identity artifact — the "who am I
+//! The User Profile is the operator's static identity artifact: the "who am I
 //! talking to" counterpart to the Simulation Card's "who am I." It lives at
 //! `cards/Operator.xml` next to `Wupi.sim`, uses the same strict-XML +
 //! CDATA-wrapped prose format, and parses with the same `roxmltree` DOM parser
-//! (CDATA auto-merged into text nodes — zero escape handling).
+//! (CDATA auto-merged into text nodes: zero escape handling).
 //!
 //! Unlike the Simulation Card, the profile is **re-read fresh on every chat
 //! turn** rather than cached. This is the hot-reload mechanism: because the
 //! profile is a ~1KB file consumed only at the single moment a prompt is
 //! assembled (the top of `chat_send`), reading it synchronously each turn is
 //! cheaper than a file-watcher thread, zero-staleness, no dependency, and no
-//! partial-write races (Prime Directive §1B — the cheapest path that preserves
+//! partial-write races (Prime Directive §1B: the cheapest path that preserves
 //! token integrity). The resolved *path* is cached (stable; resolved once in
 //! `setup`); only the *content* refreshes.
 //!
 //! The profile bypasses the Memory engine entirely. It is identity, not
-//! episodic recall — it belongs in the stable system-prompt prefix (sibling to
+//! episodic recall: it belongs in the stable system-prompt prefix (sibling to
 //! `<persona>`), NOT in the inter-turn `<retrieved_memory>` block. Because the
 //! rendered text is byte-identical across turns (until the file is edited), it
-//! does NOT trigger the §2F cold-reset guard — it's as cache-friendly as the
+//! does NOT trigger the §2F cold-reset guard: it's as cache-friendly as the
 //! persona.
 //!
 //! Design contract (mirrors the SIM card's graceful-degradation pattern in
 //! §2O): if the file is missing or malformed, `load` returns `None` and the
 //! `<user_profile>` section is simply suppressed. A bad or absent profile must
-//! never kill the OS — it just means Wupi doesn't know who she's talking to.
+//! never kill the OS: it just means Wupi doesn't know who she's talking to.
 
 use std::path::Path;
 
-/// The parsed operator profile. Both fields are optional in the XML — a
+/// The parsed operator profile. Both fields are optional in the XML: a
 /// field that's absent or empty renders as nothing, and a profile with both
 /// blank renders to an empty string (suppressed downstream by the
 /// `Option<&str>` gate, same empty-skip as the SIM card fallback).
@@ -37,7 +37,7 @@ use std::path::Path;
 pub struct UserProfile {
     /// How Wupi should address the operator (e.g. "Chloe", "Master", "Creator").
     pub name: String,
-    /// A freeform character description for Wupi to refer to the operator as —
+    /// A freeform character description for Wupi to refer to the operator as -
     /// who they are, how she should treat them, their relationship/tone, etc.
     /// Replaces the old role/background/dynamics split (simplified 2026-07-17).
     pub description: String,
@@ -50,7 +50,7 @@ impl UserProfile {
     /// `Option<&str>` gate suppresses the section cleanly.
     ///
     /// XML-tagged fields match the prompt's existing aesthetic (Prime
-    /// Directive §1B.3 — rigid structure exploits instruction-tuned attention).
+    /// Directive §1B.3: rigid structure exploits instruction-tuned attention).
     /// Ordering is name → description: identity first, then the character
     /// framing last so it lands closest to the conversation.
     pub fn render_for_prompt(&self) -> String {
@@ -91,11 +91,11 @@ fn indent(block: &str) -> String {
 }
 
 /// The hot-reload entry point. Re-reads + re-parses the file on every call so
-/// live edits take effect on the very next `chat_send` (no watcher, no cache —
+/// live edits take effect on the very next `chat_send` (no watcher, no cache -
 /// see the module docs for why per-turn re-read is the right call).
 ///
 /// - `None` path → `None` (no Operator.xml resolved at startup; Wupi runs
-///   without a profile — the common case until the operator authors one).
+///   without a profile: the common case until the operator authors one).
 /// - `Some(path)` missing or malformed → `None`, debug-logged. Debug (not
 ///   warn) because this fires every turn when the file is absent, and a warn
 ///   per turn would spam the log. The startup resolution already logged the
@@ -123,13 +123,13 @@ pub fn load(path: Option<&Path>) -> Option<UserProfile> {
 ///
 /// The inverse of [`load`]: renders both fields as `<user_profile>` XML
 /// with every field CDATA-wrapped (so prose containing quotes, angle brackets,
-/// or smart quotes round-trips with zero escape handling — same contract the
+/// or smart quotes round-trips with zero escape handling: same contract the
 /// parser already assumes). The on-disk format is byte-stable: an unchanged
 /// profile re-saves to byte-identical text, so it stays cache-friendly for the
 /// §2F guard.
 ///
 /// **Atomic write** (temp file → fsync → rename over the target) so a crash or
-/// power loss mid-write can never truncate `Operator.xml` — mirrors the atomic
+/// power loss mid-write can never truncate `Operator.xml`: mirrors the atomic
 /// pattern in `session.rs` (AGENTS.md §2E). The temp lives next to the target
 /// (same volume → `rename` is atomic; on Windows it uses
 /// `MOVEFILE_REPLACE_EXISTING`).
@@ -197,7 +197,7 @@ fn render_xml(profile: &UserProfile) -> String {
 /// handling (same contract as the SIM card).
 ///
 /// **Backward compat (2026-07-17 simplification):** the old 4-field format
-/// (name/role/background/dynamics) is silently tolerated — `role` is dropped,
+/// (name/role/background/dynamics) is silently tolerated: `role` is dropped,
 /// and `background` + `dynamics` (if present) are concatenated into
 /// `description` so an old Operator.xml isn't lost on first load. The next
 /// save rewrites it in the new 2-field shape.
@@ -216,7 +216,7 @@ fn parse(xml: &str) -> anyhow::Result<UserProfile> {
 
     // Backward compat: if the old 4-field tags are present (and the new
     // description is absent), fold background + dynamics into description so
-    // the old prose isn't lost. `role` is intentionally dropped — it was the
+    // the old prose isn't lost. `role` is intentionally dropped: it was the
     // least useful field and Chloe's simplification explicitly removes it.
     if description.trim().is_empty() {
         let background = child_text(root, "background").unwrap_or_default();
@@ -239,9 +239,8 @@ fn parse(xml: &str) -> anyhow::Result<UserProfile> {
     Ok(UserProfile { name, description })
 }
 
-// ── XML traversal helpers ──────────────────────────────────────────────────
 // Tiny roxmltree wrappers, local to this module. They duplicate the SIM card's
-// helpers — intentional: the project style is self-contained modules, and a
+// helpers: intentional: the project style is self-contained modules, and a
 // shared `xml_util` module would couple two unrelated loaders for ~10 lines of
 // savings. CDATA is already merged into `.text()` by roxmltree.
 
@@ -267,7 +266,7 @@ mod tests {
 <user_profile>
   <name>Chloe</name>
   <description><![CDATA[
-The operator. Wupi's Master — direct, ambitious, wants an honest engineering
+The operator. Wupi's Master: direct, ambitious, wants an honest engineering
 partner, not a yes-man. Build WUPI OS alongside her.
   ]]></description>
 </user_profile>"#;
@@ -379,7 +378,7 @@ partner, not a yes-man. Build WUPI OS alongside her.
     fn shipped_operator_xml_parses_and_renders() {
         // Integration check against the REAL seed profile shipped in the repo.
         // Guards against hand-edits to cards/Operator.xml breaking the parse
-        // (a malformed profile silently suppresses the section at runtime —
+        // (a malformed profile silently suppresses the section at runtime -
         // this test makes a regression visible in CI instead). Locates the file
         // relative to CARGO_MANIFEST_DIR (src-tauri/).
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -400,7 +399,7 @@ partner, not a yes-man. Build WUPI OS alongside her.
         let rendered = p.render_for_prompt();
         assert!(rendered.starts_with("<user_profile>"), "rendered: {rendered}");
         // The shipped seed ships both fields. CDATA content (description) must
-        // survive — if it were escaped instead of CDATA-wrapped, the prose
+        // survive: if it were escaped instead of CDATA-wrapped, the prose
         // wouldn't parse as text.
         assert!(!p.name.trim().is_empty());
         assert!(!p.description.trim().is_empty());

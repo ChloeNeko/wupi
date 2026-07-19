@@ -6,7 +6,7 @@
 //! LLM output arrives token-by-token. Some of that output contains control
 //! markers (`<|turn>`, `<|im_start|>`, etc.) that must never reach the UI.
 //! A naive per-token regex strip fails because a marker can be split across
-//! two or more token pieces — e.g. `<|im_` then `start|>`. If we emit the
+//! two or more token pieces: e.g. `<|im_` then `start|>`. If we emit the
 //! first piece before seeing the second, the user sees a flash of `<|im_`.
 //!
 //! # The invariant
@@ -24,7 +24,7 @@
 //! - The buffer is compacted after each feed (emitted text dropped), so
 //!   memory stays bounded by `max_pattern_len + longest_chunk`.
 //! - The suffix-length check is a single byte comparison per feed, not a
-//!   regex match — we only hold back the tail, never re-run patterns on it.
+//!   regex match: we only hold back the tail, never re-run patterns on it.
 
 use regex::Regex;
 
@@ -51,11 +51,11 @@ pub struct StreamFilter {
 impl StreamFilter {
     /// Create a filter from a set of literal marker strings. Each marker is
     /// treated as a literal (regex-escaped), so you pass the raw token text
-    /// like `"<|turn>"` — no regex syntax needed.
+    /// like `"<|turn>"`: no regex syntax needed.
     ///
     /// # Panics
     /// Panics if `markers` is empty (a filter with nothing to strip is
-    /// meaningless — just don't filter).
+    /// meaningless: just don't filter).
     pub fn new(markers: &[&str]) -> Self {
         assert!(
             !markers.is_empty(),
@@ -99,9 +99,9 @@ impl StreamFilter {
         let mut safe_end = self.buffer.len().saturating_sub(self.max_pattern_len);
 
         // CRITICAL: walk safe_end back to a valid UTF-8 char boundary. The
-        // model emits multi-byte chars (em dash '—' is 3 bytes, emoji are 4).
+        // model emits multi-byte chars (em dash '-' is 3 bytes, emoji are 4).
         // If safe_end lands inside one, slicing at it panics ("end byte index
-        // X is not a char boundary"). The extra holdback is at most 3 bytes —
+        // X is not a char boundary"). The extra holdback is at most 3 bytes -
         // well within the trailing window, so the marker-safety invariant
         // still holds.
         while safe_end > self.cursor && !self.buffer.is_char_boundary(safe_end) {
@@ -116,7 +116,7 @@ impl StreamFilter {
 
         // Before stripping: check if the RAW slice ends with a prefix of any
         // marker. If a marker straddles `safe_end`, the regex can't see the
-        // full marker — only its partial start. Hold those raw bytes back so
+        // full marker: only its partial start. Hold those raw bytes back so
         // the next feed can resolve them. Find the longest suffix of the raw
         // buffer (ending at safe_end) that is a proper prefix of some marker.
         // We only need to check positions where '<' appears (the first byte
@@ -135,13 +135,13 @@ impl StreamFilter {
         }
 
         if effective_end <= self.cursor {
-            // The held-back window ate everything — nothing safe to emit.
+            // The held-back window ate everything: nothing safe to emit.
             return String::new();
         }
 
         let slice = &self.buffer[self.cursor..effective_end];
         // Fast path (Bug #4): every marker starts with '<'. If the slice
-        // contains none, skip the regex entirely — one alloc for the return,
+        // contains none, skip the regex entirely: one alloc for the return,
         // zero regex work. This covers the overwhelmingly common case
         // (regular prose tokens contain no '<').
         let cleaned = if !slice.contains('<') {
@@ -370,7 +370,7 @@ mod tests {
 
     #[test]
     fn multibyte_char_at_boundary_does_not_panic() {
-        // Regression: em dash '—' is 3 bytes (U+2014). If safe_end lands on
+        // Regression: em dash '-' is 3 bytes (U+2014). If safe_end lands on
         // byte 4 (inside the dash, which occupies bytes 3..6), the old code
         // panicked with "end byte index 4 is not a char boundary". The fix
         // walks safe_end back to a valid boundary.
@@ -379,9 +379,9 @@ mod tests {
         // Marker is "<|turn>" (7 bytes), so the trailing window is 6 bytes.
         let mut f = StreamFilter::new(&["<|turn>"]);
         // Feed enough text that the dash lands near the boundary.
-        // "abc" = 3 bytes, then "—" = 3 bytes (bytes 3,4,5), then more text.
+        // "abc" = 3 bytes, then "-" = 3 bytes (bytes 3,4,5), then more text.
         // Total must be > window so something gets emitted.
-        let out = f.feed("abc—defghijklmnop");
+        let out = f.feed("abc-defghijklmnop");
         // Should not panic. The dash may be held or emitted but either way
         // must be valid UTF-8 and contain no panic.
         let flushed = f.flush();
@@ -394,8 +394,8 @@ mod tests {
     fn multibyte_char_split_across_chunks() {
         // The em dash split so its bytes arrive in two pieces.
         let mut f = StreamFilter::new(&["<|turn>"]);
-        // First piece ends mid-dash (only the first byte of —).
-        // In UTF-8, — is 0xE2 0x80 0x94. Feed the first byte alone.
+        // First piece ends mid-dash (only the first byte of -).
+        // In UTF-8,: is 0xE2 0x80 0x94. Feed the first byte alone.
         let out1 = f.feed("text \u{2014} more");
         let flushed = f.flush();
         let combined = format!("{out1}{flushed}");
@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     fn emoji_at_boundary_does_not_panic() {
-        // Emoji are 4 bytes — even more likely to straddle a boundary.
+        // Emoji are 4 bytes: even more likely to straddle a boundary.
         let mut f = StreamFilter::new(&["<|turn>"]);
         let out = f.feed("hello 🎉 world this is a test message");
         let flushed = f.flush();

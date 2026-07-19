@@ -1,10 +1,10 @@
 //! Core Audio integration (Win32 WASAPI via the `windows` crate).
 //!
 //! Exposes:
-//! - `audio_get_state` — current master volume (0-100), mute, default output.
-//! - `audio_set_volume` — set master volume scalar on the default render endpoint.
-//! - `audio_list_outputs` — active render endpoints with friendly names + default flag.
-//! - `audio_set_default_output` — switch the default render endpoint via
+//! - `audio_get_state`: current master volume (0-100), mute, default output.
+//! - `audio_set_volume`: set master volume scalar on the default render endpoint.
+//! - `audio_list_outputs`: active render endpoints with friendly names + default flag.
+//! - `audio_set_default_output`: switch the default render endpoint via
 //!   `IPolicyConfig::SetDefaultEndpoint`. That interface isn't in the official
 //!   SDK headers (it's the de-facto approach used by EarTrumpet / SoundSwitch);
 //!   stable in practice across Win10/11 but not API-stability-guaranteed by
@@ -27,7 +27,7 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, PROPERTYKEY};
 
-// PKEY_Device_FriendlyName — the canonical friendly-name property key.
+// PKEY_Device_FriendlyName: the canonical friendly-name property key.
 // {a45c254e-df1c-4efd-8020-67d146a850e0}, 14
 const PKEY_DEVICE_FRIENDLYNAME: PROPERTYKEY = PROPERTYKEY {
     fmtid: GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0),
@@ -48,7 +48,6 @@ pub struct AudioState {
     pub default_output: Option<AudioOutput>,
 }
 
-// ── IPolicyConfig (undocumented but stable) ─────────────────────────────────
 // GUIDs for switching the default audio endpoint:
 //   CLSID_CPolicyConfigClient  {870AF99C-171D-4F9E-AF0D-E63D-FAF4C664}
 //   IID_IPolicyConfig          {F8679F50-850A-41CF-9C72-430F290290C8}
@@ -61,7 +60,6 @@ unsafe trait IPolicyConfig: windows::core::IUnknown {
 const CLSID_CPOLICY_CONFIG_CLIENT: GUID =
     GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63dfaf4c664);
 
-// ── COM-thread helper ───────────────────────────────────────────────────────
 
 /// Run a COM-using closure on a fresh thread with its own MTA init. COM
 /// apartments don't mix with async runtimes, so each call gets a clean
@@ -76,7 +74,7 @@ where
         let init = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
         let init_ok = init.is_ok();
         // RPC_E_CHANGED_MODE: this thread was already inited in a different
-        // apartment — rare for a fresh thread, but tolerate by still running.
+        // apartment: rare for a fresh thread, but tolerate by still running.
         let result = if init_ok || init == windows::Win32::Foundation::RPC_E_CHANGED_MODE {
             f()
         } else {
@@ -121,7 +119,7 @@ fn device_name(dev: &IMMDevice) -> windows::core::Result<String> {
             return Ok(String::from("(unnamed)"));
         }
         // The string pointer is at offset 8 (after vt:u16 + reserved:u16 +
-        // padding) on 64-bit — PROPVARIANT is 16 bytes for the scalar forms,
+        // padding) on 64-bit: PROPVARIANT is 16 bytes for the scalar forms,
         // but VT_LPWSTR places the pointer in the union. Access via the
         // crate's field if present; otherwise compute it.
         let ptr_field: *const *const u16 = (std::ptr::addr_of!(*raw) as *const u8).add(8).cast();
@@ -139,7 +137,7 @@ fn device_name(dev: &IMMDevice) -> windows::core::Result<String> {
 }
 
 /// Device id as a String. IMMDevice::GetId returns a PWSTR we must copy out
-/// (and it's CoTaskMemAlloc'd — the crate frees it on drop of the PWSTR).
+/// (and it's CoTaskMemAlloc'd: the crate frees it on drop of the PWSTR).
 fn device_id(dev: &IMMDevice) -> windows::core::Result<String> {
     unsafe {
         let pwstr = dev.GetId()?;
@@ -149,7 +147,6 @@ fn device_id(dev: &IMMDevice) -> windows::core::Result<String> {
     }
 }
 
-// ── Tauri commands ──────────────────────────────────────────────────────────
 
 pub struct AudioRegistry;
 pub fn new_registry() -> AudioRegistry {

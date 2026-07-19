@@ -2,7 +2,7 @@
 //!
 //! "Sleep" hides the main window to the tray and pauses the aurora canvas
 //! (the app's dominant idle CPU/GPU cost) while keeping the model, memory, and
-//! schema engines warm in RAM/VRAM — the "barely noticeable" state. The render
+//! schema engines warm in RAM/VRAM: the "barely noticeable" state. The render
 //! loop is what makes sleep cheap, so we emit `canvas-pause` / `canvas-resume`
 //! to the frontend which gates `requestAnimationFrame`.
 //!
@@ -12,7 +12,7 @@
 
 use tauri::{
     menu::{Menu, MenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, Runtime,
 };
 
@@ -35,7 +35,7 @@ pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let menu = Menu::with_items(app, &[&wake, &quit])?;
 
     // The icon: prefer the bundled paw PNG (32x32) shipped as a Tauri icon.
-    // Fall back to no explicit icon if it can't be resolved — the tray still
+    // Fall back to no explicit icon if it can't be resolved: the tray still
     // works, just with the platform default.
     let icon = app
         .default_window_icon()
@@ -62,10 +62,9 @@ pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     Ok(())
 }
 
-// ── Power actions ──────────────────────────────────────────────────────────
 
 /// Full shutdown: terminate the process unconditionally. We use
-/// `std::process::exit(0)` — an immediate OS-level process kill that bypasses
+/// `std::process::exit(0)`: an immediate OS-level process kill that bypasses
 /// Tauri's exit flow entirely. `app.exit(0)` runs the graceful window/webview
 /// teardown, which can STALL when a secondary window is open or wedged, forcing
 /// the user to Task Manager. `std::process::exit` kills every window + webview
@@ -95,7 +94,7 @@ pub fn power_restart<R: Runtime>(app: &AppHandle<R>) {
         Ok(_) => tracing::info!("restart: spawned new instance, shutting down"),
         Err(e) => {
             tracing::error!(error = %e, exe = %exe.display(), "restart: spawn failed");
-            // If we can't relaunch, do NOT shut down — that would leave the
+            // If we can't relaunch, do NOT shut down: that would leave the
             // user with nothing. Surface the failure and stay alive.
             return;
         }
@@ -121,7 +120,6 @@ pub fn power_wake<R: Runtime>(app: &AppHandle<R>) {
     let _ = app.emit(EVT_CANVAS_RESUME, ());
 }
 
-// ── Tauri commands (invoked from the paw dropdown) ─────────────────────────
 
 #[tauri::command]
 pub fn power_shutdown_cmd<R: Runtime>(app: tauri::AppHandle<R>) -> Result<(), String> {
@@ -146,14 +144,4 @@ pub fn power_restart_cmd<R: Runtime>(app: tauri::AppHandle<R>) -> Result<(), Str
 pub fn power_sleep_cmd<R: Runtime>(app: tauri::AppHandle<R>) -> Result<(), String> {
     power_sleep(&app);
     Ok(())
-}
-
-// Re-export the mouse-button state check used by callers/tests if needed.
-#[allow(dead_code)]
-fn is_left_press(e: &TrayIconEvent) -> bool {
-    matches!(e, TrayIconEvent::Click {
-        button: MouseButton::Left,
-        button_state: MouseButtonState::Down,
-        ..
-    })
 }

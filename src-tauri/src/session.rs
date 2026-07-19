@@ -18,7 +18,7 @@ pub struct Message {
     pub reasoning: String,
     /// The raw model output (pre-parse) for assistant turns. Used by the
     /// chat formatter to re-render the turn so the rendered token sequence
-    /// matches the KV cache exactly — preserving delta-prefill across turns
+    /// matches the KV cache exactly: preserving delta-prefill across turns
     /// (Bug #3: Prefix Cache Extinction). Empty for user/system messages and
     /// legacy sessions; `render_prompt` falls back to `strip_thinking` then.
     #[serde(default)]
@@ -106,7 +106,7 @@ impl Conversation {
     /// disk-full mid-write leaves `session.json` truncated and the ENTIRE
     /// conversation unrecoverable. The temp+rename pattern guarantees the
     /// destination is either the previous complete file or the new complete
-    /// file — never a half-written middle state.
+    /// file: never a half-written middle state.
     ///
     /// - The temp file is in the same directory as `path` (same volume →
     ///   `rename` is atomic; a cross-device rename would degrade to copy+delete
@@ -189,7 +189,7 @@ impl Conversation {
     ///    cheap and the delta (memory block + new user) stays small.
     ///
     /// Memory (M) is supposed to backfill the evicted older turns via
-    /// retrieval — that's the whole point of the offload. If retrieval misses,
+    /// retrieval: that's the whole point of the offload. If retrieval misses,
     /// the model genuinely sees less recency than before; the cap is in a
     /// `const` at the call site, trivially tunable.
     ///
@@ -197,7 +197,7 @@ impl Conversation {
     /// same-role messages are merged into one block (content joined with
     /// `\n\n`, `raw_output` joined with `\n` for assistant turns). This
     /// guarantees a clean user↔assistant alternation for the downstream
-    /// backend — GLM gets the strictly-alternating payload its chat template
+    /// backend: GLM gets the strictly-alternating payload its chat template
     /// expects, and local Gemma 4 never emits adjacent `<|turn>user` or
     /// `<|turn>model` blocks that would confuse the chat-template tracking.
     /// The roll-up is a pure normalization on the assembled slice; stored
@@ -238,7 +238,7 @@ impl Conversation {
 /// assembled `Vec<ApiMessage>` before it leaves `assemble_api_messages_windowed`,
 /// so BOTH backends (local Gemma 4 via `Gemma4Format::render_prompt`, online
 /// GLM via `HttpBackend::stream`) receive the same strictly-alternating
-/// payload. Session storage is left untouched — this is a presentation-layer
+/// payload. Session storage is left untouched: this is a presentation-layer
 /// transform only.
 ///
 /// Rules:
@@ -251,12 +251,12 @@ impl Conversation {
 ///   legacy/hand-edited session had a leading system+system pair it would
 ///   merge cleanly rather than emit two system turns.
 /// - `raw_output` is merged too because the local formatter renders assistant
-///   turns from `raw_output` when present (Bug #3, §2C) — joining only
+///   turns from `raw_output` when present (Bug #3, §2C): joining only
 ///   `content` would desync the rendered tokens from the KV cache. Assistant
 ///   `raw_output` blocks are the Gemma4 channel protocol; joining with `\n`
 ///   (not `\n\n`) keeps the turn boundary inside the merged block legible.
 ///
-/// Empty messages are NOT dropped — an empty user turn is still a turn (the
+/// Empty messages are NOT dropped: an empty user turn is still a turn (the
 /// backend's alternation contract doesn't care about content length).
 pub fn normalize_alternating(messages: Vec<ApiMessage>) -> Vec<ApiMessage> {
     if messages.len() < 2 {
@@ -299,7 +299,7 @@ pub struct ApiMessage {
 ///
 /// `session.json` → `session.json.tmp`. We keep the full original name as a
 /// prefix so the temp is visually obvious in the dir and `save`'s stale-temp
-/// cleanup (`remove_file`) targets exactly this one file — not a random one.
+/// cleanup (`remove_file`) targets exactly this one file: not a random one.
 fn temp_path_for(path: &Path) -> std::path::PathBuf {
     let mut name = path
         .file_name()
@@ -322,7 +322,7 @@ fn gen_id() -> String {
 }
 
 /// Fill `buf` with pseudo-random bytes via a xorshift64 seeded from wall-clock
-/// nanos. NOT cryptographic — used only for message-ID uniqueness in local
+/// nanos. NOT cryptographic: used only for message-ID uniqueness in local
 /// chat (see `gen_id`). The name reflects what it is: a PRNG, not the OS
 /// CSPRNG (the old name `getrandom_fill` falsely implied the `getrandom`
 /// syscall / crate). Renamed 2026-07-13 (Gemini review).
@@ -509,7 +509,6 @@ mod tests {
         cleanup(&path);
     }
 
-    // ── normalize_alternating (the Alternating Roll-Up) ─────────────────
     fn api(role: &str, content: &str) -> ApiMessage {
         ApiMessage {
             role: role.into(),
@@ -591,7 +590,7 @@ mod tests {
 
     #[test]
     fn normalize_handles_empty_messages_without_dropping() {
-        // An empty user turn is still a turn — don't drop it. When the first
+        // An empty user turn is still a turn: don't drop it. When the first
         // of the merged pair is empty, no leading separator is emitted (the
         // \n\n guard fires only when BOTH sides have content).
         let msgs = vec![

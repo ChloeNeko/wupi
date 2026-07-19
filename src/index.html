@@ -6,7 +6,16 @@
     <title>WUPI OS</title>
     <link rel="stylesheet" href="styles.css">
 </head>
-<body>
+<body class="booting">
+    <!-- Boot splash: paints on first frame BEFORE the canvas initializes, so
+         the webview never shows its default white. Pure HTML/CSS — the aurora
+         ring is a conic-gradient with a CSS mask, zero asset weight, ~0 CPU.
+         Fades + removes itself once the boot gate resolves (script.js). -->
+    <div id="boot-splash">
+        <div class="boot-ring"></div>
+        <div class="boot-wordmark">WUPI OS</div>
+        <div class="boot-caption">initializing</div>
+    </div>
     <div class="top-bar">
         <div class="menu-container">
             <button class="paw-btn" id="pawBtn" aria-label="System Menu">
@@ -49,7 +58,7 @@
                 </button>
             </div>
 
-            <!-- THEME CASCADE — aligned directly right of the paw dropdown -->
+            <!-- THEME CASCADE: aligned directly right of the paw dropdown -->
             <!-- Panel 2: theme picker (only "Aurora" for now) -->
             <div class="dropdown-menu cascade-panel" id="themePanel">
                 <div class="dropdown-status-title">Theme</div>
@@ -176,7 +185,7 @@
     <div class="dock-trigger-area">
         <div class="dock-container">
             <!-- Quick-access order (fixed): AI → Chat → Profile → Codex. AI is
-                 first per Chloe's call. This is NOT alphabetical — the Docks
+                 first per Chloe's call. This is NOT alphabetical: the Docks
                  home grid is alphabetical. -->
             <div class="dock-item" id="dockApi" aria-label="AI">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -213,13 +222,12 @@
         </div>
     </div>
 
-    <!-- ═════════════════ APP WINDOWS (overlay panels) ═════════════════ -->
     <!-- One Tauri window; these are DOM overlays layered over the canvas.
          Glassmorphism + star-culling both work because they share the same
          render surface. z-index: 1000 (above canvas z:1, below top-bar/dock).
          `.app-window` is hidden unless `.show`. -->
 
-    <!-- WUPI Chat — small movable/resizable window, centered -->
+    <!-- WUPI Chat: small movable/resizable window, centered -->
     <div class="app-window chat draggable" id="chat" aria-hidden="true">
         <div class="app-window-header">
             <span class="app-window-title">WUPI Chat</span>
@@ -237,18 +245,18 @@
         </div>
     </div>
 
-    <!-- Profile Editor — centered modal, draggable + resizable -->
+    <!-- Profile Editor: centered modal, draggable + resizable -->
     <div class="app-window modal draggable" id="profile" aria-hidden="true">
         <div class="app-window-header">
             <span class="app-window-title">Profile Editor</span>
             <button class="app-window-close" data-close="profile" aria-label="Close">✕</button>
         </div>
         <div class="app-window-body profile-body">
-            <p class="profile-hint">Who Wupi is talking to. Saved live — applies on the next message.</p>
+            <p class="profile-hint">Who Wupi is talking to. Saved live: applies on the next message.</p>
             <label class="field-label">Name</label>
             <input type="text" id="profName" class="field-input" placeholder="How Wupi should address you" />
             <label class="field-label">Description</label>
-            <textarea id="profDescription" class="field-textarea" rows="6" placeholder="A character description for Wupi to refer to you as — who you are, how she should treat you, your relationship…"></textarea>
+            <textarea id="profDescription" class="field-textarea" rows="6" placeholder="A character description for Wupi to refer to you as: who you are, how she should treat you, your relationship…"></textarea>
             <div class="profile-actions">
                 <span class="profile-status" id="profStatus"></span>
                 <button id="profSaveBtn" class="field-btn primary">Save</button>
@@ -256,7 +264,7 @@
         </div>
     </div>
 
-    <!-- AI — connection profile manager. Two large mode boxes (LOCAL vs
+    <!-- AI: connection profile manager. Two large mode boxes (LOCAL vs
          ONLINE) swap the section below. LOCAL shows the single local model
          (WUPI.gguf 12B). ONLINE shows saved endpoint profiles + an editor.
          Selecting ONLINE unloads the 12B and runs Agent.gguf as the
@@ -310,7 +318,7 @@
                     </div>
 
                     <!-- Profile picker. Placeholder doubles as the "create new"
-                         affordance — selecting it focuses the editor below. -->
+                         affordance: selecting it focuses the editor below. -->
                     <select id="aiProfileSelect" class="field-input ai-select">
                         <option value="">Create a New Profile</option>
                     </select>
@@ -322,7 +330,7 @@
                     </select>
 
                     <!-- Active-state bubble (mirrors the LOCAL 12B bubble). Shows
-                         "Custom Name — model-id" when a profile is connected,
+                         "Custom Name: model-id" when a profile is connected,
                          otherwise a muted hint. -->
                     <div class="ai-online-bubble" id="aiOnlineBubble">
                         <span class="ai-online-bubble-text">No profile connected</span>
@@ -351,7 +359,7 @@
         </div>
     </div>
 
-    <!-- Codex — memory browser, centered modal, larger, draggable + resizable -->
+    <!-- Codex: memory browser, centered modal, larger, draggable + resizable -->
     <div class="app-window modal codex draggable" id="codex" aria-hidden="true">
         <div class="app-window-header">
             <span class="app-window-title">Codex</span>
@@ -379,10 +387,10 @@
     </div>
 
     <!-- Games has NO window (yet). The home-grid Games button is an inert
-         placeholder — clicking it does nothing. The scenario-launcher surface
+         placeholder: clicking it does nothing. The scenario-launcher surface
          + backend arrive with the roleplay-card system (different chat). -->
 
-    <!-- Docks — full-screen "home" launcher grid. Background stays active. -->
+    <!-- Docks: full-screen "home" launcher grid. Background stays active. -->
     <div class="app-window home" id="apps" aria-hidden="true">
         <button class="app-window-close home-close" data-close="apps" aria-label="Close">✕</button>
         <div class="home-grid">
@@ -409,7 +417,7 @@
                 <span class="home-app-label">Codex</span>
             </div>
             <!-- Games: NO data-open. The button stays (visual inventory) but
-                 is inert — clicking does nothing. The scenario-launcher surface
+                 is inert: clicking does nothing. The scenario-launcher surface
                  arrives with the roleplay-card system (different chat). -->
             <div class="home-app" aria-label="Games (coming soon)">
                 <div class="home-app-icon">

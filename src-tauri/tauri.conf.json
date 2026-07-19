@@ -13,12 +13,14 @@
     "windows": [
       {
         "title": "WUPI OS",
-        "width": 1440,
-        "height": 900,
+        "width": 500,
+        "height": 500,
         "maximized": false,
         "resizable": false,
-        "fullscreen": true,
-        "decorations": false
+        "fullscreen": false,
+        "decorations": false,
+        "transparent": true,
+        "center": true
       }
     ],
     "security": {

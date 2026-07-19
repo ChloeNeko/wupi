@@ -1,4 +1,4 @@
-//! The persistent chat engine — a dedicated generation thread.
+//! The persistent chat engine: a dedicated generation thread.
 //!
 //! `LlamaContext` is `!Send + !Sync` (it owns a raw `NonNull` pointer into
 //! llama.cpp's heap) and it borrows `&'a LlamaModel` for its whole life. Both
@@ -12,7 +12,7 @@
 //!
 //! # What lives on the engine thread
 //!
-//! - The leaked `&'static LlamaModel` (leaked at load time — see `llm.rs` for
+//! - The leaked `&'static LlamaModel` (leaked at load time: see `llm.rs` for
 //!   why this is the idiomatic choice for a process-lifetime singleton).
 //! - A single persistent `LlamaContext<'static>` with **Q8_0 KV cache** on
 //!   both keys and values (~50% VRAM cut vs F16, near-zero quality loss).
@@ -41,10 +41,9 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
-// ─── Cache-space budgeting constants ─────────────────────────────────────
 // All the magic numbers that carve up `n_ctx` between resident history and
 // generation room. Centralized here so they're greppable, documented, and
-// reviewable in one place — rather than scattered as bare literals (Gemini
+// reviewable in one place: rather than scattered as bare literals (Gemini
 // review, 2026-07-13). These are SAFETY FLOORS, not user-tunable quality
 // knobs: making them settings would be a foot-gun (set to 0 → every long
 // conversation hard-fails). Internal constants stay internal.
@@ -52,7 +51,7 @@ use std::time::Duration;
 /// Fraction of `n_ctx` reserved against prompt growth + generation when
 /// deciding whether to truncate the prompt before prefill (engine.rs
 /// `generate`). With the floor below, this yields a ~1000-token reserve at
-/// the default 4000-token context — enough headroom for a long reply plus
+/// the default 4000-token context: enough headroom for a long reply plus
 /// the next turn's user message without NoKvCacheSlot.
 const GENERATION_RESERVE_FLOOR_TOKENS: usize = 512;
 
@@ -72,7 +71,7 @@ const MAX_TOKENS_FLOOR: usize = 64;
 const MAX_TOKENS_CAP: usize = 2048;
 
 /// Tokens decoded per prefill batch. MUST match the `with_n_batch` value in
-/// `init_runtime` — llama.cpp allocates the context's batch buffer to this
+/// `init_runtime`: llama.cpp allocates the context's batch buffer to this
 /// size, and prefill batches larger than it silently fail. Bigger = fewer
 /// decode calls but more peak memory; 512 is the llama.cpp default sweet spot.
 const PREFILL_BATCH_TOKENS: i32 = 512;
@@ -82,14 +81,14 @@ pub struct EngineRequest {
     pub messages: Vec<ApiMessage>,
     pub on_chunk: ChunkFn,
     /// Cancellation flag. Set to true by `chat_stop` to break the decode loop
-    /// at the next token boundary. The engine checks this between tokens —
-    /// never mid-decode — so the KV cache stays in a consistent state.
+    /// at the next token boundary. The engine checks this between tokens -
+    /// never mid-decode: so the KV cache stays in a consistent state.
     pub cancel: Arc<AtomicBool>,
     /// Retrieved-memory block injected into the inter-turn region by
     /// `render_prompt` (§2F eager-prefill design). `None` = no memory this
     /// turn. Lives here (not baked into messages[0].content) so the stable
     /// prefix (system + turns) stays byte-identical across turns regardless
-    /// of retrieval results — that's the precondition for eager prefill.
+    /// of retrieval results: that's the precondition for eager prefill.
     pub memory_block: Option<String>,
     /// World-state schema block, sibling to `memory_block`. The persistent
     /// simulation state (summary + recent events + entities) that the
@@ -115,11 +114,11 @@ enum EngineMsg {
     Shutdown,
 }
 
-/// The handle held by `AppState` (via `LlamaCppBackend`). Fully `Send` — a
+/// The handle held by `AppState` (via `LlamaCppBackend`). Fully `Send`: a
 /// channel sender + the model family + the thread's JoinHandle. The JoinHandle
 /// lets `shutdown()` block until VRAM is actually freed (the old
-/// fire-and-forget pattern caused VRAM-overlap OOM during model swaps — see
-/// the 2026-07-18 fix in `swap_schema_engine`).
+/// fire-and-forget pattern caused VRAM-overlap OOM during model swaps, fixed
+/// 2026-07-18 by joining the thread before any new model allocates).
 pub struct ChatEngine {
     tx: mpsc::Sender<EngineMsg>,
     /// The model family, retained so the backend can report it without
@@ -142,7 +141,7 @@ impl ChatEngine {
     /// Returns the engine handle AND a receiver that yields `Ok(())` once
     /// the persistent context has been created (or `Err` if init failed).
     /// The caller MUST `recv()` from it before treating the engine as ready
-    /// — context creation happens on the engine thread, and if it fails the
+    ///: context creation happens on the engine thread, and if it fails the
     /// UI must not report "ready" (Bug #6).
     pub fn spawn(
         backend: &'static llama_cpp_2::llama_backend::LlamaBackend,
@@ -228,7 +227,7 @@ impl ChatEngine {
                                     EngineReply::Err(format!("engine panic: {msg}"))
                                 }
                             };
-                            // Sending can fail only if the caller gave up — ignore.
+                            // Sending can fail only if the caller gave up: ignore.
                             let _ = reply.send(reply_msg);
                         }
                         Ok(EngineMsg::Shutdown) => {
@@ -236,7 +235,7 @@ impl ChatEngine {
                             break;
                         }
                         Err(mpsc::RecvError) => {
-                            // All senders dropped — shut down.
+                            // All senders dropped: shut down.
                             tracing::info!("wupi-engine: all senders dropped, exiting");
                             break;
                         }
@@ -274,7 +273,7 @@ impl ChatEngine {
         let _ = self.tx.send(EngineMsg::Shutdown);
         // Take the JoinHandle (idempotent across repeated shutdown() calls)
         // and block on it. A panic in the thread surfaces as Err; log it but
-        // don't propagate — shutdown is best-effort.
+        // don't propagate: shutdown is best-effort.
         if let Ok(mut guard) = self.join.lock() {
             if let Some(handle) = guard.take() {
                 if let Err(e) = handle.join() {
@@ -309,13 +308,13 @@ impl ChatEngine {
         let n_ctx = context_size.max(1024);
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(n_ctx))
-            // MUST stay in sync with PREFILL_BATCH_TOKENS — see the consts block
+            // MUST stay in sync with PREFILL_BATCH_TOKENS: see the consts block
             // at the top of this file. `with_n_batch` allocates the context's
             // batch buffer; prefill() batches into it.
             .with_n_batch(PREFILL_BATCH_TOKENS as u32)
             .with_embeddings(false)
             // Asymmetric-ish KV quantization: Q8_0 on both K and V is the
-            // community-standard "free win" — ~50% VRAM cut vs F16, near-zero
+            // community-standard "free win": ~50% VRAM cut vs F16, near-zero
             // quality loss on Gemma. K=Q8_0 keeps attention routing precise;
             // V=Q8_0 avoids the long-context drift that Q4_0 V would cause.
             .with_type_k(KvCacheType::Q8_0)
@@ -328,7 +327,7 @@ impl ChatEngine {
         // Cache the `<|turn>` marker tokens for boundary scanning during
         // eviction. Tokenize the literal once (no BOS). For the Plain family
         // there's no `<|turn>` marker, so eviction falls back to the
-        // last-boundary path — fine, since Plain is a fallback.
+        // last-boundary path: fine, since Plain is a fallback.
         let turn_marker = family
             .turn_marker_literal()
             .and_then(|lit| model.str_to_token(lit, AddBos::Never).ok())
@@ -384,26 +383,26 @@ impl EngineRuntime {
     /// protocol into the next prompt → the model emits degenerate markers →
     /// StreamFilter strips them → `content_len=0` empty-line spam. Dropping
     /// raw_output (Option 1b) avoids the corruption but breaks cache coherence
-    /// — every post-cancel turn cold-resets. Unacceptable for roleplay.
+    ///: every post-cancel turn cold-resets. Unacceptable for roleplay.
     ///
     /// This fix takes the third path: **actually decode the closer tokens into
     /// the KV cache**, so the cache and `raw_out` agree byte-for-byte that the
     /// turn ended cleanly. Next turn's `common_prefix_len` hits the full prefix
-    /// — delta-prefill fast path preserved, zero stutter. The cost is 1-3 extra
-    /// forward passes at cancel time — microseconds, paid once.
+    ///: delta-prefill fast path preserved, zero stutter. The cost is 1-3 extra
+    /// forward passes at cancel time: microseconds, paid once.
     ///
     /// # The closer is always `<channel|>`
     ///
-    /// The Gemma4 protocol is sequential, not nested — exactly one channel is
+    /// The Gemma4 protocol is sequential, not nested: exactly one channel is
     /// open at a time (thought, then reply). The closer for ANY open channel
     /// is `<channel|>`. No state machine needed to detect which channel; just
     /// detect whether ANY channel is still open.
     ///
     /// # Returns
     ///
-    /// - `Ok(true)` — closer was appended (micro-decode ran).
-    /// - `Ok(false)` — skipped: raw_out empty, already cleanly closed, or the
-    ///   literal couldn't be tokenized (defensive — caller should fall back
+    /// - `Ok(true)`: closer was appended (micro-decode ran).
+    /// - `Ok(false)`: skipped: raw_out empty, already cleanly closed, or the
+    ///   literal couldn't be tokenized (defensive: caller should fall back
     ///   to dropping raw_output, accepting the cold-reset).
     fn append_channel_closer(
         &mut self,
@@ -423,7 +422,7 @@ impl EngineRuntime {
         let last_open = raw_out.rfind("<|channel>");
         match last_open {
             None => {
-                // No opener at all — the model replied without using the
+                // No opener at all: the model replied without using the
                 // channel protocol (some Plain-family turns do this). Nothing
                 // to close.
                 return Ok(false);
@@ -438,13 +437,13 @@ impl EngineRuntime {
             }
         }
 
-        // Tokenize the closer. AddBos::Never — we're appending, not starting.
+        // Tokenize the closer. AddBos::Never: we're appending, not starting.
         let closer_tokens = self
             .model
             .str_to_token("<channel|>", AddBos::Never)
             .map_err(|e| anyhow::anyhow!("tokenize closer: {e:?}"))?;
         if closer_tokens.is_empty() {
-            tracing::warn!("str_to_token(\"<channel|>\") returned empty — skipping closer");
+            tracing::warn!("str_to_token(\"<channel|>\") returned empty: skipping closer");
             return Ok(false);
         }
 
@@ -463,7 +462,7 @@ impl EngineRuntime {
             *n_cur += 1;
         }
 
-        // Append the literal closer string to raw_out. Always the literal —
+        // Append the literal closer string to raw_out. Always the literal -
         // `token_to_piece` can return empty for special-control tokens, which
         // would desync raw_out from the cache. The literal is what the model's
         // protocol expects and what render_prompt will re-emit next turn.
@@ -519,7 +518,7 @@ impl EngineRuntime {
         // conversation → NoKvCacheSlot. The fix inverts the relationship:
         // truncate the PROMPT to fit the cache. After truncation, the §2F
         // structural-divergence guard (below) handles the cache/prompt
-        // mismatch by cold-resetting — slower than surgical eviction, but
+        // mismatch by cold-resetting: slower than surgical eviction, but
         // correct and safe.
         //
         // Why not surgical eviction on truncation: attempted in three
@@ -532,14 +531,14 @@ impl EngineRuntime {
         // truncated prompt share only the system prefix at the token level,
         // and no mapping can align them. Storing raw token IDs alongside
         // messages would fix the drift but hard-locks history to one model's
-        // tokenizer — rejected (model-swap would corrupt saved chats).
+        // tokenizer: rejected (model-swap would corrupt saved chats).
         // Truncation cold-reset is the accepted cost until the Memory engine
         // keeps visible history short enough that truncation rarely fires.
         let generation_reserve = (self.n_ctx as usize / 4).max(GENERATION_RESERVE_FLOOR_TOKENS);
         let max_prompt_len = (self.n_ctx as usize).saturating_sub(generation_reserve);
         let full_tokens = if full_tokens.len() > max_prompt_len {
             if self.turn_marker.is_empty() {
-                // Plain family has no turn markers — can't truncate safely.
+                // Plain family has no turn markers: can't truncate safely.
                 anyhow::bail!(
                     "context too long: {} tokens, max {}, and no truncation strategy for this model family",
                     full_tokens.len(), max_prompt_len
@@ -571,17 +570,16 @@ impl EngineRuntime {
         // the cache. Track cached vs. prefilled for telemetry. ---
         let prefill_start = std::time::Instant::now();
         let (cached_tokens, prefilled_tokens) = if self.buffer.is_cold() {
-            // Cold start — nothing was cached. Prefill everything.
+            // Cold start: nothing was cached. Prefill everything.
             self.reset_and_prefill(&full_tokens)?;
             (0usize, full_tokens.len())
         } else {
             let common = self.buffer.common_prefix_len(&full_tokens);
             let committed = self.buffer.committed_len();
 
-            // ── Structural-divergence guard (Bug §2F, 2026-07-13) ──────────
             // Delta-prefill decodes `full_tokens[common..]` at `start_pos =
             // common`, APPENDING to the cache. That is only valid when the new
-            // prompt is a pure extension of what's resident — i.e.
+            // prompt is a pure extension of what's resident: i.e.
             // `common == committed_len`. The cache then ends exactly where the
             // delta begins, so appending is safe.
             //
@@ -598,7 +596,7 @@ impl EngineRuntime {
             // system prefix → `common` is small, `committed_len` is large →
             // guard fires → cold-reset → clean prefill.
             //
-            // Cost: one full prefill (paid rarely — only when truncation
+            // Cost: one full prefill (paid rarely: only when truncation
             // changes the cut point between turns). Normal turns have
             // `common == committed_len` → fast delta path preserved.
             if common < committed {
@@ -628,9 +626,9 @@ impl EngineRuntime {
         // re-prefill the truncated prompt from scratch. This is safe now
         // because truncation guarantees `full_tokens.len() <= max_prompt_len`,
         // so a cold re-prefill always fits. The OLD reconstruct-based eviction
-        // is gone — it was the source of the self-defeating-eviction bug.
-        // (Reaching here with a cold buffer is impossible — the cold branch
-        // above already prefilled — so reset_and_prefill's clear is safe.) ---
+        // is gone: it was the source of the self-defeating-eviction bug.
+        // (Reaching here with a cold buffer is impossible: the cold branch
+        // above already prefilled: so reset_and_prefill's clear is safe.) ---
         let min_gen_window = MIN_GENERATION_WINDOW;
         let remaining = self.n_ctx as i32 - self.buffer.committed_len() as i32;
         if remaining < min_gen_window {
@@ -704,7 +702,7 @@ impl EngineRuntime {
     }
 
     /// The token-by-token generation loop. Sampler + ThoughtGate + StreamFilter
-    /// — identical config to the previous `generate_blocking`. Captures TTFT +
+    ///: identical config to the previous `generate_blocking`. Captures TTFT +
     /// generation timing, and checks `cancel` between tokens so `chat_stop`
     /// can break out cleanly at a token boundary.
     fn decode_loop(
@@ -727,6 +725,7 @@ impl EngineRuntime {
             "<|think|>",
             "<|channel>thought",
             "<channel|>",
+            "<audio|>",
             "<|tool_call>",
             "<tool_call|>",
             "<|tool_response>",
@@ -736,7 +735,7 @@ impl EngineRuntime {
         ]);
 
         let eos = self.model.token_eos();
-        // n_cur is the position of the NEXT token to decode — one past the
+        // n_cur is the position of the NEXT token to decode: one past the
         // last prefilled/generated token.
         let mut n_cur = self.buffer.committed_len() as i32;
         // Bug #1 Part B: clamp max_tokens to the remaining cache space. Leave
@@ -751,7 +750,7 @@ impl EngineRuntime {
 
         // Bug #2: allocate the step batch ONCE outside the loop and reuse it
         // via .clear(). The old code allocated LlamaBatch::new(1,1) inside the
-        // loop — one alloc per token (~500 for a typical reply). prefill()
+        // loop: one alloc per token (~500 for a typical reply). prefill()
         // already shows the correct pattern.
         let mut step_batch = LlamaBatch::new(1, 1);
 
@@ -835,7 +834,7 @@ impl EngineRuntime {
                 Ok(false) => {
                     // Skipped (empty raw, already clean, or couldn't tokenize).
                     // Fall back to dropping raw_output to avoid persisting a
-                    // malformed turn — accepts a cold-reset next turn.
+                    // malformed turn: accepts a cold-reset next turn.
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "append_channel_closer failed; dropping raw_output");
@@ -856,7 +855,7 @@ impl EngineRuntime {
             on_chunk(&filter_tail);
         }
 
-        // Record the generated tokens in the buffer — they're now resident in
+        // Record the generated tokens in the buffer: they're now resident in
         // the KV cache at [committed_len .. committed_len + generated.len()).
         let gen_count = tokens_generated.len();
         self.buffer.append_generated(&tokens_generated);
@@ -867,9 +866,9 @@ impl EngineRuntime {
         //
         // Cancel handling (Path B, 2026-07-13): the coherence-preserving
         // closer-append above made raw_out structurally valid (ends with
-        // `<channel|>`), so it's safe to persist verbatim — cache coherence
+        // `<channel|>`), so it's safe to persist verbatim: cache coherence
         // is preserved and next turn's delta-prefill fast path fires. If the
-        // closer was NOT appended (skipped or errored — the rare fallback),
+        // closer was NOT appended (skipped or errored: the rare fallback),
         // drop raw_output to avoid persisting a malformed turn; that turn
         // cold-resets next time, which is the safe degradation.
         let mut parsed = self.formatter.parse_output(&raw_out);
@@ -941,7 +940,7 @@ impl EngineRuntime {
 
     /// Phase 2 reconstruction: clear the KV cache entirely, then re-decode the
     /// system prefix + the surviving tail (everything after `cut`) from
-    /// position 0. This is a clean rebuild — no RoPE surgery, no position
+    /// position 0. This is a clean rebuild: no RoPE surgery, no position
     /// shifting. The cost is one full prefill, paid rarely (only when history
     /// approaches `n_ctx`).
     ///
@@ -980,13 +979,13 @@ impl EngineRuntime {
     /// Estimate where the system prefix ends in the cold-start token stream.
     /// For Gemma4, the system block is `<|turn>system\n...<turn|>\n` and the
     /// next `<|turn>` token marks the start of the first user turn. If we
-    /// can't find a boundary, pin nothing (0) — the prefix is still correct,
+    /// can't find a boundary, pin nothing (0): the prefix is still correct,
     /// just less protected from eviction.
     fn estimate_system_prefix_len(&self, tokens: &[LlamaToken]) -> usize {
         if self.turn_marker.is_empty() || tokens.len() < self.turn_marker.len() {
             return 0;
         }
-        // Find the SECOND occurrence of the turn marker — the first opens the
+        // Find the SECOND occurrence of the turn marker: the first opens the
         // system turn, the second opens the first conversation turn. Everything
         // before the second is the system prefix.
         let limit = tokens.len() - self.turn_marker.len();
@@ -1000,11 +999,11 @@ impl EngineRuntime {
             }
         }
         // Only one turn marker (system only, no conversation yet). Pin nothing
-        // extra — the whole prompt is effectively the prefix.
+        // extra: the whole prompt is effectively the prefix.
         0
     }
 }
 
-// `turn_marker_literal` lives on `ModelFamily` in `chat_format.rs` — the
+// `turn_marker_literal` lives on `ModelFamily` in `chat_format.rs`: the
 // family is the authority on its own turn protocol, so the marker literal
 // belongs there rather than dispatching through the trait by name string.

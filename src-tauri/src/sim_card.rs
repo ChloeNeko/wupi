@@ -1,6 +1,6 @@
 //! Simulation Card (`.sim`) loader, parser, and renderer.
 //!
-//! A Simulation Card is the persona artifact for a WUPI OS entity — Wupi's
+//! A Simulation Card is the persona artifact for a WUPI OS entity: Wupi's
 //! own card (the OS interface persona) or, later, a roleplay scenario card.
 //! Each card carries its own identity, appearance, role, conversational style,
 //! and an introduction list used for the randomized boot greeting.
@@ -8,7 +8,7 @@
 //! The card is strict XML with CDATA-wrapped prose blocks (so emoticons,
 //! quotes, and any literal `<>` in the persona text parse cleanly). We parse
 //! it once at startup with `roxmltree` (a tiny DOM parser that auto-merges
-//! CDATA into text nodes — zero special handling), render the persona into a
+//! CDATA into text nodes: zero special handling), render the persona into a
 //! `<persona>` block for the system prompt, and expose a randomized intro for
 //! the boot UI flourish.
 //!
@@ -41,11 +41,10 @@ pub struct SimCard {
     /// One greeting string per line in `<introductions>`. Empty if the card
     /// omits the block. Used by [`random_intro`] for the boot flourish.
     pub introductions: Vec<String>,
-    // ── Roleplay-only fields (added 2026-07-18, Games app Seam 1) ──────────
     // All `None` / empty for the system card (Wupi). A roleplay scenario card
     // carries a `<scenario>` block that populates these. The parser already
     // handles optional elements via `nested_text` returning `None` for absent
-    // parents, so adding fields here is non-breaking — `Wupi.sim` parses as
+    // parents, so adding fields here is non-breaking: `Wupi.sim` parses as
     // before with every field below at its default.
     /// The world/setting premise. Injected into the narrator's system prompt
     /// as the ground-truth scenario context. `None` for system cards.
@@ -61,7 +60,7 @@ pub struct SimCard {
     /// to spawn the initial cast. Empty for system cards.
     pub start_npc_ids: Vec<String>,
     /// Activities this card activates (e.g. `["combat","crafting"]`). Phase
-    /// 2+ hint — the engine registry will match these against available
+    /// 2+ hint: the engine registry will match these against available
     /// activity modules. Empty for system cards.
     pub declared_activities: Vec<String>,
     /// The protagonist's name for roleplay cards (e.g. "Alex", "Kaelen").
@@ -76,13 +75,13 @@ pub struct SimCard {
 
 impl SimCard {
     /// Render the persona into a compact `<persona>` block for the system
-    /// prompt. Only the identity-shaping fields are rendered — `introductions`
+    /// prompt. Only the identity-shaping fields are rendered: `introductions`
     /// are a UI concern, not model context. Returns an empty `String` for the
     /// minimal fallback (so the caller's `Option<&str>` gate suppresses the
     /// section cleanly when there's no real persona).
     ///
     /// XML-tagged sections match the prompt's existing aesthetic (Prime
-    /// Directive §1B.3 — rigid structure exploits instruction-tuned attention).
+    /// Directive §1B.3: rigid structure exploits instruction-tuned attention).
     pub fn render_for_prompt(&self) -> String {
         if self.is_fallback() {
             return String::new();
@@ -168,7 +167,7 @@ const FALLBACK_ID: &str = "__wupi_fallback__";
 /// Build the minimal fallback card used when the real card file is missing or
 /// unparseable. The app still boots; the persona section is simply suppressed
 /// (`render_for_prompt` returns empty for the fallback). Loud warning is the
-/// caller's job — this fn is silent. Public so `setup()` can reach it directly
+/// caller's job: this fn is silent. Public so `setup()` can reach it directly
 /// when no card path resolved at all.
 pub fn fallback() -> SimCard {
     SimCard {
@@ -183,7 +182,7 @@ pub fn fallback() -> SimCard {
         conversational_rules: String::new(),
         technical_rules: String::new(),
         introductions: Vec::new(),
-        // Roleplay-only fields — all empty for the system-card fallback.
+        // Roleplay-only fields: all empty for the system-card fallback.
         setting: None,
         tone: None,
         opening_scene: None,
@@ -195,7 +194,7 @@ pub fn fallback() -> SimCard {
 
 /// Load a `.sim` card from disk, falling back to a minimal stub on any error
 /// (missing file, IO error, malformed XML, missing required fields). The
-/// persona is best-effort — a bad card must never kill the OS boot. Mirrors
+/// persona is best-effort: a bad card must never kill the OS boot. Mirrors
 /// the embedder's graceful-degradation contract (§2M).
 pub fn load_or_fallback(path: &Path) -> SimCard {
     match try_load(path) {
@@ -239,7 +238,7 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
 
     // `id` is OPTIONAL and derived from <identity><name> (lowercased) when
     // <metadata> is absent. The metadata block is NOT part of the card format
-    // by design — cards stay clean and persona-only. The id is vestigial today
+    // by design: cards stay clean and persona-only. The id is vestigial today
     // anyway: memory partitioning uses the WUPI_OS_CARD_ID sentinel, not the
     // card's id. Keeping a derived id preserves the field for a future
     // roleplay-card partition path without forcing metadata onto every card.
@@ -295,7 +294,7 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
 
     let introductions = first_child(root, "introductions")
         .map(|n| {
-            // The block is a CDATA bullet list — one intro per `- ` line.
+            // The block is a CDATA bullet list: one intro per `- ` line.
             // Strip the leading `- ` and trim each. Empty lines drop.
             text_content(n)
                 .lines()
@@ -306,11 +305,10 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
         })
         .unwrap_or_default();
 
-    // ── Roleplay-only `<scenario>` block (Games app Seam 1, 2026-07-18) ────
     // All fields optional; absent on system cards (Wupi). `setting`/`tone`/
     // `opening_scene` are nested text children; `start_npcs`/`activities` are
     // CDATA bullet lists parsed the same way as `introductions`. A missing
-    // `<scenario>` block leaves every field at its default (None / empty) —
+    // `<scenario>` block leaves every field at its default (None / empty) -
     // `Wupi.sim` parses unchanged.
     let scenario = first_child(root, "scenario");
     let setting = scenario
@@ -370,7 +368,6 @@ fn parse_bullet_list(text: &str) -> Vec<String> {
         .collect::<Vec<_>>()
 }
 
-// ── XML traversal helpers ──────────────────────────────────────────────────
 // roxmltree's API is verbose; these thin wrappers keep the parser readable.
 // CDATA is already merged into `.text()` by roxmltree, so `text_content`
 // returns the full text of a node regardless of how it was wrapped.
@@ -522,7 +519,7 @@ mod tests {
 
     #[test]
     fn fallback_card_renders_empty() {
-        // The fallback suppresses the persona section entirely — empty render.
+        // The fallback suppresses the persona section entirely: empty render.
         let card = fallback();
         assert_eq!(card.render_for_prompt(), "");
         assert!(card.random_intro().is_none());
@@ -536,7 +533,7 @@ mod tests {
 
     #[test]
     fn parse_derives_id_from_name_when_no_metadata() {
-        // Metadata is OPTIONAL — a clean, persona-only card (no <metadata>
+        // Metadata is OPTIONAL: a clean, persona-only card (no <metadata>
         // block) must still parse. The id derives from <identity><name>,
         // lowercased. This is the card format going forward.
         let no_meta = r#"<sim_card>
@@ -554,7 +551,7 @@ mod tests {
     /// A roleplay scenario card (Games app Seam 1). Same strict-XML + CDATA
     /// format as `Wupi.sim`, but with a `<scenario>` block holding setting,
     /// tone, opening_scene, start_npcs, and activities. The system card
-    /// (Wupi) omits this block entirely — those fields stay at their default
+    /// (Wupi) omits this block entirely: those fields stay at their default
     /// (None / empty). The dungeon card below is also the §2L-test seed
     /// (the dungeon half of the cross-topic memory rejection test).
     #[test]

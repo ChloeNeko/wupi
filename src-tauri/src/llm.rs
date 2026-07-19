@@ -1,6 +1,6 @@
 //! LLM backend façade + the process-wide llama.cpp backend singleton.
 //!
-//! The heavy generation logic now lives in [`crate::engine`] — a dedicated
+//! The heavy generation logic now lives in [`crate::engine`]: a dedicated
 //! thread owning a persistent `LlamaContext` with Q8_0 KV cache and a
 //! [`KvBuffer`] that tracks the token IDs resident in the cache so each turn
 //! only prefills the **delta** since the last turn.
@@ -14,7 +14,7 @@
 //!
 //! `LlamaContext<'a>` borrows `&'a LlamaModel`. Storing model + context together
 //! is self-referential and rejected by the borrow checker. Leaking the model to
-//! `&'static LlamaModel` dissolves the borrow — `new_context(&'static self)`
+//! `&'static LlamaModel` dissolves the borrow: `new_context(&'static self)`
 //! yields `LlamaContext<'static>`, which the engine thread can own freely.
 //!
 //! This is the idiomatic choice for a **process-lifetime singleton**: the
@@ -28,7 +28,7 @@
 //! [`shared_backend`] is the single chokepoint for `LlamaBackend::init()`,
 //! which the crate documents as panic-on-double-init. Both the chat loader
 //! (here) and the Memory embedder ([`crate::memory_embedder_llama`]) call it
-//! — the `OnceLock` makes the race safe even if both load concurrently.
+//!: the `OnceLock` makes the race safe even if both load concurrently.
 
 use crate::chat_format::ParsedOutput;
 use crate::chat_format::ModelFamily;
@@ -66,7 +66,7 @@ pub trait GenerationClient: Send + Sync {
 
 /// The process-wide shared llama.cpp backend, leaked to `&'static`.
 ///
-/// `LlamaBackend::init()` must be called exactly once per process — a second
+/// `LlamaBackend::init()` must be called exactly once per process: a second
 /// call returns `Err(BackendAlreadyInitialized)` (the crate guards itself with
 /// an internal `AtomicBool`). The chat engine (`load_blocking`) and the Memory
 /// embedder both need the backend, so this function is the single chokepoint
@@ -77,14 +77,14 @@ pub trait GenerationClient: Send + Sync {
 /// The backend is a ZST (`pub struct LlamaBackend {}`) with no raw fields, so
 /// `&'static LlamaBackend` is `Send + Sync` and safe to share across the
 /// `wupi-engine` and `wupi-embedder` threads. Leaking is correct for a
-/// process-lifetime singleton — it lives until the OS exits, matching the
+/// process-lifetime singleton: it lives until the OS exits, matching the
 /// model leak in `LlamaModelHandle::into_static`.
 static SHARED_BACKEND: OnceLock<&'static LlamaBackend> = OnceLock::new();
 
 pub fn shared_backend() -> &'static LlamaBackend {
     SHARED_BACKEND.get_or_init(|| {
         let backend = LlamaBackend::init()
-            .expect("LlamaBackend::init failed — cannot start llama.cpp");
+            .expect("LlamaBackend::init failed: cannot start llama.cpp");
         Box::leak(Box::new(backend))
     })
 }
@@ -114,7 +114,7 @@ impl GenerationClient for EchoBackend {
     }
 }
 
-/// HTTP API backend — talks to an OpenAI-compatible chat completions endpoint
+/// HTTP API backend: talks to an OpenAI-compatible chat completions endpoint
 /// (Z.AI, NanoGPT, OpenRouter, OpenAI itself, llama.cpp/vLLM/Ollama servers).
 /// Implements the same [`GenerationClient`] trait as [`LlamaCppBackend`] so
 /// `chat_send` can dispatch on `ModelSource` without caring which backend is
@@ -130,7 +130,7 @@ impl GenerationClient for EchoBackend {
 /// **Memory + world_state injection:** the local backend splices these into
 /// the inter-turn region via `render_prompt`. An API only takes a flat
 /// `messages` list, so we fold them into the system message (they're already
-/// XML-tagged blocks — `<retrieved_memory>`, `<world_state>` — and read fine
+/// XML-tagged blocks: `<retrieved_memory>`, `<world_state>` - and read fine
 /// as additional system context). This preserves the retrieval + schema
 /// injection that makes Wupi's memory work, just routed through the system
 /// role instead of a protocol splice.
@@ -181,7 +181,7 @@ impl HttpBackend {
 }
 
 /// A single message in the OpenAI chat request body. The local `ApiMessage`
-/// has a `raw_output` field the API doesn't want — this is the slim wire view.
+/// has a `raw_output` field the API doesn't want: this is the slim wire view.
 /// (Could `#[serde(skip)]` raw_output on ApiMessage instead, but that would
 /// couple the session type to the API wire format; a local view is cleaner.)
 #[derive(serde::Serialize)]
@@ -193,7 +193,7 @@ struct ChatRequestMessage {
 /// The streaming chunk envelope: `{ choices: [ { delta: { content: "..." } } ] }.
 /// `content` is `Option` because the first chunk typically carries only `role`,
 /// and the final chunk carries `finish_reason` instead. Everything else is
-/// ignored — we only want the delta text.
+/// ignored: we only want the delta text.
 #[derive(serde::Deserialize)]
 struct ChatStreamChunk {
     choices: Vec<ChatStreamChoice>,
@@ -256,7 +256,7 @@ impl GenerationClient for HttpBackend {
             // Sampler params mirror the locked local-engine config (AGENTS.md
             // §0 Sampler config): temp 1.0, top_p 0.95, min_p 0.1, top_k 0.
             // min_p + top_k are llama.cpp-native and non-standard for the
-            // OpenAI /chat/completions contract — providers that don't
+            // OpenAI /chat/completions contract: providers that don't
             // recognize them should ignore them, and the few that reject
             // unknown fields will surface a 400 (acceptable per the explicit
             // "full mirror" decision; aligns the API path with local).
@@ -348,7 +348,7 @@ impl GenerationClient for HttpBackend {
     }
 }
 
-/// The loaded model, as loaded from disk. This is an intermediate value — it
+/// The loaded model, as loaded from disk. This is an intermediate value: it
 /// exists only between `load_blocking` and `into_static`, after which the model
 /// is leaked to `&'static` and handed to the engine. The backend is NOT owned
 /// here; it's the process-wide singleton from `shared_backend`.
@@ -375,7 +375,7 @@ impl LlamaModelHandle {
 }
 
 /// The backend façade. Holds a handle to the engine thread (or `None` while
-/// loading). Fully `Send`/`Sync` — no `LlamaContext` or `!Send` type crosses
+/// loading). Fully `Send`/`Sync`: no `LlamaContext` or `!Send` type crosses
 /// out of the engine thread.
 pub struct LlamaCppBackend {
     engine: Arc<std::sync::Mutex<Option<ChatEngine>>>,
@@ -384,7 +384,7 @@ pub struct LlamaCppBackend {
 /// Process-level slot for the leaked `&'static LlamaModel`. Filled once when
 /// the chat backend loads (so the leaked model survives the loader thread
 /// exiting). The schema delta engine reads this to create its OWN isolated
-/// `LlamaContext` on the same model — true context isolation, the same
+/// `LlamaContext` on the same model: true context isolation, the same
 /// pattern as the embedder (§3B). `LlamaModel` is `Sync`, so a `&'static` ref
 /// is safely shareable across the chat, embedder, and schema threads.
 static SHARED_MODEL: std::sync::OnceLock<&'static LlamaModel> = std::sync::OnceLock::new();
@@ -395,7 +395,7 @@ impl LlamaCppBackend {
     /// engine init completes (success or failure).
     ///
     /// `context_size` fixes the `n_ctx` of the persistent context. It cannot
-    /// change without re-spawning the engine — that's a future P concern
+    /// change without re-spawning the engine: that's a future P concern
     /// (settings hot-reload).
     pub fn spawn_load(
         path: PathBuf,
@@ -423,7 +423,7 @@ impl LlamaCppBackend {
 
                 // Stash the model ref in the process-level slot so the schema
                 // delta engine can create an isolated context on the same model.
-                // set() is a no-op if already set (it won't be — first load).
+                // set() is a no-op if already set (it won't be: first load).
                 let _ = SHARED_MODEL.set(model_ref);
 
                 // Spawn the persistent engine with Q8_0 KV cache + delta prefill.
@@ -516,7 +516,7 @@ impl GenerationClient for LlamaCppBackend {
                 .map_err(|e| anyhow::anyhow!(e))?;
             }
 
-            // Await the reply off the async runtime — generation takes seconds
+            // Await the reply off the async runtime: generation takes seconds
             // and we must not block a tokio worker. The engine streams chunks
             // directly to `on_chunk` (the Tauri Channel) while we wait.
             let reply = tokio::task::spawn_blocking(move || reply_rx.recv())
@@ -545,7 +545,7 @@ impl LlamaCppBackend {
     /// its `EngineRuntime` (LlamaContext + the borrowed `&'static LlamaModel`
     /// → VRAM actually freed), then sets the inner slot to `None` so further
     /// `stream()` calls return the "not ready" error instead of posting to a
-    /// dead thread. The synchronous join is load-bearing during model swaps —
+    /// dead thread. The synchronous join is load-bearing during model swaps -
     /// the old fire-and-forget version raced VRAM teardown and OOM'd the next
     /// `load_from_file` (Chloe's 2026-07-18 VRAM-overlap diagnosis). Callers
     /// using this from an async context should wrap it in `spawn_blocking`.

@@ -1,16 +1,19 @@
 // Tauri 2 IPC + event APIs. Imported as ES modules now that script.js is
 // `type="module"` (Vite bundles these; withGlobalTauri is off so the
-// `window.__TAURI__` global is NOT injected — the import is the source of truth).
+// `window.__TAURI__` global is NOT injected: the import is the source of truth).
 import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+// Window API: used ONLY by the boot splash to flip the small floating boot
+// window into fullscreen once the model is ready. Permission
+// `core:window:allow-set-fullscreen` is granted in capabilities/default.json.
+import { getCurrentWindow } from '@tauri-apps/api/window';
 
 const canvas = document.getElementById('aurora-canvas');
 const ctx = canvas.getContext('2d');
 
-// ── Theme palettes ─────────────────────────────────────────────────────────
 // Each color code defines the aurora's sky gradient (top→bottom CSS color
 // stops) and the curtain hue generator (base hue ± range). The animate() loop
-// reads `currentPalette` — switching color codes re-paints on the next frame.
+// reads `currentPalette`: switching color codes re-paints on the next frame.
 //
 // "Vibrant" reproduces the original hardcoded values (the project default).
 // New color codes = add entries here + a matching swatch in styles.css.
@@ -41,7 +44,7 @@ function resize() {
   canvas.height = Math.floor(height * dpr);
   canvas.style.width = width + 'px';
   canvas.style.height = height + 'px';
-  // Reset transform then re-apply — resize() can fire repeatedly, and the
+  // Reset transform then re-apply: resize() can fire repeatedly, and the
   // scale accumulates if not reset first.
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.scale(dpr, dpr);
@@ -62,7 +65,7 @@ window.addEventListener('mousemove', (e) => {
 const starCount = 1000;
 const stars = Array.from({ length: starCount }, () => {
   const isTwinkling = Math.random() > 0.98;
-  // colorIdx indexes STAR_COLORS — drawing buckets stars by color so the
+  // colorIdx indexes STAR_COLORS: drawing buckets stars by color so the
   // context's fillStyle changes ~4×/frame instead of ~1000×.
   const colorIdx = Math.floor(Math.random() * 4);
 
@@ -80,10 +83,9 @@ const stars = Array.from({ length: starCount }, () => {
 
 let time = 0;
 
-// ── Cached sky gradient (perf: was recreated every frame) ─────────────────
 // The gradient depends only on the palette + canvas height, both of which
 // change rarely (theme switch / resize). Recreating it 60×/sec was pure waste
-// — createLinearGradient + 5 addColorStop calls per frame. Rebuilt only when
+//: createLinearGradient + 5 addColorStop calls per frame. Rebuilt only when
 // `currentPalette` or `height` changes.
 let cachedSkyGrad = null;
 let cachedSkyHeight = -1;
@@ -101,17 +103,30 @@ function skyGradient() {
 // Invalidate the cache on resize (height changes → gradient must rebuild).
 window.addEventListener('resize', () => { cachedSkyGrad = null; });
 
-// ── Stars bucketed by color (perf: was 1000 fillStyle/globalAlpha toggles) ─
 // Batching same-color stars into one fillStyle set + grouping alpha into a
 // few bands collapses ~1000 state changes/frame into a handful. The visual
 // difference is imperceptible (alpha quantized to 8 bands of 0.1).
 const STAR_COLORS = ['#ffffff', '#e8f0ff', '#fff4e6', '#ffe6ee'];
 
+// Waking Canvas: aurora ramp 0 → 1 over ~1.6s after the boot gate resolves.
+// `auroraIntensity` multiplies ONLY the curtain alpha inside animate() — sky,
+// stars, blur filter, composite op, and the pause logic are untouched. Starts
+// at 0 so during the splash the canvas reads as pitch-black space + stars
+// only; the curtains bloom in as the ramp climbs. Advanced at the top of
+// animate() so it inherits the existing pause/visibility gating for free
+// (no separate RAF loop, no extra pause wiring).
+let auroraIntensity = 0;
+let auroraRampStart = 0;
+const AURORA_RAMP_MS = 1600;
+
 function animate() {
+  if (auroraRampStart && auroraIntensity < 1) {
+    auroraIntensity = Math.min(1, (performance.now() - auroraRampStart) / AURORA_RAMP_MS);
+  }
   currentX += (mouseX - currentX) * 0.25;
   currentY += (mouseY - currentY) * 0.25;
 
-  // Sky (cached gradient — see skyGradient()).
+  // Sky (cached gradient: see skyGradient()).
   ctx.globalCompositeOperation = 'source-over';
   ctx.globalAlpha = 1.0;
   ctx.fillStyle = skyGradient();
@@ -147,10 +162,10 @@ function animate() {
   }
   ctx.globalAlpha = 1.0;
 
-  // Aurora borealis — 5 layered, independently-hued curtains. Each curtain
+  // Aurora borealis: 5 layered, independently-hued curtains. Each curtain
   // gets its own hue oscillation + its own blurred fill, which is what
   // produces the multi-color ribbon effect. The blur is expensive (a full
-  // Gaussian pass per fill) but it IS the look — the soft bloom is the whole
+  // Gaussian pass per fill) but it IS the look: the soft bloom is the whole
   // point. Kept as-is per Chloe: do NOT collapse into one fill.
   // The perf gains live elsewhere (visibility pause, cached sky, star
   // batching) so the aurora can stay visually rich.
@@ -189,13 +204,15 @@ function animate() {
 
     const hue = currentPalette.hueBase + Math.sin(time * 1.0 + i) * currentPalette.hueRange;
 
-    ctx.fillStyle = `hsla(${hue}, 100%, 65%, 0.18)`;
+    // Waking Canvas: auroraIntensity gates the curtain alpha so the borealis
+    // blooms in from invisible (boot) to full (0.18 = the locked aesthetic).
+    ctx.fillStyle = `hsla(${hue}, 100%, 65%, ${0.18 * auroraIntensity})`;
     ctx.fill();
   }
 
   ctx.filter = 'none';
   time += 0.0025;
-  // Don't schedule the next frame while paused — see `paused` + the
+  // Don't schedule the next frame while paused: see `paused` + the
   // visibility/focus handlers below. The canvas RAF is the app's dominant
   // idle CPU/GPU cost; pausing it is what makes Sleep "barely noticeable"
   // AND what stops the lag when the window is covered/minimized.
@@ -207,7 +224,7 @@ function animate() {
 //   1. `canvas-pause` event from Rust (system_menu power_sleep).
 //   2. `document.visibilitychange` → hidden (alt-tab, minimize, another app
 //      fully covering the window). The standard browser RAF throttle isn't
-//      enough — WebView2 still fires RAF in some hidden states, and even a
+//      enough: WebView2 still fires RAF in some hidden states, and even a
 //      throttled RAF re-runs the full animate() body.
 //   3. `window.blur` (focus lost to another app) as a belt-and-suspenders
 //      fallback when visibilitychange doesn't fire (e.g. another window
@@ -225,7 +242,7 @@ listen('canvas-pause', () => { paused = true; }).catch(() => {});
 listen('canvas-resume', () => { startLoop(); }).catch(() => {});
 
 // Pause when the page is hidden (alt-tab / minimize / tab switch). This is
-// THE fix for "lag when another app covers the window" — without it the RAF
+// THE fix for "lag when another app covers the window": without it the RAF
 // keeps running the full animate() body at full speed even when nothing's
 // visible. Resume on visible.
 document.addEventListener('visibilitychange', () => {
@@ -247,11 +264,9 @@ window.addEventListener('focus', () => {
 
 animate();
 
-// ════════════════════════════════════════════════════════════════════════
-// "WUPI OS" title — live AI-status indicator
-// ════════════════════════════════════════════════════════════════════════
+// "WUPI OS" title: live AI-status indicator
 // The title reflects the live state of the MAIN chat model (local 12B OR the
-// connected API model — NOT Agent.gguf, which runs on its own thread and
+// connected API model: NOT Agent.gguf, which runs on its own thread and
 // never drives chat_send). Three states:
 //   - 'idle'    : connected, not generating → steady medium white glow
 //   - 'offline' : no AI connected (boot pre-load, ONLINE w/ no profile,
@@ -261,11 +276,11 @@ animate();
 //                 (CSS can't do random timing).
 //
 // State inputs:
-//   1. The `model-status` Tauri event — Rust already emits ready/error/
+//   1. The `model-status` Tauri event: Rust already emits ready/error/
 //      no_model at boot + on api_disconnect reload; this is the offline/idle
 //      authority. We just never listened before.
-//   2. The chat IIFE's setGenerating() flag — bridges to 'typing'/'idle'.
-//   3. The AI panel's mode swaps — calls 'offline' while a swap is pending.
+//   2. The chat IIFE's setGenerating() flag: bridges to 'typing'/'idle'.
+//   3. The AI panel's mode swaps: calls 'offline' while a swap is pending.
 const osTitleEl = document.querySelector('.os-title');
 let titleState = 'idle';      // 'idle' | 'offline' | 'typing'
 let titleFlickerTimer = null;  // the setTimeout handle for the typing pulse
@@ -278,14 +293,14 @@ function applyTitleClass() {
 }
 
 // The random "typing" pulse: toggles .title-flicker on a jittered timer so
-// the glow bursts feel organic (like someone actually typing). ON 80–200ms,
-// OFF 120–500ms, re-rolled each cycle. Stops when state leaves 'typing'.
+// the glow bursts feel organic (like someone actually typing). ON 80-200ms,
+// OFF 120-500ms, re-rolled each cycle. Stops when state leaves 'typing'.
 function scheduleNextFlicker() {
   if (titleState !== 'typing' || !osTitleEl) return;
   const isOn = osTitleEl.classList.contains('title-flicker');
   const delay = isOn
-    ? 80 + Math.random() * 120   // ON duration: 80–200ms
-    : 120 + Math.random() * 380; // OFF duration: 120–500ms
+    ? 80 + Math.random() * 120   // ON duration: 80-200ms
+    : 120 + Math.random() * 380; // OFF duration: 120-500ms
   titleFlickerTimer = setTimeout(() => {
     if (titleState !== 'typing') return;
     osTitleEl.classList.toggle('title-flicker');
@@ -311,7 +326,7 @@ function setTitleState(state) {
 }
 
 // Subscribe to Rust's model-status events (already emitted, previously
-// unobserved). Boot starts at 'idle' (steady white) per Chloe's call — the
+// unobserved). Boot starts at 'idle' (steady white) per Chloe's call: the
 // pulse only fires for actual typing, and the red alarm only for confirmed
 // offline/error states. The first model-status event then corrects to the
 // real state.
@@ -330,8 +345,85 @@ function setTitleState(state) {
   }
 })();
 
+// ─── Boot splash → fullscreen "Waking Canvas" transition ───────────────────
+// Gate: chat `model-status: ready` (the 12B load — Rust's single source of
+// truth, Rust is untouched) AND a 1.2s minimum dwell timer. Both must resolve
+// before we transition. The dwell prevents an abrupt strobe on fast hardware;
+// on slow hardware the model load dominates and we transition immediately on
+// ready. The existing model-status listener above keeps its title-indicator
+// job; this is a SEPARATE listener so the title's `typing` no-op guard can't
+// swallow the wake signal.
+//
+// Sequence on resolve: start aurora ramp → setFullscreen(true) → remove
+// body.booting (CSS slides top-bar down + dock up) → fade splash → remove.
+(function setupBootSplash() {
+  const MIN_DWELL_MS = 1200;
+  let modelReady = false;
+  let dwellDone = false;
+  let transitioned = false;
+
+  // <body> already carries .booting from index.html; this is belt-and-suspenders
+  // for the dev-preview case where the HTML might not have it.
+  document.body.classList.add('booting');
+
+  function maybeTransition() {
+    if (transitioned || !(modelReady && dwellDone)) return;
+    transitioned = true;
+    wakeCanvas();
+  }
+
+  // Min-dwell timer: guarantees the splash is visible long enough to register
+  // even if the model loads instantly.
+  setTimeout(() => { dwellDone = true; maybeTransition(); }, MIN_DWELL_MS);
+
+  // Primary gate: the chat 12B model finished loading.
+  listen('model-status', (e) => {
+    if (e?.payload?.status === 'ready') {
+      modelReady = true;
+      maybeTransition();
+    }
+  }).catch(() => {});
+  // Safety net: no_model (echo mode) / error also resolve the gate so the user
+  // is never trapped behind the splash if the model path fails. The title
+  // indicator still shows 'offline' via the listener above.
+  listen('model-status', (e) => {
+    const s = e?.payload?.status;
+    if (s === 'no_model' || s === 'error') {
+      modelReady = true;
+      maybeTransition();
+    }
+  }).catch(() => {});
+
+  async function wakeCanvas() {
+    // 1. Arm the aurora ramp. animate() advances auroraIntensity 0 → 1 over
+    //    AURORA_RAMP_MS; until then curtains stay invisible (pitch-black space
+    //    + stars only), which is the spec'd "Waking Canvas" opening state.
+    auroraRampStart = performance.now();
+    // 2. Flip the floating 500×500 boot window into fullscreen. The window
+    //    resize fires the existing 'resize' listener, which rebuilds canvas
+    //    dims and invalidates the cached sky gradient — no special handling
+    //    needed here.
+    try {
+      await getCurrentWindow().setFullscreen(true);
+    } catch (err) {
+      console.warn('[Wupi] setFullscreen failed; continuing in windowed mode', err);
+    }
+    // 3. Drop body.booting → CSS slides the top-bar down (0.2s delay) and the
+    //    dock up (0.35s delay), staged after the aurora ramp begins.
+    document.body.classList.remove('booting');
+    // 4. Fade the splash out, then remove it from the DOM. transitionend +
+    //    {once:true} guarantees one-shot cleanup; pointer-events:none on
+    //    .fade-out means even a stalled transition can't block the UI.
+    const splash = document.getElementById('boot-splash');
+    if (splash) {
+      splash.classList.add('fade-out');
+      splash.addEventListener('transitionend', () => splash.remove(), { once: true });
+    }
+  }
+})();
+
 // NOTE: this file is loaded as type="module", which defers execution until
-// after the DOM is parsed — so DOMContentLoaded has ALREADY fired by the time
+// after the DOM is parsed: so DOMContentLoaded has ALREADY fired by the time
 // we run. Do NOT wrap the wiring in a DOMContentLoaded listener (it would
 // never execute). The elements below all exist at module-eval time.
 const pawBtn = document.getElementById('pawBtn');
@@ -379,7 +471,6 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   bluetoothBtn.addEventListener('click', (e) => toggleDropdown(bluetoothDropdownMenu, e));
   audioBtn.addEventListener('click', (e) => toggleDropdown(audioDropdownMenu, e));
 
-  // ── Paw menu: power actions (Shutdown / Restart / Sleep) ────────────────
   // The three power commands exposed by system_menu.rs. Each closes the
   // dropdown first so it doesn't flash on the next launch.
   const closePawMenu = () => dropdownMenu.classList.remove('show');
@@ -397,7 +488,6 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     invoke('power_sleep_cmd');
   });
 
-  // ── Theme cascade (paw → theme → color code) ────────────────────────────
   // Three aligned panels. Clicking Theme opens panel 2; clicking a theme opens
   // panel 3 (color codes); clicking a color code persists + applies live. The
   // document-click dismiss handler (below) closes all three on outside click.
@@ -466,7 +556,6 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   const wifiToggle = document.querySelector('.wifi-toggle-row');
   const wifiIcon = wifiBtn.querySelector('.status-icon');
 
-  // ── Wi-Fi dropdown: real current network + scan list ────────────────────
   function refreshWifi() {
     // Current connection.
     invoke('wifi_get_current')
@@ -501,7 +590,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
           const btn = document.createElement('button');
           btn.className = 'dropdown-item wifi-network';
           const lock = n.secure ? '🔒 ' : '';
-          // No signal % — it was noisy and the same network appeared multiple
+          // No signal %: it was noisy and the same network appeared multiple
           // times at different strengths. SSID-only now (backend dedups).
           btn.innerHTML = `<span class="status-dot"></span>${lock}${n.ssid}`;
           btn.addEventListener('click', (ev) => {
@@ -538,7 +627,6 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   const btToggle = document.querySelector('.bt-toggle-row');
   const btIcon = bluetoothBtn.querySelector('.status-icon');
 
-  // ── Bluetooth dropdown: real radio state + device list ──────────────────
   function refreshBluetooth() {
     invoke('bluetooth_get_state')
       .then((s) => {
@@ -602,7 +690,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     }, 0);
   });
 
-  // "Add Device" — discover in-range unpaired BT devices and list them under
+  // "Add Device": discover in-range unpaired BT devices and list them under
   // the button. Clicking one calls bluetooth_pair (Windows shows the native
   // PIN/confirmation UI for devices that need it).
   document.getElementById('btAddBtn')?.addEventListener('click', (e) => {
@@ -687,7 +775,6 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     }
   }
 
-  // ── Audio dropdown: live volume + output list ───────────────────────────
   // Debounced volume set so dragging the slider doesn't spam IPC calls.
   let volTimer = null;
   volumeSlider.addEventListener('input', (e) => {
@@ -702,9 +789,8 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     }, 60);
   });
 
-  // ── Audio dropdown: live volume + output list ───────────────────────────
   // Split into two pieces to kill the flicker: the volume/mute is polled every
-  // 1s (slider/percent/icon only — no DOM rebuild), and the output-device list
+  // 1s (slider/percent/icon only: no DOM rebuild), and the output-device list
   // is built ONCE when the dropdown opens (it almost never changes mid-session).
   // The previous version rebuilt the whole list each tick → flicker.
 
@@ -712,7 +798,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     invoke('audio_get_state')
       .then((s) => {
         if (!s) return;
-        // Only touch the slider/percent/icon — never rebuild the device list.
+        // Only touch the slider/percent/icon: never rebuild the device list.
         volumeSlider.value = s.volume;
         volumePercent.textContent = `${s.volume}%`;
         setAudioIcon(s.muted ? 0 : s.volume);
@@ -823,15 +909,13 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   updateClocks();
   setInterval(updateClocks, 1000);
 
-  // ════════════════════════════════════════════════════════════════════════
   // APP WINDOW MANAGER
-  // ════════════════════════════════════════════════════════════════════════
   // The surfaces (Chat, Profile Editor, Codex, Docks) are DOM overlays in
   // the ONE Tauri window. Background rules (per Chloe's spec):
   //   - WUPI Chat (chat): the ONLY window that pauses the canvas (stars +
   //     aurora OFF). Its own background is ~80% opaque so the paused backdrop
   //     doesn't show through. Closing it resumes the canvas.
-  //   - Everything else (Codex, Profile, Docks home): canvas keeps running —
+  //   - Everything else (Codex, Profile, Docks home): canvas keeps running -
   //     stars/aurora animate behind the translucent glass.
   //
   // The previous version painted a frozen gradient into the framebuffer while
@@ -843,7 +927,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
 
   const openWindows = new Set();
   let zCounter = 1000;
-  // No window pauses the canvas anymore — the background stays active behind
+  // No window pauses the canvas anymore: the background stays active behind
   // every surface (Chat is now translucent enough that stars show through).
   // Kept as a hook in case a future surface wants to freeze the background.
   function syncCanvasForWindows() {
@@ -854,7 +938,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     const el = document.getElementById(id);
     if (!el) return;
     if (openWindows.has(id)) {
-      // Already open — just raise it to the top.
+      // Already open: just raise it to the top.
       el.style.zIndex = ++zCounter;
       return;
     }
@@ -877,10 +961,17 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     el.classList.remove('show');
     el.setAttribute('aria-hidden', 'true');
     syncCanvasForWindows();
+    // Fire an onClose hook if the surface registered one (e.g. Chat tears
+    // down an active ink-reveal timer so it doesn't tick against a detached
+    // node).
+    const closeHook = windowCloseHooks.get(id);
+    if (closeHook) closeHook();
   }
 
   // Surfaces register an async onOpen hook (load data when first shown).
   const windowOpenHooks = new Map();
+  // Surfaces register an onClose hook (tear down timers, etc.).
+  const windowCloseHooks = new Map();
 
   // ✕ close buttons (data-close="winId").
   document.querySelectorAll('.app-window-close[data-close]').forEach((btn) => {
@@ -914,9 +1005,8 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     win.addEventListener('click', (e) => e.stopPropagation());
   });
 
-  // ── Draggable windows (Profile, Codex) ───────────────────────────────────
   // Header is the drag handle. The window is absolutely positioned; dragging
-  // updates `left`/`top`. Only windows with `.draggable` get this — Chat is
+  // updates `left`/`top`. Only windows with `.draggable` get this: Chat is
   // fixed (immovable per spec), Docks-home is full-screen (no drag).
   function makeDraggable(winEl) {
     const handle = winEl.querySelector('.app-window-header');
@@ -962,10 +1052,9 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   }
   document.querySelectorAll('.app-window.draggable').forEach(makeDraggable);
 
-  // ── Dock wiring ──────────────────────────────────────────────────────────
   // Click an open app's dock item again → closes it (toggle behavior). The
   // quick-access dock order is fixed: API → Chat → Profile → Codex (NOT
-  // alphabetical — that's the Docks home grid). Apps (Docks launcher) is
+  // alphabetical: that's the Docks home grid). Apps (Docks launcher) is
   // special: it closes any open surface windows then shows the home grid.
   function dockToggle(id) {
     if (openWindows.has(id)) closeWindow(id);
@@ -991,7 +1080,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   document.getElementById('dockApps')?.addEventListener('click', (e) => {
     e.stopPropagation();
     // Docks = "home": close any open surface windows and show the launcher
-    // grid. (apps itself is the full-screen home overlay.) Not a toggle —
+    // grid. (apps itself is the full-screen home overlay.) Not a toggle -
     // clicking Docks while home is open is a no-op (it's already home).
     if (openWindows.has('apps')) return;
     closeWindow('api');
@@ -1011,9 +1100,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     });
   });
 
-  // ════════════════════════════════════════════════════════════════════════
   // PROFILE EDITOR
-  // ════════════════════════════════════════════════════════════════════════
   (function profileEditor() {
     const nameEl = document.getElementById('profName');
     const descEl = document.getElementById('profDescription');
@@ -1026,7 +1113,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       statusEl.className = 'profile-status' + (kind ? ' ' + kind : '');
     }
 
-    // Load fresh every time the window opens — cheap, and guarantees the editor
+    // Load fresh every time the window opens: cheap, and guarantees the editor
     // reflects disk state (someone could have hand-edited Operator.xml).
     windowOpenHooks.set('profile', () => {
       setStatus('Loading…');
@@ -1050,22 +1137,20 @@ const dropdownMenu = document.getElementById('dropdownMenu');
         name: nameEl.value,
         description: descEl.value,
       })
-        .then(() => setStatus('Saved — applies next message', 'ok'))
+        .then(() => setStatus('Saved: applies next message', 'ok'))
         .catch((err) => setStatus('Save failed: ' + err, 'err'))
         .finally(() => { saveBtn.disabled = false; });
     });
   })();
 
-  // ════════════════════════════════════════════════════════════════════════
-  // AI — Connection Profile panel (LOCAL | ONLINE mode selector + profile CRUD)
-  // ════════════════════════════════════════════════════════════════════════
+  // AI: Connection Profile panel (LOCAL | ONLINE mode selector + profile CRUD)
   // Source of truth = api_config.json (loaded at boot into AppState). The
   // panel shows two large mode boxes: LOCAL (the single WUPI 12B bubble) or
   // ONLINE (saved endpoint profiles + an editor). Selecting ONLINE triggers
   // the model swap (12B unloads, Agent.gguf spins up for schema/memory);
   // selecting LOCAL reverts it. Temperature is fixed at 1.0 (no UI field).
   // The model field is a dropdown populated from the endpoint's /models
-  // list after a successful connect — never free text.
+  // list after a successful connect: never free text.
   (function apiPanel() {
     const root = document.getElementById('api');
     if (!root) return;
@@ -1116,7 +1201,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     // Render the profile dropdown from the cached config. Sorted alphabetically
     // by name. Active profile is flagged with a ● prefix. The "Create a New
     // Profile" placeholder option is ONLY shown when there are zero saved
-    // profiles — once any exist it disappears (the + button is the create
+    // profiles: once any exist it disappears (the + button is the create
     // affordance then). Selecting the placeholder focuses the editor.
     function renderProfileSelect(config) {
       lastConfig = config;
@@ -1124,12 +1209,12 @@ const dropdownMenu = document.getElementById('dropdownMenu');
         (a.name || a.id).localeCompare(b.name || b.id)
       );
       // Capture the selection BEFORE we rebuild the DOM. After innerHTML
-      // rebuilds the options, the .value reverts to "" — so we must remember
+      // rebuilds the options, the .value reverts to "": so we must remember
       // it now and re-apply it after.
       const prevValue = profileSelect.value;
 
       if (profiles.length === 0) {
-        // No saved profiles yet — the dropdown IS the "create" affordance.
+        // No saved profiles yet: the dropdown IS the "create" affordance.
         profileSelect.innerHTML = '<option value="">Create a New Profile</option>';
         profileSelect.disabled = false;
         editProfileBtn.disabled = true;
@@ -1137,7 +1222,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
         return;
       }
       profileSelect.disabled = false;
-      // Once profiles exist, drop the "Create a New Profile" placeholder —
+      // Once profiles exist, drop the "Create a New Profile" placeholder -
       // the + button below handles creation.
       profileSelect.innerHTML = profiles.map((p) => {
         const isActive = p.id === config.active_profile_id;
@@ -1158,12 +1243,12 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     }
 
     // Update the online bubble. Three states:
-    //   - connected (runtime on API): magenta glow + "Name — model"
+    //   - connected (runtime on API): magenta glow + "Name: model"
     //   - selection pending (profile+model picked, not yet Connect'd): subdued
     //     preview of what Connect will activate, no glow
     //   - nothing picked: muted "No profile connected"
     function renderOnlineBubble() {
-      // Connected — runtime actually on API with an active profile.
+      // Connected: runtime actually on API with an active profile.
       if (runtimeSource === 'api' && activeProfileId) {
         const p = findProfile(activeProfileId);
         if (p) {
@@ -1171,12 +1256,12 @@ const dropdownMenu = document.getElementById('dropdownMenu');
           onlineBubble.classList.remove('pending');
           onlineBubble.innerHTML =
             `<span class="ai-online-bubble-text">${escapeHtml(p.name || p.id)}</span>` +
-            `<span class="ai-online-bubble-sep">—</span>` +
+            `<span class="ai-online-bubble-sep">-</span>` +
             `<span class="ai-online-bubble-model">${escapeHtml(p.model || '?')}</span>`;
           return;
         }
       }
-      // Selection pending — profile + model both picked in the dropdowns but
+      // Selection pending: profile + model both picked in the dropdowns but
       // not yet connected. Show a preview so the user sees what they're about
       // to activate. Uses the "pending" style (no glow, lighter text).
       const pickedProfileId = profileSelect?.value;
@@ -1188,7 +1273,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
           onlineBubble.classList.add('pending');
           onlineBubble.innerHTML =
             `<span class="ai-online-bubble-text">${escapeHtml(p.name || p.id)}</span>` +
-            `<span class="ai-online-bubble-sep">—</span>` +
+            `<span class="ai-online-bubble-sep">-</span>` +
             `<span class="ai-online-bubble-model">${escapeHtml(pickedModel)}</span>`;
           return;
         }
@@ -1201,18 +1286,18 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     // Fetch /models for a profile + populate the model dropdown. Cached per
     // profile so switching back doesn't refetch. Default-selects the saved
     // model if present in the list, else the first alphabetically. The list
-    // is sorted alphabetically (case-insensitive) — NanoGPT's /models returns
+    // is sorted alphabetically (case-insensitive): NanoGPT's /models returns
     // 100+ models in provider-defined order (a chaotic mix of org/name), so
     // alphabetical is the only sane default. There's no membership/free-vs-
     // paid field in the OpenAI-standard /models response, so we can't group
-    // by tier without custom metadata — just alphabetize for now.
+    // by tier without custom metadata: just alphabetize for now.
     async function populateModelDropdown(profile) {
       if (!profile) {
         modelSelect.innerHTML = '<option value="">Pick a profile to load models…</option>';
         modelSelect.disabled = true;
         return;
       }
-      // Cache hit. But HONOR the user's current in-UI selection — if the
+      // Cache hit. But HONOR the user's current in-UI selection: if the
       // dropdown already has a value and it's still in the cached list,
       // keep it selected. Otherwise a refresh() after Connect would fling
       // the selection back to the cache's stale `selected` field.
@@ -1284,7 +1369,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
         renderProfileSelect(config);
         renderOnlineBubble();
         // Seed the mode from the backend ONCE on first refresh. After that
-        // the mode is the user's click — refresh() must never clobber it.
+        // the mode is the user's click: refresh() must never clobber it.
         if (!modeInitialized) {
           currentMode = runtimeSource === 'api' ? 'online' : 'local';
           modeInitialized = true;
@@ -1304,17 +1389,16 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       }
     }
 
-    // ── TAB CLICKS = RUNTIME SWITCHES (per Chloe's design) ──
     // Clicking LOCAL: disconnect API (if on API), reload the 12B. Clicking
     // ONLINE: reconnect the last-used API profile + model. No separate
-    // disconnect affordance — you pick one or the other.
+    // disconnect affordance: you pick one or the other.
     modeLocalBtn?.addEventListener('click', async () => {
       if (currentMode === 'local' && runtimeSource === 'local') return;
       currentMode = 'local';
       applyMode();
       if (runtimeSource === 'api') {
         setTitleState('offline'); // red while the 12B reloads
-        setStatus('Disconnecting API — reloading WUPI 12B…', '');
+        setStatus('Disconnecting API: reloading WUPI 12B…', '');
         try {
           await invoke('api_disconnect');
           setStatus('Back on local WUPI 12B.', 'ok');
@@ -1328,7 +1412,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     modeOnlineBtn?.addEventListener('click', async () => {
       currentMode = 'online';
       applyMode();
-      // If a profile is already connected, nothing to do — just show it.
+      // If a profile is already connected, nothing to do: just show it.
       if (runtimeSource === 'api' && activeProfileId) return;
       // Reconnect the last-used profile if one exists.
       if (activeProfileId) {
@@ -1338,24 +1422,23 @@ const dropdownMenu = document.getElementById('dropdownMenu');
           await invoke('api_connect', { profileId: activeProfileId });
           setStatus('Connected.', 'ok');
         } catch (err) {
-          setStatus('Connect failed: ' + err + ' — still on local.', 'err');
+          setStatus('Connect failed: ' + err + ': still on local.', 'err');
           setTitleState('idle');
         }
         await refresh();
       } else {
-        // No active profile — ONLINE view is up, user picks one + hits Connect.
+        // No active profile: ONLINE view is up, user picks one + hits Connect.
         setStatus('');
       }
     });
 
-    // ── Profile dropdown: on change, load its models into the second dropdown ──
-    // When the dropdown has no real selection (zero-profile state — the
+    // When the dropdown has no real selection (zero-profile state: the
     // "Create a New Profile" placeholder is selected), focus the editor so
     // the user can start typing their first profile.
     profileSelect?.addEventListener('change', async () => {
       const selectedId = profileSelect.value;
       if (!selectedId) {
-        // "Create a New Profile" (or no selection) — prep the editor.
+        // "Create a New Profile" (or no selection): prep the editor.
         clearEditor();
         nameEl?.focus();
         // Edit/trash aren't meaningful without a real profile.
@@ -1369,15 +1452,14 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       await populateModelDropdown(p);
       updateConnectEnabled();
       renderOnlineBubble();
-      // Real profile selected — enable edit/trash.
+      // Real profile selected: enable edit/trash.
       editProfileBtn.disabled = false;
       deleteProfileBtn.disabled = false;
     });
 
-    // ── Model dropdown: changing the selection updates Connect + the preview ──
     // Also writes the new pick back into the cache so a subsequent refresh()
     // (which hits the cache) honors it instead of flinging back to the old
-    // default — the cause of the "dropdown flings to first after Connect" bug.
+    // default: the cause of the "dropdown flings to first after Connect" bug.
     modelSelect?.addEventListener('change', () => {
       const pickedProfileId = profileSelect.value;
       const pickedModel = modelSelect.value;
@@ -1391,12 +1473,11 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       renderOnlineBubble();
     });
 
-    // ── Connect button: the single runtime swap action for ONLINE ──
     connectBtn?.addEventListener('click', async () => {
       const profileId = profileSelect.value;
       const modelId = modelSelect.value;
       if (!profileId || !modelId) return;
-      // Persist the chosen model into the profile before connecting — the
+      // Persist the chosen model into the profile before connecting: the
       // backend's api_connect validates non-empty model.
       const p = findProfile(profileId);
       if (p && p.model !== modelId) {
@@ -1413,15 +1494,14 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       connectBtn.disabled = true;
       try {
         await invoke('api_connect', { profileId });
-        setStatus('Connected — chat via API now.', 'ok');
+        setStatus('Connected: chat via API now.', 'ok');
       } catch (err) {
-        setStatus('Connect failed: ' + err + ' — still on local.', 'err');
+        setStatus('Connect failed: ' + err + ': still on local.', 'err');
         setTitleState('idle');
       }
       await refresh();
     });
 
-    // ── Profile editor (add new / edit existing) ──
     function clearEditor() {
       editingId = null;
       nameEl.value = '';
@@ -1441,9 +1521,8 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       nameEl.focus();
     }
 
-    // ── The + button: commit the editor (add new OR overwrite if editing) ──
     // Errors via the status line if any field is empty. Does NOT auto-connect
-    // — just lands the profile in the dropdown and auto-selects it.
+    //: just lands the profile in the dropdown and auto-selects it.
     addBtn?.addEventListener('click', async () => {
       const name = nameEl.value.trim();
       if (!name) { setStatus('Name is required.', 'err'); nameEl.focus(); return; }
@@ -1482,14 +1561,12 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       }
     });
 
-    // ── Edit tool: load the selected profile into the editor ──
     editProfileBtn?.addEventListener('click', () => {
       const p = findProfile(profileSelect.value);
       if (!p) { setStatus('Pick a profile to edit first.', 'err'); return; }
       loadEditor(p);
     });
 
-    // ── Trash tool: delete the selected profile ──
     deleteProfileBtn?.addEventListener('click', async () => {
       const id = profileSelect.value;
       const p = findProfile(id);
@@ -1507,8 +1584,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       }
     });
 
-    // ── LOCAL Connect button ──
-    // LOCAL is always "connected" to the 12B by design — clicking Connect
+    // LOCAL is always "connected" to the 12B by design: clicking Connect
     // here is visual parity with ONLINE. If the runtime is somehow on API
     // (user connected then peeked at LOCAL), this triggers the disconnect +
     // 12B reload. Otherwise it's a no-op confirmation.
@@ -1516,7 +1592,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       if (runtimeSource === 'api') {
         setTitleState('offline');
         localConnectBtn.disabled = true;
-        setStatus('Disconnecting API — reloading WUPI 12B…', '');
+        setStatus('Disconnecting API: reloading WUPI 12B…', '');
         try {
           await invoke('api_disconnect');
           setStatus('Back on local WUPI 12B.', 'ok');
@@ -1533,13 +1609,11 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     windowOpenHooks.set('api', () => { refresh(); });
   })();
 
-  // ════════════════════════════════════════════════════════════════════════
-  // THE CODEX — authored lore library (NOT a memory browser)
-  // ════════════════════════════════════════════════════════════════════════
-  // Codex is a library of authored reference "books" — world lore, TV-show
+  // THE CODEX: authored lore library (NOT a memory browser)
+  // Codex is a library of authored reference "books": world lore, TV-show
   // facts, worldbuilding. Source of truth = .md files in codex/ (re-seeded to
   // the retrieval index at boot + after each edit). It has NOTHING to do with
-  // chat history or Wupi's persona — just the lore you author.
+  // chat history or Wupi's persona: just the lore you author.
   //
   // UI: two panes. Left = searchable list of entries (title + tags). Right =
   // reader for the selected entry, with an Edit mode and a New-entry mode.
@@ -1563,7 +1637,6 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       }[c]));
     }
 
-    // ── List rendering ───────────────────────────────────────────────────
     function renderList(filter) {
       const q = (filter || '').trim().toLowerCase();
       const files = q
@@ -1597,7 +1670,6 @@ const dropdownMenu = document.getElementById('dropdownMenu');
         });
     }
 
-    // ── Reader pane ──────────────────────────────────────────────────────
     function showReader(file) {
       readerEl.innerHTML = `
         <div class="codex-reader-head">
@@ -1619,7 +1691,6 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       readerEl.innerHTML = `<div class="codex-reader-empty">${escapeHtml(msg || 'Select an entry to read, or add new lore.')}</div>`;
     }
 
-    // ── Editor pane (edit existing or create new) ───────────────────────
     function showEditor(file) {
       const isNew = !file;
       readerEl.innerHTML = `
@@ -1675,7 +1746,6 @@ const dropdownMenu = document.getElementById('dropdownMenu');
         .catch((err) => setStatus('Delete failed: ' + err, 'err'));
     }
 
-    // ── Wiring ───────────────────────────────────────────────────────────
     // Clicking a list row opens it in the reader.
     listEl.addEventListener('click', (e) => {
       const row = e.target.closest('.codex-row[data-filename]');
@@ -1694,9 +1764,107 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     windowOpenHooks.set('codex', () => { loadAll(); showEmptyReader(); });
   })();
 
-  // ════════════════════════════════════════════════════════════════════════
-  // WUPI CHAT — full streaming chat surface
-  // ════════════════════════════════════════════════════════════════════════
+  // Ink reveal: paces streamed text to a smooth 10 chars/sec on the DOM,
+  // independent of how fast the backend generates. The backend finishes in
+  // ~1-2s for a typical turn but the user reads at ~10 cps, so the UI drips
+  // the text out of a buffer on a timer. The blinking caret (`.streaming`
+  // class on the bubble) stays on until the reveal catches up to the full
+  // target. Shared by the chat path now and the game/narrator path when it
+  // ships; the helper is agnostic to the source of the text.
+  const REVEAL_TICK_MS = 100;       // 10 ticks/sec
+  const REVEAL_CHARS_PER_TICK = 1;  // 10 chars/sec total
+
+  // The currently-active reveal, if any. Module-level so a new send() can
+  // flush a still-draining previous reveal before starting its own.
+  let activeReveal = null;
+
+  // Start an ink reveal on `bubble`. Returns a handle with push/flush/destroy.
+  // The caller pushes the full accumulated text on every chunk; the helper
+  // advances a visible cursor on a timer and writes `target.slice(0, shown)`
+  // to `bubble.textContent`.
+  //
+  // `onTick` (optional) fires after every visible write (e.g. to scroll).
+  // `onComplete` (optional) fires once when the caller signals the target is
+  // final (push with isFinal=true) AND the reveal has shown all of it. This
+  // is the hook for finalizing the bubble (removing the caret, showing the
+  // reasoning panel). If the reveal already caught up when the final push
+  // arrives, onComplete fires synchronously; otherwise it fires from the
+  // tick loop when shown reaches target.length.
+  function startInkReveal(bubble, onTick, onComplete) {
+    let target = '';
+    let shown = 0;
+    let timer = null;
+    let finalArmed = false;   // caller pushed isFinal=true
+    let completed = false;    // onComplete has fired
+    const clearActive = () => {
+      if (activeReveal === api) activeReveal = null;
+    };
+    const stop = () => {
+      if (timer !== null) { clearInterval(timer); timer = null; }
+    };
+    const write = () => {
+      bubble.textContent = target.slice(0, shown);
+      if (typeof onTick === 'function') onTick();
+    };
+    const maybeComplete = () => {
+      if (finalArmed && !completed && shown >= target.length) {
+        completed = true;
+        stop();
+        clearActive();
+        if (typeof onComplete === 'function') onComplete();
+      }
+    };
+    const tick = () => {
+      if (shown < target.length) {
+        shown = Math.min(shown + REVEAL_CHARS_PER_TICK, target.length);
+        write();
+      } else {
+        // Nothing left to drip. Stop the timer; restart on next push.
+        stop();
+      }
+      maybeComplete();
+    };
+    const api = {
+      // Set the full target text. isFinal=true marks it as the last push
+      // (backend sent `done`): onComplete fires when the reveal catches up.
+      // A new push always re-arms completion (a previously-completed reveal
+      // can fire onComplete again if more final text arrives, e.g. the user
+      // clicked stop mid-reveal, the reveal flushed, then `done` arrived).
+      push(fullText, isFinal) {
+        target = fullText;
+        if (isFinal) {
+          finalArmed = true;
+          completed = false;
+        }
+        if (shown < target.length && timer === null) {
+          timer = setInterval(tick, REVEAL_TICK_MS);
+        }
+        maybeComplete();
+      },
+      // Reveal everything immediately and stop. Used when the caller wants
+      // to skip ahead (user clicked stop, or a new send preempts this one).
+      flush(fullText) {
+        if (fullText != null) target = fullText;
+        shown = target.length;
+        stop();
+        write();
+        maybeComplete();
+        // flush is not necessarily "final" — if the caller wants onComplete
+        // to fire, push(finalText, true) before flushing, or the caller's
+        // own done-handling runs after flush returns.
+      },
+      // Tear down without a final write or completion fire (used on error:
+      // the bubble is removed anyway).
+      destroy() {
+        stop();
+        clearActive();
+      },
+    };
+    activeReveal = api;
+    return api;
+  }
+
+  // WUPI CHAT: full streaming chat surface
   (function wupiChat() {
     const msgsEl = document.getElementById('chatMessages');
     const inputEl = document.getElementById('chatInput');
@@ -1704,7 +1872,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     const stopBtn = document.getElementById('chatStopBtn');
     if (!msgsEl) return;
 
-    // Tauri v2 Channel for streaming — imported statically at the top of the
+    // Tauri v2 Channel for streaming: imported statically at the top of the
     // module, so it's always available (no race with a dynamic import).
     let generating = false;
     let emptyShown = true;
@@ -1740,7 +1908,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       scrollBottom();
     }
 
-    // A static (non-streaming) Wupi message — used for the randomized intro
+    // A static (non-streaming) Wupi message: used for the randomized intro
     // shown when Chat first opens. Mirrors the finalized bubble shape.
     function addWupiBubble(text) {
       clearEmpty();
@@ -1785,7 +1953,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       sendBtn.disabled = on;
       stopBtn.disabled = !on;
       // Bridge to the title status indicator: the main model is "typing"
-      // during a chat_send. This flag is the authoritative source — it only
+      // during a chat_send. This flag is the authoritative source: it only
       // flips on user-driven chat sends, so Agent.gguf (schema engine, own
       // thread, never drives chat_send) is excluded by construction.
       setTitleState(on ? 'typing' : 'idle');
@@ -1796,6 +1964,10 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       const text = inputEl.value.trim();
       if (!text) return;
 
+      // If a previous reveal is still dripping, flush it to completion so the
+      // user sees the full previous reply before the new one starts.
+      if (activeReveal) activeReveal.flush();
+
       inputEl.value = '';
       addUserBubble(text);
 
@@ -1803,27 +1975,49 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       let streamed = '';
       setGenerating(true);
 
+      // The reveal's onComplete finalizes the bubble: removes the caret,
+      // sets the final text, appends the reasoning panel. Fires when the
+      // backend has sent `done` AND the 10 cps timer has shown all the text.
+      let pendingFinalize = null;  // {finalText, reasoning}
+      const reveal = startInkReveal(
+        bubble,
+        () => scrollBottom(),
+        () => {
+          if (pendingFinalize) {
+            const { finalText, reasoning } = pendingFinalize;
+            pendingFinalize = null;
+            finalizeWupiBubble(bubble, finalText, reasoning);
+          }
+        },
+      );
+
       const channel = new Channel();
       channel.onmessage = (e) => {
         if (!e) return;
         if (e.type === 'chunk') {
           streamed += e.text || '';
-          bubble.textContent = streamed;
-          scrollBottom();
+          reveal.push(streamed);
         } else if (e.type === 'error') {
+          reveal.destroy();
           setGenerating(false);
           // Replace the partial bubble with an error notice.
           bubble.remove();
           addErrorBubble(e.message || 'Generation failed.');
         } else if (e.type === 'done') {
+          // Backend finished. Arm the finalize; the reveal fires onComplete
+          // either synchronously (short reply, already drained) or when the
+          // timer catches up to the final text.
           setGenerating(false);
-          finalizeWupiBubble(bubble, e.final_text != null ? e.final_text : streamed, e.reasoning || '');
+          const finalText = e.final_text != null ? e.final_text : streamed;
+          pendingFinalize = { finalText, reasoning: e.reasoning || '' };
+          reveal.push(finalText, true);
         }
       };
 
       invoke('chat_send', { text, onEvent: channel })
         .catch((err) => {
           if (generating) {
+            reveal.destroy();
             setGenerating(false);
             bubble.remove();
             addErrorBubble('Failed to send: ' + err);
@@ -1833,6 +2027,10 @@ const dropdownMenu = document.getElementById('dropdownMenu');
 
     sendBtn?.addEventListener('click', send);
     stopBtn?.addEventListener('click', () => {
+      // If a reveal is still dripping, flush it so the user sees the full
+      // text immediately on stop. The backend will then send done/error
+      // which finalizes the bubble.
+      if (activeReveal) activeReveal.flush();
       invoke('chat_stop').catch((e) => console.warn('[Wupi] chat_stop failed', e));
     });
 
@@ -1846,7 +2044,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
 
     // On each open: reset to a fresh conversation view + show Wupi's randomized
     // intro (one per open, from the SIM card's introductions list via the
-    // get_intro IPC). The intro is UI-only — never sent to the model or archived.
+    // get_intro IPC). The intro is UI-only: never sent to the model or archived.
     function loadIntro() {
       emptyShown = true;
       msgsEl.innerHTML = '';
@@ -1864,5 +2062,10 @@ const dropdownMenu = document.getElementById('dropdownMenu');
         });
     }
     windowOpenHooks.set('chat', loadIntro);
+    // Tear down an active ink-reveal timer when the chat window closes so it
+    // doesn't keep ticking against a detached bubble node.
+    windowCloseHooks.set('chat', () => {
+      if (activeReveal) activeReveal.destroy();
+    });
     loadIntro();
   })();

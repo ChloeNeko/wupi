@@ -1,4 +1,4 @@
-//! The GameEngine — the Narrator's dedicated generation thread (Games app Seam 2).
+//! The GameEngine: the Narrator's dedicated generation thread (Games app Seam 2).
 //!
 //! A dedicated `std::thread` ("wupi-game") owning an ISOLATED
 //! `LlamaContext<'static>` on the same `WUPI.gguf` model the chat engine
@@ -9,12 +9,12 @@
 //!
 //! The Games app design (docs/games-app-design.md §1.1) is built on
 //! DUAL-CONTEXT: Wupi-as-game-manager (her chat context) must be available
-//! *while* the Narrator is mid-scene. The two cannot share a context — they
+//! *while* the Narrator is mid-scene. The two cannot share a context: they
 //! are different personas with different system prompts and different KV
 //! state. A fourth isolated `LlamaContext` on the same leaked model
 //! accomplishes this. Mirrors the schema engine pattern (§2J) and the
 //! embedder pattern (§3B). Four contexts now coexist:
-//! **chat (4000) + embedder (512) + schema (2048) + game (4000)** — all
+//! **chat (4000) + embedder (512) + schema (2048) + game (4000)**: all
 //! sharing one leaked `&'static LlamaModel` + one `shared_backend()`.
 //! Total VRAM ~10GB → ~2GB headroom on 12GB (verified by design doc §3.1).
 //!
@@ -47,7 +47,7 @@ use llama_cpp_2::token::LlamaToken;
 
 use crate::llm::{shared_backend, shared_model, CancelToken, ChunkFn};
 
-/// The game context's token budget. Matches the chat context (4000) — the
+/// The game context's token budget. Matches the chat context (4000): the
 /// narrator's turns are the same shape as chat turns (system + history + new
 /// turn) and need the same headroom for long roleplay exchanges.
 const GAME_CTX: u32 = 4000;
@@ -59,7 +59,7 @@ const GAME_BATCH: u32 = 512;
 const GAME_MAX_TOKENS: i32 = 1024;
 
 // ---------------------------------------------------------------------------
-// Control plane — channel types
+// Control plane: channel types
 // ---------------------------------------------------------------------------
 
 /// A request to the game thread: stream a narrator turn for `prompt`.
@@ -67,7 +67,7 @@ struct GameRequest {
     /// Fully-rendered prompt (system + visible history + new user turn +
     /// generation prompt). The engine tokenizes + prefills + decodes it.
     prompt: String,
-    /// Streaming callback — invoked once per decoded token piece. Wraps the
+    /// Streaming callback: invoked once per decoded token piece. Wraps the
     /// Tauri Channel's `send` (mirrors `chat_send`'s `on_chunk`).
     on_chunk: ChunkFn,
     /// Per-request cancellation token. The decode loop checks
@@ -104,7 +104,7 @@ enum GameMsg {
 // Handle (held by callers; fully Send + Sync)
 // ---------------------------------------------------------------------------
 
-/// The handle callers hold. Fully `Send + Sync` — a channel sender + the
+/// The handle callers hold. Fully `Send + Sync`: a channel sender + the
 /// thread's JoinHandle so `shutdown()` can block until VRAM is actually freed
 /// (same load-bearing concern as `SchemaEngine`: the next `game_start` must
 /// not race the previous `game_end`'s VRAM teardown). Mirrors `SchemaEngine`
@@ -121,9 +121,9 @@ unsafe impl Sync for GameEngine {}
 
 impl GameEngine {
     /// Spawn the game thread. Loads `WUPI.gguf` (or whatever path resolves)
-    /// as this engine's OWN model — freshly leaked `&'static`, independent
+    /// as this engine's OWN model: freshly leaked `&'static`, independent
     /// KV state. The readiness receiver yields `Ok(())` once the context is
-    /// live (or `Err` if init failed — the caller should treat the engine as
+    /// live (or `Err` if init failed: the caller should treat the engine as
     /// unavailable, same contract as `SchemaEngine::spawn_load`).
     pub fn spawn_load(
         path: PathBuf,
@@ -224,7 +224,7 @@ impl GameEngine {
     }
 
     /// Shut down the game thread and block until VRAM is freed. Same
-    /// load-bearing concern as `SchemaEngine::shutdown` — required so the
+    /// load-bearing concern as `SchemaEngine::shutdown`: required so the
     /// next `game_start` doesn't race the teardown.
     pub fn shutdown(&self) {
         let _ = self.tx.send(GameMsg::Shutdown);
@@ -239,7 +239,7 @@ impl GameEngine {
 
     /// Post a narrator turn request. The caller awaits the reply via the
     /// receiver it created. The streaming chunks arrive via `on_chunk` *as
-    /// they decode* — the reply comes once when generation completes.
+    /// they decode*: the reply comes once when generation completes.
     pub fn request_turn(
         &self,
         prompt: String,
@@ -275,7 +275,7 @@ impl GameEngine {
     }
 
     /// Initialize the game runtime. Prefers the chat engine's already-loaded
-    /// `&'static LlamaModel` via `shared_model()` — sharing weights is the
+    /// `&'static LlamaModel` via `shared_model()`: sharing weights is the
     /// ONLY way four contexts (chat 4000 + embedder 512 + schema 2048 +
     /// game 4000) fit on a 12GB GPU. Loading a second 12B copy would OOM
     /// (the 2026-07-18 `NullResult` lesson). The `path` arg is kept for
@@ -284,7 +284,7 @@ impl GameEngine {
     fn init_runtime(path: &Path, n_gpu_layers: u32) -> anyhow::Result<GameRuntime> {
         let backend = shared_backend();
 
-        // Prefer the shared model (the load-bearing path — avoids VRAM OOM).
+        // Prefer the shared model (the load-bearing path: avoids VRAM OOM).
         // Only load a separate copy if there's no shared model to reuse
         // (e.g. API mode where the chat engine's local model is torn down).
         let model_ref: &'static LlamaModel = match shared_model() {
@@ -308,7 +308,7 @@ impl GameEngine {
             .with_n_ctx(std::num::NonZeroU32::new(GAME_CTX))
             .with_n_batch(GAME_BATCH)
             .with_embeddings(false)
-            // Match the chat engine's KV quantization exactly — the narrator
+            // Match the chat engine's KV quantization exactly: the narrator
             // context is the same shape as a chat context.
             .with_type_k(KvCacheType::Q8_0)
             .with_type_v(KvCacheType::Q8_0);
@@ -342,13 +342,13 @@ impl GameRuntime {
     /// streaming chunks via `req.on_chunk`. Checks `req.cancel` between
     /// tokens (Relaxed ordering, same correctness argument as the chat
     /// engine, §2B). Returns the full raw model output (Gemma4 channel
-    /// protocol included — the caller parses/extracts).
+    /// protocol included: the caller parses/extracts).
     ///
     /// Uses the locked sampler config (temp 1.0 + top_p 0.95 + min_p 0.1 +
-    /// greedy argmax) — same as the chat engine (AGENTS.md "Sampler config
+    /// greedy argmax): same as the chat engine (AGENTS.md "Sampler config
     /// LOCKED"). Creative but not unhinged.
     ///
-    /// No delta-prefill optimization for v1 — each turn does a full
+    /// No delta-prefill optimization for v1: each turn does a full
     /// prefill. The accepted §2F cold-reset tax on memory-injected turns
     /// applies here too. Optimize later if TTFT becomes a constraint.
     fn generate_turn(&mut self, req: &GameRequest) -> Result<String, GenerationOutcome> {
@@ -411,12 +411,39 @@ impl GameRuntime {
         let max_tokens = GAME_MAX_TOKENS
             .min((GAME_CTX as i32 - n_prompt).max(64));
 
+        // Protocol marker filter. Same marker set as the chat engine
+        // (engine.rs): strips `<|turn>`, `<|channel>thought`, `<channel|>`,
+        // `<audio|>`, and the tool markers so they never stream to the UI.
+        // Without this the narrator would flicker `<|channel>thought\n...`
+        // live during generation (only stripped post-hoc in lib.rs).
+        let mut marker_filter = crate::stream_filter::StreamFilter::new(&[
+            "<|turn>",
+            "<turn|>",
+            "<|think|>",
+            "<|channel>thought",
+            "<channel|>",
+            "<audio|>",
+            "<|tool_call>",
+            "<tool_call|>",
+            "<|tool_response>",
+            "<tool_response|>",
+            "<|tool>",
+            "<tool|>",
+        ]);
+
         for _ in 0..max_tokens {
             // Cancellation check at the TOP of the loop (between tokens,
-            // never mid-decode — same KV-consistency contract as the chat
+            // never mid-decode: same KV-consistency contract as the chat
             // engine, §2C).
             if req.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 tracing::debug!("game turn cancelled by request");
+                // Flush any held-back text so the partial reply is complete
+                // up to the cancel point (mirrors the chat engine's flush).
+                let tail = marker_filter.flush();
+                if !tail.is_empty() {
+                    out.push_str(&tail);
+                    (req.on_chunk)(&tail);
+                }
                 return Err(GenerationOutcome::Cancelled(out));
             }
 
@@ -440,8 +467,13 @@ impl GameRuntime {
                 })?;
             if !piece.is_empty() {
                 out.push_str(&piece);
-                // Stream to the caller via the chunk callback.
-                (req.on_chunk)(&piece);
+                // Feed through the marker filter: only the safe-to-emit
+                // slice reaches the UI. The filter holds back any partial
+                // marker prefix straddling the chunk boundary.
+                let safe = marker_filter.feed(&piece);
+                if !safe.is_empty() {
+                    (req.on_chunk)(&safe);
+                }
             }
 
             // Feed the token back at position n_cur.
@@ -459,7 +491,16 @@ impl GameRuntime {
             n_cur += 1;
         }
 
-        // Sampler drops implicitly on scope exit — no explicit free() needed.
+        // Flush any held-back tail (partial marker prefix, or text inside
+        // the trailing window at EOG). Same contract as the chat engine's
+        // post-loop flush.
+        let tail = marker_filter.flush();
+        if !tail.is_empty() {
+            out.push_str(&tail);
+            (req.on_chunk)(&tail);
+        }
+
+        // Sampler drops implicitly on scope exit: no explicit free() needed.
         Ok(out)
     }
 }
@@ -473,7 +514,7 @@ mod tests {
     use super::*;
 
     /// The handle is Send+Sync (manually asserted via unsafe impl). This test
-    /// just confirms the type compiles with the right trait bounds — it
+    /// just confirms the type compiles with the right trait bounds: it
     /// doesn't construct one (that requires a real model load).
     #[test]
     fn game_engine_traits_compile() {

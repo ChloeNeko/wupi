@@ -1,22 +1,22 @@
 //! Ring-buffer bookkeeping for the persistent chat context.
 //!
 //! This is the **Phase 1 / Phase 2** token-tracking layer described in the
-//! engine design. It holds NO llama.cpp handles — it is pure bookkeeping over
+//! engine design. It holds NO llama.cpp handles: it is pure bookkeeping over
 //! a `Vec` of token IDs, which makes it fully `Send`/`Sync` and unit-testable
 //! in isolation.
 //!
 //! # The two phases
 //!
-//! **Phase 1 — Ring-Buffer Pointer Rotation.** We track where the system
+//! **Phase 1: Ring-Buffer Pointer Rotation.** We track where the system
 //! prefix ends (`system_prefix_len`) and use `should_evict` to decide when the
 //! cache is near capacity. The system prefix is pinned: it is never counted
 //! toward eviction.
 //!
-//! **Phase 2 — Token-ID Slicing Reconstruction.** Eviction is implemented as
+//! **Phase 2: Token-ID Slicing Reconstruction.** Eviction is implemented as
 //! a clean rebuild, NOT live RoPE surgery. We always hold the ground-truth
 //! token IDs in `token_log`. To evict, we slice out the dropped prefix,
 //! `clear_kv_cache()` the live context, and re-decode the surviving tokens
-//! from position 0. This is one full prefill — rare, bounded, and never
+//! from position 0. This is one full prefill: rare, bounded, and never
 //! risks corrupting position indices mid-generation.
 //!
 //! # Token integrity
@@ -35,7 +35,7 @@ use llama_cpp_2::token::LlamaToken;
 ///   live KV cache (after any reconstruction). It is the single source of
 ///   truth for what the cache "contains."
 /// - `system_prefix_len` is set once on the first (cold-start) generation and
-///   never changes for the lifetime of the engine — the system prompt is
+///   never changes for the lifetime of the engine: the system prompt is
 ///   pinned at the front and excluded from eviction.
 #[derive(Debug)]
 pub struct KvBuffer {
@@ -83,7 +83,7 @@ impl KvBuffer {
     /// this index are already in the KV cache and need no re-prefill; tokens
     /// at/after this index are new (or divergent) and must be decoded.
     ///
-    /// O(min(n, m)) — a single pointer walk. Cheaper than one decode step.
+    /// O(min(n, m)): a single pointer walk. Cheaper than one decode step.
     /// Returns 0 on a cold cache (everything must be prefilled).
     pub fn common_prefix_len(&self, incoming: &[LlamaToken]) -> usize {
         let max = std::cmp::min(self.token_log.len(), incoming.len());
@@ -114,7 +114,7 @@ impl KvBuffer {
 
     /// Delta commit: prefilled `delta` tokens starting at position
     /// `common_prefix_len`, after truncating the log back to that length
-    /// (anything diverging from the incoming prompt is invalidated — this
+    /// (anything diverging from the incoming prompt is invalidated: this
     /// handles mid-stream history edits correctly). The surviving tail is the
     /// common prefix; the delta extends it.
     ///
@@ -169,7 +169,7 @@ impl KvBuffer {
             .iter()
             .copied()
             .find(|&b| b >= min_cut && b > self.system_prefix_len)
-            // No boundary found past the threshold — evict up to the last
+            // No boundary found past the threshold: evict up to the last
             // boundary that still keeps the system prefix pinned.
             .or_else(|| {
                 turn_boundaries
@@ -195,7 +195,7 @@ impl KvBuffer {
         &self.token_log[cut..]
     }
 
-    /// The pinned system-prefix tokens — what the caller must prepend to the
+    /// The pinned system-prefix tokens: what the caller must prepend to the
     /// `reconstruct_tokens` tail when rebuilding the cache after eviction.
     pub fn system_prefix(&self) -> &[LlamaToken] {
         &self.token_log[..self.system_prefix_len]
@@ -232,7 +232,7 @@ impl Default for KvBuffer {
 // Turn-boundary scanning
 // ---------------------------------------------------------------------------
 
-/// Scan a rendered token stream for turn boundaries — positions where a new
+/// Scan a rendered token stream for turn boundaries: positions where a new
 /// `<|turn>` token sequence begins. Used by eviction to cut at clean turn
 /// boundaries rather than mid-message.
 ///
@@ -269,7 +269,7 @@ pub fn scan_turn_boundaries(tokens: &[LlamaToken], turn_marker: &[LlamaToken]) -
 /// space the next delta can actually use.
 ///
 /// `system_prefix_len` is the index where conversation turns begin (caller
-/// computes this — for Gemma it's the position of the SECOND `<|turn>` marker,
+/// computes this: for Gemma it's the position of the SECOND `<|turn>` marker,
 /// since the first opens the system turn). Everything before it is pinned and
 /// never dropped. `turn_boundaries` are the sorted start positions of each
 /// `<|turn>` marker in `tokens` (from `scan_turn_boundaries`).
@@ -279,7 +279,7 @@ pub fn scan_turn_boundaries(tokens: &[LlamaToken], turn_marker: &[LlamaToken]) -
 /// system prefix + last turn dropped, returns `None` (caller bails cleanly).
 ///
 /// Only call this for marker-bearing families (Gemma). Plain has no markers
-/// and truncating mid-token would corrupt the prompt — the caller checks
+/// and truncating mid-token would corrupt the prompt: the caller checks
 /// `turn_marker` presence first.
 pub fn truncate_to_fit(
     tokens: &[LlamaToken],
@@ -287,7 +287,7 @@ pub fn truncate_to_fit(
     system_prefix_len: usize,
     turn_boundaries: &[usize],
 ) -> Option<Vec<LlamaToken>> {
-    // Already fits — no work.
+    // Already fits: no work.
     if tokens.len() <= max_len {
         return Some(tokens.to_vec());
     }
@@ -300,7 +300,7 @@ pub fn truncate_to_fit(
         .filter(|&b| b >= system_prefix_len)
         .collect();
     if conv_boundaries.is_empty() {
-        // Over budget but no conversation turns to drop — the system prefix
+        // Over budget but no conversation turns to drop: the system prefix
         // alone exceeds max_len. Nothing safe to do.
         return None;
     }
@@ -445,7 +445,7 @@ mod tests {
         assert_eq!(buf.should_evict(2, 1, &boundaries), None);
     }
 
-    // --- Phase 2 reconstruction — the token-integrity regression ---
+    // --- Phase 2 reconstruction: the token-integrity regression ---
 
     #[test]
     fn reconstruct_tokens_returns_tail_after_cut() {
@@ -467,7 +467,7 @@ mod tests {
 
     /// The full eviction round-trip: a buffer that needs eviction should,
     /// after reconstruct_tokens + reconstruct_finish, contain exactly the
-    /// system prefix plus the surviving tail — nothing more, nothing less,
+    /// system prefix plus the surviving tail: nothing more, nothing less,
     /// in order. This is the token-boundary integrity guarantee.
     #[test]
     fn full_eviction_roundtrip_preserves_token_integrity() {

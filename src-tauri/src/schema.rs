@@ -1,4 +1,4 @@
-//! The world-state schema — "the schema IS the summarizer."
+//! The world-state schema: "the schema IS the summarizer."
 //!
 //! A persistent, semi-structured record of the simulated world's current
 //! state: a running narrative summary, recent salient events, and a flexible
@@ -41,7 +41,7 @@ use std::path::Path;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct WorldSchema {
     /// One-paragraph running narrative summary. The model rewrites this when
-    /// the narrative arc shifts — NOT every turn. Carries the "where are we
+    /// the narrative arc shifts: NOT every turn. Carries the "where are we
     /// in the story" thread that the 6-message window can't hold alone.
     #[serde(default)]
     pub summary: String,
@@ -55,7 +55,7 @@ pub struct WorldSchema {
 
     /// Flexible key→value store for hard data. Keys are model-defined and
     /// namespaced by convention (e.g. `"item.iron_sword"`,
-    /// `"char.mira.trust"`, `"loc.current"`). Values are strings — structured
+    /// `"char.mira.trust"`, `"loc.current"`). Values are strings: structured
     /// enough to read programmatically, loose enough to hold anything.
     ///
     /// In a delta, a `None` value (JSON `null`) means "delete this key";
@@ -66,16 +66,16 @@ pub struct WorldSchema {
 
 impl WorldSchema {
     /// Deep-merge a micro-delta into self. The "native Rust merging"
-    /// requirement — the model emits only changed keys, Rust applies them.
+    /// requirement: the model emits only changed keys, Rust applies them.
     ///
     /// Semantics:
     /// - `summary`: overwrite if the delta carries one (the model only emits
     ///   this when the narrative arc actually shifted).
     /// - `recent_events`: append the delta's events at the end (newest last).
-    ///   No dedupe — the model is responsible for not re-emitting existing
+    ///   No dedupe: the model is responsible for not re-emitting existing
     ///   events. Trimming old events is the model's job too (it sees the full
     ///   current list in the delta prompt and can drop stale ones by emitting
-    ///   a replacement... actually no — append-only is the v1 contract; the
+    ///   a replacement... actually no: append-only is the v1 contract; the
     ///   model can rewrite `summary` to fold old events in, and a future
     ///   "replace recent_events" signal could land if trimming becomes needed).
     /// - `entities`: for each (key, value) in the delta: `Some(v)` → upsert,
@@ -105,7 +105,7 @@ impl WorldSchema {
     /// into the chat turn's `<world_state>` block. Compactness matters: this
     /// goes into the inter-turn region alongside the memory block, and every
     /// token is prefill cost. We emit the summary, the last few recent events
-    /// (not all — the model doesn't need the deep history list in chat, that's
+    /// (not all: the model doesn't need the deep history list in chat, that's
     /// what the delta pass sees in full), and the entities as `key: value`
     /// lines.
     ///
@@ -126,7 +126,7 @@ impl WorldSchema {
             out.push_str(self.summary.trim());
             out.push('\n');
         }
-        // Cap recent events shown in chat at the last 5 — older events live
+        // Cap recent events shown in chat at the last 5: older events live
         // in the persisted schema + memory retrieval, not the chat prompt.
         let show_events = self.recent_events.len().saturating_sub(5);
         if !self.recent_events[show_events..].is_empty() {
@@ -150,7 +150,7 @@ impl WorldSchema {
                 out.push('\n');
             }
         }
-        // Trim the trailing newline — the caller wraps this in a tag block.
+        // Trim the trailing newline: the caller wraps this in a tag block.
         out.trim_end().to_string()
     }
 
@@ -180,7 +180,7 @@ impl WorldSchema {
     }
 
     /// Load from `world_schema.json`. Returns an empty schema if the file
-    /// doesn't exist yet (first run) — never an error for the NotFound case.
+    /// doesn't exist yet (first run): never an error for the NotFound case.
     pub fn load(path: &Path) -> std::io::Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(text) => serde_json::from_str(&text)
@@ -191,7 +191,7 @@ impl WorldSchema {
     }
 }
 
-/// A micro-delta against [`WorldSchema`]. All fields optional — the model
+/// A micro-delta against [`WorldSchema`]. All fields optional: the model
 /// emits ONLY the keys that changed this turn. Omitted fields = unchanged.
 ///
 /// Deserialized from the JSON object the schema-delta model pass emits. The
@@ -216,22 +216,22 @@ impl SchemaDelta {
     /// 1. The Gemma4 channel protocol (`<|channel>thought\n...<channel|>reply`).
     ///    The model emits this protocol for ALL output (including the schema
     ///    delta pass, which is instructed to emit raw JSON). The JSON lives in
-    ///    the REPLY channel — the text after the last `<channel|>` marker.
-    /// 2. Markdown fences (```` ```json ... ``` ````) — stripped if present.
+    ///    the REPLY channel: the text after the last `<channel|>` marker.
+    /// 2. Markdown fences (```` ```json ... ``` ````): stripped if present.
     /// 3. Surrounding whitespace.
     ///
     /// Runtime-discovered 2026-07-13: the delta pass emitted
-    /// `<|channel>thought\n<channel|>{}` — a valid empty delta `{}` wrapped in
+    /// `<|channel>thought\n<channel|>{}`: a valid empty delta `{}` wrapped in
     /// the channel protocol. Without extracting the reply channel, serde saw
     /// `<|channel>...` and bailed at column 1.
     pub fn from_model_output(raw: &str) -> Result<Self, serde_json::Error> {
         let reply = extract_reply_channel(raw);
-        let cleaned = strip_markdown_fences(reply).trim();
+        let cleaned = strip_markdown_fences(&reply).trim();
         serde_json::from_str(cleaned)
     }
 
     /// True if the delta carries ANY actual change (summary, events, or entity
-    /// mutations). False for an empty `{}` delta — which the model may emit when
+    /// mutations). False for an empty `{}` delta: which the model may emit when
     /// the player's request didn't translate to anything. Used by the
     /// game-manager routing (Phase E, 2026-07-18) to decide whether to apply +
     /// confirm vs. ask the player to rephrase.
@@ -251,27 +251,33 @@ impl SchemaDelta {
 }
 
 /// Extract the reply channel from Gemma4 protocol output. The model emits
-/// `<|channel>thought\n...<channel|>reply` — the thought channel (internal
+/// `<|channel>thought\n...<channel|>reply`: the thought channel (internal
 /// reasoning) comes first, closed by `<channel|>`, then the reply text
 /// follows. The JSON delta is in the reply.
 ///
 /// Uses `rsplit_once("<channel|>")` to take everything after the LAST closing
-/// marker. This correctly handles:
-/// - Protocol-wrapped output (the common case): the thought block is
-///   discarded, the reply JSON is kept.
-/// - Thought-only output (no reply): returns empty string → parse fails
-///   gracefully (the repair prompt or error path takes over).
-/// - Raw JSON with no protocol wrapping: returns the whole string unchanged
-///   (the rare case where the model emits JSON directly).
+/// marker, then strips any `<audio|>` markers from the reply. `<audio|>` is
+/// the Gemma4 audio-channel closer: the model emits it mid-prose when it
+/// "speaks" audio. Wupi renders no audio, so the marker would otherwise leak
+/// as literal text (e.g. "Mira's voice is a<audio|> whisper"). A reply can
+/// contain multiple `<audio|>` markers, so this is a replace-all, not a split.
 ///
-/// This mirrors `chat_format.rs::Gemma4Format::parse_output`'s split-on-
-/// `<channel|>` logic, specialized to the schema's "I only want the reply"
-/// need (parse_output splits into both channels; we discard thought entirely).
-pub fn extract_reply_channel(raw: &str) -> &str {
-    match raw.rsplit_once("<channel|>") {
+/// Returns an owned `String` (not `&str`) because the `<audio|>` strip may
+/// mutate. Allocation cost is negligible: this runs once per turn, not per
+/// token.
+///
+/// Handles:
+/// - Protocol-wrapped output (the common case): thought discarded, reply kept.
+/// - Thought-only output (no reply): returns empty string, parse fails
+///   gracefully (the repair prompt or error path takes over).
+/// - Raw output with no protocol wrapping: returns the input with `<audio|>`
+///   stripped (the rare case where the model emits content directly).
+pub fn extract_reply_channel(raw: &str) -> String {
+    let reply = match raw.rsplit_once("<channel|>") {
         Some((_, reply)) => reply,
         None => raw,
-    }
+    };
+    reply.replace("<audio|>", "")
 }
 
 /// Strip ```json ... ``` markdown fences if present. The model is told to
@@ -293,7 +299,7 @@ fn strip_markdown_fences(s: &str) -> &str {
 }
 
 /// Build a sibling temp-file path for an atomic save. Mirrors
-/// `session::temp_path_for` — same directory/volume so `rename` is atomic.
+/// `session::temp_path_for`: same directory/volume so `rename` is atomic.
 fn temp_path_for(path: &Path) -> std::path::PathBuf {
     let mut name = path
         .file_name()
@@ -468,7 +474,7 @@ mod tests {
 
     #[test]
     fn from_model_output_null_entity_value_is_delete_signal() {
-        // JSON null deserializes to Option::None — the delete signal.
+        // JSON null deserializes to Option::None: the delete signal.
         let raw = r#"{"entities":{"drop_me":null}}"#;
         let delta = SchemaDelta::from_model_output(raw).unwrap();
         assert_eq!(delta.entities.unwrap().get("drop_me"), Some(&None));
@@ -477,7 +483,7 @@ mod tests {
     #[test]
     fn from_model_output_strips_gemma4_channel_protocol() {
         // Regression for the 2026-07-13 runtime failure: the delta pass
-        // emitted `<|channel>thought\n<channel|>{}` — a valid empty delta
+        // emitted `<|channel>thought\n<channel|>{}`: a valid empty delta
         // wrapped in the Gemma4 channel protocol. Without extracting the
         // reply channel serde saw `<|channel>...` and bailed at column 1.
         let raw = "<|channel>thought\n<channel|>{}";
@@ -519,7 +525,7 @@ mod tests {
 
     #[test]
     fn from_model_output_raw_json_without_protocol_passes_through() {
-        // No channel markers at all — the model emitted JSON directly (rare
+        // No channel markers at all: the model emitted JSON directly (rare
         // but possible). rsplit_once finds no `<channel|>` and returns the
         // whole string unchanged.
         let raw = r#"{"recent_events":["saw a fox"]}"#;
@@ -572,5 +578,41 @@ mod tests {
         assert!(loaded.summary.is_empty());
         assert!(loaded.recent_events.is_empty());
         assert!(loaded.entities.is_empty());
+    }
+
+    #[test]
+    fn extract_reply_channel_strips_audio_marker_mid_prose() {
+        // Regression for the §2Z known issue: the model emits `<audio|>` (the
+        // Gemma4 audio-channel closer) mid-prose. Without stripping it, the
+        // marker leaks as literal text into narrator output, e.g.
+        // "Mira's voice is a<audio|> whisper".
+        let raw = "<|channel>thought\nsetting the scene.\n<channel|>Mira's voice is a<audio|> whisper.";
+        assert_eq!(
+            extract_reply_channel(raw),
+            "Mira's voice is a whisper."
+        );
+    }
+
+    #[test]
+    fn extract_reply_channel_strips_multiple_audio_markers() {
+        // A reply can contain more than one `<audio|>`: replace-all, not split.
+        let raw = "<channel|>He says hi<audio|> and she replies<audio|>.";
+        assert_eq!(extract_reply_channel(raw), "He says hi and she replies.");
+    }
+
+    #[test]
+    fn extract_reply_channel_preserves_reply_without_markers() {
+        // No `<audio|>` and no channel wrapping: input passes through unchanged.
+        let raw = "The tavern door creaks open.";
+        assert_eq!(extract_reply_channel(raw), "The tavern door creaks open.");
+    }
+
+    #[test]
+    fn extract_reply_channel_audio_without_channel_marker() {
+        // `<audio|>` present but no `<channel|>` at all (model emitted raw
+        // prose with an audio marker, no thought channel). The audio marker
+        // is still stripped.
+        let raw = "A bell tolls<audio|> in the distance.";
+        assert_eq!(extract_reply_channel(raw), "A bell tolls in the distance.");
     }
 }

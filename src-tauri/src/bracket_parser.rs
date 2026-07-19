@@ -2,19 +2,19 @@
 //!
 //! The narrator emits bracket commands alongside its prose to drive the UI
 //! deterministically. This module parses those out of the *final raw output*
-//! (post-generation), NOT from the token stream — brackets are scene-level
+//! (post-generation), NOT from the token stream: brackets are scene-level
 //! events, not token-level concerns, so they're best extracted once from the
 //! complete text rather than incrementally during streaming.
 //!
 //! # Supported commands (mirror `narrator_prompt::BRACKET_PROTOCOL`)
 //!
-//! - `[CHARACTER_TURN:npc_id]` ... `[CHARACTER_TURN:end]` — an NPC spoke.
-//! - `[OBJECT id=iron_chest state=open]` — an object's state changed.
-//! - `[FX rain]` — a scene effect should activate.
+//! - `[CHARACTER_TURN:npc_id]` ... `[CHARACTER_TURN:end]`: an NPC spoke.
+//! - `[OBJECT id=iron_chest state=open]`: an object's state changed.
+//! - `[FX rain]`: a scene effect should activate.
 //!
 //! # Design
 //!
-//! Pure string parsing — no regex backtracking, no re-tokenizing (Prime
+//! Pure string parsing: no regex backtracking, no re-tokenizing (Prime
 //! Directive §1B.2). One linear scan over the text, extracting bracketed
 //! regions. The prose left over after extraction is the cleaned narrator
 //! output the UI renders.
@@ -57,7 +57,7 @@ pub struct ParsedNarration {
 ///
 /// Strategy: walk the text, when we see `[`, attempt to match a known
 /// command pattern. On match, push a command + skip past the bracket. On
-/// no match, copy the `[` into prose and continue (graceful — better to
+/// no match, copy the `[` into prose and continue (graceful: better to
 /// leak a literal bracket than misparse).
 ///
 /// `CHARACTER_TURN` is the only multi-region command (open + body + close).
@@ -82,7 +82,7 @@ pub fn parse(raw: &str) -> ParsedNarration {
 
         // Find the closing `]`.
         let Some(end_rel) = bytes[start..].iter().position(|&b| b == b']') else {
-            // Unterminated bracket — emit the `[` literally and advance one
+            // Unterminated bracket: emit the `[` literally and advance one
             // byte (so we don't loop forever on a stray `[`).
             prose.push('[');
             i = start + 1;
@@ -93,7 +93,7 @@ pub fn parse(raw: &str) -> ParsedNarration {
 
         // Try to match a command. On match, push it; on miss, the bracket
         // content is emitted as literal prose (preserves original text).
-        // `text_after` is the raw text starting just past the closing `]` —
+        // `text_after` is the raw text starting just past the closing `]` -
         // used by CHARACTER_TURN to find its `[CHARACTER_TURN:end]` body
         // terminator. Indices returned by `parse_one` are relative to this
         // slice (not the full `raw`), so the caller adds `end + 1`.
@@ -119,7 +119,7 @@ pub fn parse(raw: &str) -> ParsedNarration {
 }
 
 /// Attempt to parse one bracket's contents into a `BracketCommand`.
-/// Returns `(command, bytes_consumed_after_the_closing_bracket)` — the
+/// Returns `(command, bytes_consumed_after_the_closing_bracket)`: the
 /// after-bracket consumption is nonzero only for `CHARACTER_TURN`, which
 /// swallows its body + close tag.
 ///
@@ -132,7 +132,7 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
     if let Some(rest) = bracket.strip_prefix("CHARACTER_TURN:") {
         let npc_id = rest.trim().to_string();
         if npc_id == "end" || npc_id.is_empty() {
-            // A stray close tag or empty open tag — drop it.
+            // A stray close tag or empty open tag: drop it.
             return Some((BracketCommand::CharacterTurn {
                 npc_id: String::new(),
                 line: String::new(),
@@ -148,7 +148,7 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
                 end_idx + close.len(),
             ));
         }
-        // No close tag — treat the rest of the output as the line (graceful).
+        // No close tag: treat the rest of the output as the line (graceful).
         let line = text_after.trim().to_string();
         return Some((
             BracketCommand::CharacterTurn { npc_id, line },
@@ -258,7 +258,7 @@ mod tests {
 
     #[test]
     fn unknown_bracket_emitted_as_literal() {
-        // `[NOTE:foo]` isn't a recognized command — preserve it in prose.
+        // `[NOTE:foo]` isn't a recognized command: preserve it in prose.
         let raw = "Strange [NOTE:foo] marker.";
         let parsed = parse(raw);
         assert!(parsed.commands.is_empty());

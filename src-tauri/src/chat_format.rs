@@ -1,6 +1,6 @@
 //! Chat-completion format presets.
 //!
-//! Each model family has its own turn protocol — the special tokens that
+//! Each model family has its own turn protocol: the special tokens that
 //! delimit system/user/model turns, thinking channels, and tool calls.
 //! Rather than depend on llama.cpp's heuristic template matcher (which only
 //! recognizes ~50 hardcoded formats and returns `-1` / FfiError on anything
@@ -8,7 +8,7 @@
 //! against each family's *documented* protocol.
 //!
 //! This is deterministic, dependency-free, and avoids shipping a Jinja engine.
-//! Adding a new model family means writing one more `ChatFormat` impl — no
+//! Adding a new model family means writing one more `ChatFormat` impl: no
 //! per-model completion logic.
 
 use crate::session::ApiMessage;
@@ -21,7 +21,7 @@ pub trait ChatFormat: Send + Sync {
     /// `add_generation_prompt = true` should append the opening of a model
     /// turn (no closing) so the model continues from there.
     ///
-    /// `memory_block` — an optional retrieved-memory annotation injected into
+    /// `memory_block`: an optional retrieved-memory annotation injected into
     /// the inter-turn region (between the last conversation turn and the
     /// generation prompt). `None`/empty renders nothing. This position is
     /// deliberate (2026-07-13, §2F eager-prefill design): keeping the memory
@@ -32,7 +32,7 @@ pub trait ChatFormat: Send + Sync {
     /// annotation (no turn markers around it) so it reads as context, not a
     /// conversational turn.
     ///
-    /// `world_state` — an optional world-state schema annotation, sibling to
+    /// `world_state`: an optional world-state schema annotation, sibling to
     /// `memory_block`. Same inter-turn position, same non-turn annotation
     /// shape (wrapped in `<world_state>` tags so the model can distinguish it
     /// from retrieved memory). Carries the persistent simulation state the
@@ -66,9 +66,9 @@ pub struct ToolSpec {
 /// Result of splitting model output into its channels.
 #[derive(Debug, Clone, Default)]
 pub struct ParsedOutput {
-    /// The reply channel — what the user sees.
+    /// The reply channel: what the user sees.
     pub content: String,
-    /// The thought channel — the model's reasoning, if any.
+    /// The thought channel: the model's reasoning, if any.
     pub reasoning: String,
     /// The complete raw model output (pre-parse). Set by the engine's decode
     /// loop, NOT by `parse_output` itself. Persisted onto assistant `Message`s
@@ -84,7 +84,7 @@ pub enum ModelFamily {
     /// `<|tool_call>` / `<tool_call|>` for tool invocation.
     Gemma4,
     /// Fallback: plain text turns, no special protocol. Used when the loaded
-    /// model isn't recognized — generation will work but without thinking or
+    /// model isn't recognized: generation will work but without thinking or
     /// tool channels.
     Plain,
 }
@@ -138,12 +138,12 @@ impl ModelFamily {
 /// Reference: https://ai.google.dev/gemma/docs/core/prompt-formatting-gemma4
 ///
 /// Token summary:
-///   `<|turn>{role}\n` ... `<turn|>\n`   — dialogue turn delimiters
-///   `<|think|>`                         — activates thinking (system turn)
-///   `<|channel>thought\n` ... `<channel|>` — internal reasoning channel
-///   `<|tool>declaration:...{...}<tool|>` — tool definition
-///   `<|tool_call>call:name{args}<tool_call|>` — model requests a tool
-///   `<|tool_response>response:name{val}<tool_response|>` — tool result back
+///   `<|turn>{role}\n` ... `<turn|>\n`   - dialogue turn delimiters
+///   `<|think|>`                         - activates thinking (system turn)
+///   `<|channel>thought\n` ... `<channel|>`: internal reasoning channel
+///   `<|tool>declaration:...{...}<tool|>`: tool definition
+///   `<|tool_call>call:name{args}<tool_call|>`: model requests a tool
+///   `<|tool_response>response:name{val}<tool_response|>`: tool result back
 ///
 /// Roles: `system`, `user`, `model` (note: assistant → model).
 pub struct Gemma4Format;
@@ -212,13 +212,12 @@ impl ChatFormat for Gemma4Format {
             out.push_str("<turn|>\n");
         }
 
-        // --- Inter-turn annotations (§2F eager-prefill layout) ───────────
         // Both retrieved_memory and world_state sit AFTER all conversation
         // turns, BEFORE the generation prompt. Non-turn annotations (no
         // `<|turn>` markers) so they read as context for the upcoming model
         // turn, not as conversational turns. Only emitted when a generation
         // prompt follows (no point annotating a render that won't generate).
-        // Order: memory first, then world_state — retrieval is conversational
+        // Order: memory first, then world_state: retrieval is conversational
         // recall (transient per query), world_state is persistent ground truth.
         if add_generation_prompt {
             if let Some(block) = memory_block {
@@ -263,10 +262,10 @@ impl ChatFormat for Gemma4Format {
                 // `before` is everything prior to the opening `<|channel>` on
                 // this segment. If the segment started with `<|channel>thought`,
                 // `before` is "" and what follows (in `part` after the marker)
-                // is the thinking text — but we already consumed it via split.
+                // is the thinking text: but we already consumed it via split.
                 // The text after `<channel|>` (next iteration) is the reply.
                 if part.contains("<|channel>") {
-                    // This was a thought block — capture as reasoning.
+                    // This was a thought block: capture as reasoning.
                     let thought = part
                         .split("<|channel>")
                         .last()
@@ -286,7 +285,7 @@ impl ChatFormat for Gemma4Format {
                         content.push('\n');
                     }
                 } else {
-                    // No opening marker — this is reply text (or trailing junk).
+                    // No opening marker: this is reply text (or trailing junk).
                     content.push_str(part);
                 }
             }
@@ -334,7 +333,7 @@ fn push_escaped(out: &mut String, s: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// ThoughtGate — stateful streaming filter for the variable-length thought block
+// ThoughtGate: stateful streaming filter for the variable-length thought block
 // ---------------------------------------------------------------------------
 
 /// The opening marker for Gemma 4's thinking channel.
@@ -346,7 +345,7 @@ const CHANNEL_CLOSE: &str = "<channel|>";
 /// block (`<|channel>thought\n...<channel|>`).
 ///
 /// Unlike `StreamFilter` (which handles bounded markers via regex), the thought
-/// block has no known length — we can't predict when `<channel|>` will arrive.
+/// block has no known length: we can't predict when `<channel|>` will arrive.
 /// The gate tracks three states:
 ///
 /// - `Detecting`: we haven't seen enough to know if this is a thought turn or
@@ -357,7 +356,7 @@ const CHANNEL_CLOSE: &str = "<channel|>";
 /// - `Reply`: the thought block closed (or there never was one). All text
 ///   passes through immediately with zero buffering.
 ///
-/// The gate outputs clean reply text. The thought *content* is not emitted —
+/// The gate outputs clean reply text. The thought *content* is not emitted -
 /// it's captured separately by `parse_output` at end of generation.
 pub struct ThoughtGate {
     state: GateState,
@@ -369,7 +368,7 @@ pub struct ThoughtGate {
 
 #[derive(Debug, PartialEq, Eq)]
 enum GateState {
-    /// First tokens — deciding if this turn uses the thought channel.
+    /// First tokens: deciding if this turn uses the thought channel.
     Detecting,
     /// Inside the thought block, holding everything until `<channel|>`.
     InThought,
@@ -401,13 +400,13 @@ impl ThoughtGate {
     pub fn flush(&mut self) -> String {
         match self.state {
             GateState::Detecting => {
-                // Never saw enough to enter thought mode — emit the buffer.
+                // Never saw enough to enter thought mode: emit the buffer.
                 let out = std::mem::take(&mut self.detect_buf);
                 out
             }
             GateState::InThought => {
                 // Generation ended mid-thought (truncated). Discard the
-                // incomplete thought — it's not useful reply text.
+                // incomplete thought: it's not useful reply text.
                 self.thought_buf.clear();
                 String::new()
             }
@@ -428,7 +427,7 @@ impl ThoughtGate {
                 self.state = GateState::InThought;
                 return (String::new(), true);
             } else {
-                // Not a thought turn — emit the whole buffer as reply.
+                // Not a thought turn: emit the whole buffer as reply.
                 let out = std::mem::take(&mut self.detect_buf);
                 self.state = GateState::Reply;
                 return (out, false);
@@ -437,10 +436,10 @@ impl ThoughtGate {
 
         // Not enough yet to tell. Check if it COULD still become the marker.
         if THOUGHT_OPEN.starts_with(self.detect_buf.as_str()) {
-            // Still a valid prefix — hold it.
+            // Still a valid prefix: hold it.
             (String::new(), false)
         } else {
-            // Can't possibly become the marker — emit and switch to Reply.
+            // Can't possibly become the marker: emit and switch to Reply.
             let out = std::mem::take(&mut self.detect_buf);
             self.state = GateState::Reply;
             (out, false)
@@ -459,7 +458,7 @@ impl ThoughtGate {
             // Strip any leading whitespace/newline the model puts after the closer.
             (reply.trim_start().to_string(), false)
         } else {
-            // Still thinking — hold everything.
+            // Still thinking: hold everything.
             (String::new(), true)
         }
     }
@@ -655,7 +654,7 @@ mod tests {
     #[test]
     fn gemma4_injects_memory_block_in_inter_turn_region() {
         // §2F eager-prefill design (2026-07-13): the retrieved-memory block sits
-        // AFTER all conversation turns, BEFORE the generation prompt — and
+        // AFTER all conversation turns, BEFORE the generation prompt: and
         // crucially NOT inside the system prompt. This is what makes the stable
         // prefix (rendered with memory_block=None) a true byte-prefix of the
         // full prompt, enabling eager prefill. Verifies both position AND the
@@ -678,13 +677,13 @@ mod tests {
         assert!(mem_pos < gen_pos, "memory block must come before generation prompt");
         assert!(out.contains(block));
         assert!(out.ends_with("<|turn>model\n"), "still ends with the generation prompt");
-        // No turn markers wrap the memory block — it's an annotation.
+        // No turn markers wrap the memory block: it's an annotation.
         assert!(!out.contains("<|turn>retrieved_memory"));
     }
 
     #[test]
     fn gemma4_memory_block_omitted_when_none() {
-        // The stable-prefix render path passes None — no annotation leaks.
+        // The stable-prefix render path passes None: no annotation leaks.
         let f = Gemma4Format;
         let out = f.render_prompt(
             "You are Wupi.",

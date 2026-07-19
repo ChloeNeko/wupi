@@ -3,12 +3,12 @@
 //!
 //! This is the config half of the API feature. The HTTP backend impl
 //! (`HttpBackend: GenerationClient`) lives in `llm.rs`; this module owns only
-//! the persisted state — the list of saved API profiles (endpoint URL + model
+//! the persisted state: the list of saved API profiles (endpoint URL + model
 //! name + API key) and which model source (local WUPI.gguf vs API) is active.
 //!
 //! **Storage contract** (mirrors `theme.rs` exactly): `api_config.json` in the
 //! app data dir, atomic save (temp + rename), graceful default on any error.
-//! The file holds real API keys in plaintext — acceptable per the design call
+//! The file holds real API keys in plaintext: acceptable per the design call
 //! that WUPI OS runs on private offline personal computers with no network
 //! exposure of the file. NOT cryptographically protected; if WUPI ever gains
 //! network-facing features, move keys to Windows DPAPI first.
@@ -16,7 +16,7 @@
 //! **Profile model:** a flat `Vec<ApiProfile>` + an `active_profile_id`. The
 //! UI upserts by `id` (a generated slug from the name); delete is by `id`. The
 //! `model_source` field persists across reboots so the user's last selection
-//! (local vs API) is restored at boot — but the actual model swap is
+//! (local vs API) is restored at boot: but the actual model swap is
 //! re-performed in `setup()` based on this value, not assumed.
 
 use std::path::PathBuf;
@@ -38,7 +38,7 @@ pub struct ApiProfile {
     /// Provider-specific; the user copies it from the provider's model list.
     pub model: String,
     /// The API key (secret). Plaintext on disk per the design contract above.
-    /// Serialized as normal JSON — `serde_json` doesn't special-case it.
+    /// Serialized as normal JSON: `serde_json` doesn't special-case it.
     #[serde(default)]
     pub api_key: String,
     /// Optional per-profile temperature. `None` lets the provider pick its
@@ -53,7 +53,7 @@ pub struct ApiProfile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelSource {
-    /// Local `WUPI.gguf` (12B) — the default. Chat + schema both run locally.
+    /// Local `WUPI.gguf` (12B): the default. Chat + schema both run locally.
     Local,
     /// An API endpoint is the chat source. The schema/memory engine moves to
     /// `Agent.gguf` (4B) so the API can focus on roleplay; never two local
@@ -74,7 +74,7 @@ pub struct ApiConfig {
     #[serde(default)]
     pub profiles: Vec<ApiProfile>,
     /// Which profile is currently connected (last successful `api_connect`).
-    /// `None` when no profile is active — `ModelSource::Api` requires this to
+    /// `None` when no profile is active: `ModelSource::Api` requires this to
     /// be `Some`; the UI gates the API radio on a connected profile existing.
     #[serde(default)]
     pub active_profile_id: Option<String>,
@@ -94,7 +94,7 @@ impl ApiConfig {
 
     /// Load from disk, falling back to default (empty config, Local source)
     /// on any error (missing file, malformed JSON, IO). Persistence is
-    /// best-effort: a corrupt `api_config.json` must never block app launch —
+    /// best-effort: a corrupt `api_config.json` must never block app launch -
     /// the user just sees an empty profile list and re-enters their configs.
     /// Mirrors `ThemeSettings::load`.
     pub fn load(path: &std::path::Path) -> Self {
@@ -105,7 +105,7 @@ impl ApiConfig {
     }
 
     /// Persist atomically: temp file + rename (same pattern as `theme.rs` +
-    /// `session.rs::save`). On failure we log and continue — the in-memory
+    /// `session.rs::save`). On failure we log and continue: the in-memory
     /// config still lives in AppState and can be re-saved on the next change.
     pub fn save(&self, path: &std::path::Path) {
         let tmp = path.with_extension("json.tmp");
@@ -120,7 +120,7 @@ impl ApiConfig {
             tracing::error!(error = %e, "api_config: write tmp failed");
             return;
         }
-        // Windows rename over existing uses MOVEFILE_REPLACE_EXISTING — atomic.
+        // Windows rename over existing uses MOVEFILE_REPLACE_EXISTING: atomic.
         if let Err(e) = std::fs::rename(&tmp, path) {
             tracing::error!(error = %e, "api_config: rename failed");
             let _ = std::fs::remove_file(&tmp);
@@ -141,7 +141,7 @@ impl ApiConfig {
     }
 
     /// Remove a profile by id. Returns true if a profile was removed. If the
-    /// removed profile was the active one, `active_profile_id` is cleared —
+    /// removed profile was the active one, `active_profile_id` is cleared -
     /// the caller must handle the `ModelSource` downgrade (can't be Api with
     /// no active profile).
     pub fn remove(&mut self, id: &str) -> bool {
@@ -156,7 +156,7 @@ impl ApiConfig {
 
     /// Borrow the active profile, if any. `None` when no profile is active
     /// OR the active id points at a profile that no longer exists (orphaned
-    /// id after a delete that didn't clear it — defensive).
+    /// id after a delete that didn't clear it: defensive).
     pub fn active_profile(&self) -> Option<&ApiProfile> {
         let id = self.active_profile_id.as_ref()?;
         self.profiles.iter().find(|p| &p.id == id)
@@ -167,7 +167,7 @@ impl ApiConfig {
 /// non-alphanumeric/`-`/`_` char with `-`, trim leading/trailing `-`. Returns
 /// a fallback (`"profile"`) if the result is empty. Public so the IPC layer
 /// can echo back the exact id `upsert` will use (the UI tracks entries by id).
-/// Mirrors `codex::sanitize_stem` — same contract, different default.
+/// Mirrors `codex::sanitize_stem`: same contract, different default.
 pub fn sanitize_profile_id(name: &str) -> String {
     let slug: String = name
         .trim()

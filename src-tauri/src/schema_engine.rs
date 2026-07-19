@@ -1,39 +1,29 @@
 //! The background state-delta schema engine.
 //!
 //! A dedicated `std::thread` ("wupi-schema") owning an ISOLATED
-//! `LlamaContext<'static>` on a model it loads ITSELF (not the chat model).
-//! After each chat turn, `chat_send` posts a [`SchemaRequest`] here; the
-//! thread generates a micro-delta JSON (only the changed keys), parses it,
-//! and replies. The chat KV cache is never touched — true context isolation.
-//!
-//! # Independent model loading (2026-07-17, API feature)
-//!
-//! Previously this engine shared the chat model via `shared_model()`. That
-//! coupling broke the moment chat could move to an HTTP API (no local model
-//! to share). The engine now loads its OWN model by path — mirroring the
-//! embedder (`memory_embedder_llama.rs`). In Local mode it loads `WUPI.gguf`;
-//! in API mode it loads `Agent.gguf` (4B Gemma4, the dedicated agent). The
-//! Gemma4 turn markers in the delta prompt work for both — Agent.gguf is
-//! Gemma4 family.
+//! `LlamaContext<'static>` on `WUPI.gguf`. After each chat turn, `chat_send`
+//! posts a [`SchemaRequest`] here; the thread generates a micro-delta JSON
+//! (only the changed keys), parses it, and replies. The chat KV cache is
+//! never touched: true context isolation.
 //!
 //! # Why a separate context (the load-bearing isolation requirement)
 //!
 //! The schema pass MUST NOT pollute the chat engine's rolling KV cache. A
 //! second `LlamaContext` on the schema's own `&'static LlamaModel` achieves
-//! this: independent KV state, no cross-contamination. This is the same
-//! pattern as the embedder (§3B) — proven architecture.
+//! this: independent KV state, no cross-contamination. Same pattern as the
+//! embedder (§3B): proven architecture.
 //!
 //! # The micro-delta contract
 //!
-//! The pass emits ONLY changed keys, not a full schema rewrite. A typical
-//! delta is 20-100 tokens → sub-second generation. See `schema.rs` for the
-//! merge semantics (`null` = delete key).
+//! Emits ONLY changed keys, not a full schema rewrite. A typical delta is
+//! 20-100 tokens for sub-second generation. See `schema.rs` for the merge
+//! semantics (`null` = delete key).
 //!
 //! # JSON robustness
 //!
 //! `SchemaDelta::from_model_output` strips markdown fences. If parsing still
 //! fails, the thread retries once with a repair prompt; on second failure it
-//! replies `Err` and the schema is left unchanged for that turn (graceful —
+//! replies `Err` and the schema is left unchanged for that turn (graceful:
 //! chat proceeds with stale schema).
 
 use std::path::{Path, PathBuf};
@@ -49,7 +39,7 @@ use llama_cpp_2::token::LlamaToken;
 use crate::llm::shared_backend;
 use crate::schema::{SchemaDelta, WorldSchema};
 
-/// The schema context's token budget. Smaller than chat's 4000 — the delta
+/// The schema context's token budget. Smaller than chat's 4000: the delta
 /// pass only needs: system instruction (~150 tokens) + current schema JSON
 /// (~200-800) + last exchange (~100-400) + generation room. 2048 is generous
 /// headroom; the KV cost at Q8_0 is ~75MB.
@@ -62,7 +52,7 @@ const SCHEMA_BATCH: u32 = 512;
 const SCHEMA_MAX_TOKENS: i32 = 256;
 
 // ---------------------------------------------------------------------------
-// Control plane — channel types
+// Control plane: channel types
 // ---------------------------------------------------------------------------
 
 /// A request to the schema thread: diff `last_exchange` against
@@ -79,7 +69,7 @@ struct SchemaRequest {
 
 /// What the schema thread sends back when a delta pass completes. Carries the
 /// RAW model output alongside the parsed delta so callers (the debug IPC, and
-/// Component D's queue) can see exactly what the model emitted — essential for
+/// Component D's queue) can see exactly what the model emitted: essential for
 /// diagnosing JSON malformedness. On parse failure, `delta` is `None` and
 /// `error` explains why. `raw_output` is always populated on a completed pass.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -101,11 +91,8 @@ enum SchemaMsg {
     /// `SchemaDelta` (Phase E, 2026-07-18). Distinct from `Request` (the auto-
     /// summarizer's per-turn delta): the translation takes an explicit player
     /// command, not a just-finished chat exchange. Reuses the same JSON-delta
-    /// parser + the schema engine's isolated context — no new infrastructure.
+    /// parser + the schema engine's isolated context, no new infrastructure.
     RequestTranslation(Box<TranslationRequest>),
-    /// Kept for future hot-swap / clean shutdown, mirroring `ChatEngine`.
-    #[allow(dead_code)]
-    Shutdown,
 }
 
 /// A request to translate a player's natural-language request ("make it
@@ -127,14 +114,12 @@ struct TranslationRequest {
 // Handle (held by callers; fully Send + Sync)
 // ---------------------------------------------------------------------------
 
-/// The handle callers hold. Fully `Send + Sync` — a channel sender + the
-/// thread's JoinHandle so `shutdown()` can block until VRAM is actually freed
-/// (the fire-and-forget pattern was causing VRAM-overlap OOM during model
-/// swaps — see the 2026-07-18 fix in `swap_schema_engine`). Mirrors
-/// `ChatEngine` and `LlamaCppEmbedder`.
+/// The handle callers hold. Fully `Send + Sync`: a channel sender to the
+/// dedicated schema thread. No `LlamaContext` crosses out. The thread lives
+/// for process lifetime (no hot-swap path now that the schema engine stays
+/// on WUPI.gguf in both Local and API modes, §2X).
 pub struct SchemaEngine {
     tx: mpsc::Sender<SchemaMsg>,
-    join: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 // SAFETY: mpsc::Sender<SchemaMsg> is Send (SchemaMsg owns only Send data).
@@ -145,14 +130,14 @@ unsafe impl Sync for SchemaEngine {}
 impl SchemaEngine {
     /// Spawn the schema thread. The chat backend MUST be loaded first (we read
     /// `shared_model()` to get the leaked `&'static LlamaModel`). Returns
-    /// `None` if no model is available — callers should treat the schema
+    /// `None` if no model is available: callers should treat the schema
     /// engine as optional (chat proceeds without schema updates).
     ///
     /// The readiness receiver yields `Ok(())` once the schema context is live
     /// (or `Err` if init failed). The caller SHOULD `recv()` before treating
     /// the engine as ready, same contract as `ChatEngine::spawn` (Bug #6).
     ///
-    /// `path` is the model file this engine loads as ITS OWN model — no longer
+    /// `path` is the model file this engine loads as ITS OWN model: no longer
     /// `shared_model()`. In Local mode pass WUPI.gguf; in API mode pass
     /// Agent.gguf. Mirrors `LlamaCppEmbedder::spawn_load`.
     pub fn spawn_load(
@@ -163,7 +148,7 @@ impl SchemaEngine {
         let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
 
         let builder = std::thread::Builder::new().name("wupi-schema".into());
-        let join = builder
+        let _join = builder
             .spawn(move || {
                 let mut runtime = match Self::init_runtime(&path, n_gpu_layers) {
                     Ok(rt) => {
@@ -206,10 +191,6 @@ impl SchemaEngine {
                                 }),
                             );
                             Some((outcome, req.reply))
-                        }
-                        Ok(SchemaMsg::Shutdown) => {
-                            tracing::info!("wupi-schema shutting down");
-                            break;
                         }
                         Err(mpsc::RecvError) => {
                             tracing::info!("wupi-schema: all senders dropped, exiting");
@@ -273,36 +254,13 @@ impl SchemaEngine {
         (
             SchemaEngine {
                 tx,
-                join: std::sync::Mutex::new(Some(join)),
             },
             init_rx,
         )
     }
 
-    /// Shut down the schema thread AND block until it has fully exited +
-    /// dropped its `SchemaRuntime` (LlamaContext + leaked model ref → VRAM
-    /// freed). This synchronous wait is load-bearing during model swaps: the
-    /// old fire-and-forget pattern posted Shutdown and returned immediately,
-    /// so the next `spawn_load` raced the thread's VRAM teardown and OOM'd
-    /// `load_from_file` → `NullResult` (Chloe's 2026-07-18 diagnosis of the
-    /// E4B/Agent.gguf load failures). By blocking on the JoinHandle we
-    /// guarantee VRAM is actually released before any new model allocates.
-    pub fn shutdown(&self) {
-        let _ = self.tx.send(SchemaMsg::Shutdown);
-        // Take the JoinHandle (so repeated shutdown() calls are safe) and
-        // block on it. A panic in the thread surfaces as Err; log + ignore
-        // since shutdown is best-effort anyway.
-        if let Ok(mut guard) = self.join.lock() {
-            if let Some(handle) = guard.take() {
-                if let Err(e) = handle.join() {
-                    tracing::warn!(error = ?e, "wupi-schema thread join failed during shutdown");
-                }
-            }
-        }
-    }
-
     /// Post a delta request. The caller awaits the reply via the receiver
-    /// it created. Fire-and-forget is NOT the contract here — the caller
+    /// it created. Fire-and-forget is NOT the contract here: the caller
     /// (chat_send's queue) needs the result before proceeding.
     pub fn request_delta(
         &self,
@@ -325,7 +283,7 @@ impl SchemaEngine {
     /// natural-language game-management request into a `SchemaDelta`. Used by
     /// `route_to_game_manager` when Wupi intercepts a "make it stormy" /
     /// "give me a sword" / "travel to the dungeon" command. Same reply
-    /// contract as `request_delta` — caller awaits via the returned receiver.
+    /// contract as `request_delta`: caller awaits via the returned receiver.
     pub fn request_translation(
         &self,
         player_request: String,
@@ -356,7 +314,7 @@ impl SchemaEngine {
     }
 
     /// Initialize the schema runtime: load the model by path (this engine's
-    /// OWN model — no `shared_model()`), leak it to `&'static`, create an
+    /// OWN model: no `shared_model()`), leak it to `&'static`, create an
     /// isolated context. Mirrors `memory_embedder_llama.rs::init_runtime`.
     /// Runs on the schema thread.
     fn init_runtime(path: &Path, n_gpu_layers: u32) -> anyhow::Result<SchemaRuntime> {
@@ -401,10 +359,10 @@ impl SchemaRuntime {
     ///
     /// Two-pass: render the delta prompt, generate, parse JSON. If parsing
     /// fails, retry once with a repair prompt. On second failure, return Err
-    /// (the schema is left unchanged for this turn — graceful degradation).
+    /// (the schema is left unchanged for this turn: graceful degradation).
     ///
     /// Returns `(raw_output, Result<delta, error>)` so the caller can always
-    /// see what the model emitted, even when parsing failed — essential for the
+    /// see what the model emitted, even when parsing failed: essential for the
     /// debug panel's JSON-malformedness diagnosis.
     fn generate_delta(
         &mut self,
@@ -426,7 +384,7 @@ impl SchemaRuntime {
                 let repair = render_repair_prompt(&raw);
                 let raw2 = self.generate_text(&repair)?;
                 // The returned raw_output is the RETRY's output (the most
-                // recent model emission) — that's what's diagnostically
+                // recent model emission): that's what's diagnostically
                 // useful when the caller wants to see why parsing failed.
                 match SchemaDelta::from_model_output(&raw2) {
                     Ok(delta) => Ok((raw2, Ok(delta))),
@@ -442,8 +400,8 @@ impl SchemaRuntime {
     }
 
     /// Translate a player's natural-language game-management request into a
-    /// `SchemaDelta` (Phase E, 2026-07-18). Same shape as `generate_delta` —
-    /// two-pass with repair, same JSON parser — but the prompt is built by
+    /// `SchemaDelta` (Phase E, 2026-07-18). Same shape as `generate_delta` -
+    /// two-pass with repair, same JSON parser: but the prompt is built by
     /// `game_command::render_translation_prompt` from the player's verbatim
     /// text + the current game-world schema. Used by Wupi-as-game-manager
     /// when she intercepts "make it stormy" / "give me a sword" via chat_send.
@@ -492,7 +450,7 @@ impl SchemaRuntime {
     ///
     /// The context is fully reset each call (clear_kv_cache + re-prefill from
     /// zero). Unlike the chat engine, there's no delta-prefill optimization
-    /// here — each prompt is a different schema + exchange, and the prompt is
+    /// here: each prompt is a different schema + exchange, and the prompt is
     /// small (~1-2KB), so a full prefill each call is cheap and correct.
     ///
     /// The sample/detokenize/batch pattern mirrors `engine.rs::decode_loop`
@@ -518,7 +476,7 @@ impl SchemaRuntime {
             tracing::warn!(dropped = drop, "schema prompt exceeded context; truncated from front");
         }
 
-        // Fresh cache each call — the schema context is one-shot, no reuse.
+        // Fresh cache each call: the schema context is one-shot, no reuse.
         self.ctx.clear_kv_cache();
 
         // Prefill in batches (mirrors engine.rs::prefill).
@@ -541,7 +499,7 @@ impl SchemaRuntime {
             consumed += take;
         }
 
-        // Sample-and-decode loop. Greedy (argmax) — JSON wants determinism,
+        // Sample-and-decode loop. Greedy (argmax): JSON wants determinism,
         // and there's no ThoughtGate/StreamFilter here (the output is JSON,
         // not the Gemma4 channel protocol). n_cur = next position to decode.
         let mut sampler = LlamaSampler::greedy();
@@ -593,7 +551,7 @@ impl SchemaRuntime {
 
 /// Render the schema-delta generation prompt. Uses the Gemma4 turn markers so
 /// the model sees familiar structure, but the content is schema-specific.
-/// NOT routed through `ChatFormat::render_prompt` — this is a dedicated
+/// NOT routed through `ChatFormat::render_prompt`: this is a dedicated
 /// renderer (the schema pass isn't a chat turn).
 fn render_delta_prompt(current_schema_json: &str, last_exchange: &(String, String)) -> String {
     let mut out = String::with_capacity(2048);
@@ -616,7 +574,7 @@ fn render_delta_prompt(current_schema_json: &str, last_exchange: &(String, Strin
 fn render_repair_prompt(bad_output: &str) -> String {
     let mut out = String::with_capacity(1024);
     out.push_str("<|turn>system\n");
-    out.push_str("Your previous output was not valid JSON. Emit ONLY the JSON delta object — no prose, no markdown fences, no commentary. If nothing changed, emit {}.");
+    out.push_str("Your previous output was not valid JSON. Emit ONLY the JSON delta object: no prose, no markdown fences, no commentary. If nothing changed, emit {}.");
     out.push_str("<turn|>\n");
     out.push_str("<|turn>user\n");
     out.push_str("Previous (invalid) output:\n");
@@ -629,8 +587,8 @@ fn render_repair_prompt(bad_output: &str) -> String {
 /// Cheap content gate for whether the schema delta pass should fire this turn.
 ///
 /// The delta pass is a FULL 12B forward pass (tokenize + prefill + greedy
-/// decode up to 256 tokens). Firing it unconditionally on every turn —
-/// including "ok", "thanks", "lol", "yes" — burns ~1-4s of dedicated GPU time
+/// decode up to 256 tokens). Firing it unconditionally on every turn -
+/// including "ok", "thanks", "lol", "yes": burns ~1-4s of dedicated GPU time
 /// for a turn that changed nothing in the world. This gate skips those.
 ///
 /// **Conservative by design.** The cost of a false skip (missing a real world-
@@ -642,11 +600,11 @@ fn render_repair_prompt(bad_output: &str) -> String {
 ///
 /// - User message ≤ 4 words AND ≤ 32 chars (covers "ok", "thanks", "lol",
 ///   "yes", "no", "sure", "k", "yep", "continue", "ok cool", etc.).
-/// - No assistant content (empty/error reply — nothing to record).
+/// - No assistant content (empty/error reply: nothing to record).
 ///
 /// # What does NOT skip (deliberately)
 ///
-/// - Short roleplay actions ("I nod", "I draw" — 2 words but world-moving).
+/// - Short roleplay actions ("I nod", "I draw": 2 words but world-moving).
 ///   These are 2 words but contain a verb in first person, so the word-count
 ///   gate alone is wrong for them. We can't distinguish "I nod" from "ok"
 ///   cheaply without a model call, so we FIRE on anything that looks like it
@@ -680,7 +638,7 @@ pub fn should_fire_delta(user_text: &str, assistant_text: &str) -> bool {
         ];
         let looks_like_action = PRONOUNS.iter().any(|p| lower.starts_with(p));
         if looks_like_action {
-            return true; // ambiguous — fire to be safe
+            return true; // ambiguous: fire to be safe
         }
         return false; // short, compact, no pronoun → filler, skip
     }
@@ -691,7 +649,7 @@ pub fn should_fire_delta(user_text: &str, assistant_text: &str) -> bool {
 const DELTA_SYSTEM_INSTRUCTION: &str = "\
 You are a world-state tracker. Given the current schema and the last exchange, emit ONLY the keys that changed as a JSON delta. Do NOT rewrite unchanged keys.
 
-Output format (raw JSON only — no markdown fences, no prose):
+Output format (raw JSON only: no markdown fences, no prose):
 {
   \"summary\": \"<updated summary string, or omit if unchanged>\",
   \"recent_events\": [\"<new event>\", ...],
@@ -701,7 +659,7 @@ Output format (raw JSON only — no markdown fences, no prose):
 Rules:
 - Emit ONLY changed keys. Omit unchanged sections entirely. If nothing tracked changed this turn, emit {}.
 - entities: a null value means DELETE the key. A non-null string means SET/overwrite.
-- Keep the delta minimal — a few keys at most per turn.
+- Keep the delta minimal: a few keys at most per turn.
 - summary: only emit when the narrative arc meaningfully shifts, not every turn.
 - recent_events: append only genuinely new salient events.\n";
 
@@ -729,9 +687,8 @@ mod tests {
         assert!(prompt.contains("not json at all"));
     }
 
-    // ── should_fire_delta gate tests ────────────────────────────────────
     // The gate is the M2 overhead fix: skip the full 12B forward pass on
-    // clearly non-substantive turns. The contract is conservative — when in
+    // clearly non-substantive turns. The contract is conservative: when in
     // doubt, fire (the cost of a missed world-state change > one wasted pass).
 
     #[test]
@@ -767,7 +724,7 @@ mod tests {
 
     #[test]
     fn gate_fires_on_long_user_message_even_if_filler_sounding() {
-        // 5+ words clears the word ceiling regardless of content — fires.
+        // 5+ words clears the word ceiling regardless of content: fires.
         assert!(should_fire_delta(
             "ok so anyway let me think about that for a second",
             "Take your time."
@@ -786,51 +743,14 @@ mod tests {
 
     #[test]
     fn gate_fires_on_first_person_contraction() {
-        // "I'm" / "I'll" — pronoun check covers contractions too.
+        // "I'm" / "I'll": pronoun check covers contractions too.
         assert!(should_fire_delta("I'm going north", "The path narrows."));
         assert!(should_fire_delta("I'll attack", "You strike."));
     }
 
     #[test]
     fn gate_skips_short_message_without_pronoun_or_verb_shape() {
-        // 3 words, no pronoun, not action-shaped → filler, skip.
+        // 3 words, no pronoun, not action-shaped: filler, skip.
         assert!(!should_fire_delta("lol that's funny", "Glad you enjoyed it."));
     }
-}
-
-// ---------------------------------------------------------------------------
-// Model discovery (mirrors memory_embedder_llama.rs)
-// ---------------------------------------------------------------------------
-
-/// Find a named `.gguf` model in `dir` (case-insensitive exact-name match).
-/// Used by [`resolve_schema_model`] to locate either `WUPI.gguf` (Local mode)
-/// or `Agent.gguf` (API mode) for the schema engine's own model load.
-fn pick_named_model(dir: &Path, name: &str) -> Option<PathBuf> {
-    let target = name.to_lowercase();
-    std::fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .find(|e| {
-            e.path().extension().and_then(|x| x.to_str()).map_or(false, |x| x.eq_ignore_ascii_case("gguf"))
-                && e.file_name().to_string_lossy().to_lowercase() == target
-        })
-        .map(|e| e.path())
-}
-
-/// Resolve the schema engine's model across the standard candidate dirs.
-/// `name` is `"WUPI.gguf"` in Local mode or `"Agent.gguf"` in API mode.
-/// Mirrors `memory_embedder_llama::resolve_embed_model` + the candidate walk
-/// in `lib.rs::resolve_model_path`. Returns `None` if no matching file exists
-/// — the caller falls back to running without schema deltas (graceful).
-pub fn resolve_schema_model(dirs: &[PathBuf], name: &str) -> Option<PathBuf> {
-    for dir in dirs {
-        if dir.exists() {
-            if let Some(p) = pick_named_model(dir, name) {
-                tracing::info!("resolved schema model ({name}): {}", p.display());
-                return Some(p);
-            }
-        }
-    }
-    tracing::warn!("no {name} found — schema engine will not start (no world-state deltas)");
-    None
 }

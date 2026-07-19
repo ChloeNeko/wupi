@@ -38,9 +38,18 @@ html, body {
     letter-spacing: 0.5px;
     z-index: 9999;
     user-select: none;
+    /* Waking Canvas: hidden above the top edge while body.booting, slides
+       down on transition. The 0.2s delay stages it just after the aurora
+       ramp begins. cubic-bezier is the house spring curve (see .dock-container). */
+    transform: translateY(-100%);
+    transition: transform 0.7s cubic-bezier(0.175, 0.885, 0.32, 1.1) 0.2s;
+}
+/* Reset to rest position once the boot gate resolves (script.js removes
+   .booting from <body>). */
+body:not(.booting) .top-bar {
+    transform: translateY(0);
 }
 
-/* ── "WUPI OS" title — live AI-status indicator ──────────────────────
    The title never pulses on its own. It is one of three states, driven
    by the title-state controller in script.js:
      - idle/boot: steady medium white glow, no animation
@@ -64,7 +73,7 @@ html, body {
     transition: color 0.35s ease, text-shadow 0.35s ease;
 }
 
-/* OFFLINE — fast steady red alarm flash. Speed mirrors a one-note fire
+/* OFFLINE: fast steady red alarm flash. Speed mirrors a one-note fire
    alarm: ~1Hz, sharp transitions (not eased), full-range opacity. */
 .os-title.is-offline {
     color: #ff3b3b;
@@ -79,7 +88,7 @@ html, body {
     50%, 100% { opacity: 0.3; text-shadow: 0 0 4px rgba(255, 59, 59, 0.2); }
 }
 
-/* TYPING — JS-toggled flicker class. The base .is-typing state is just
+/* TYPING: JS-toggled flicker class. The base .is-typing state is just
    the idle white; .title-flicker gets added/removed on a randomized
    timer to produce subtle organic "typing" spurts. */
 .os-title.is-typing,
@@ -283,7 +292,6 @@ html, body {
     animation: fadeIn 0.12s ease-out;
 }
 
-/* ── Theme cascade panels (paw → theme → color code) ──────────────────────
    Each panel is a sibling of the paw dropdown, anchored to its right edge so
    all three align horizontally. top matches the paw dropdown (56px).
    NOTE: must outrank `.menu-container .dropdown-menu { left: 0 }` in
@@ -307,13 +315,13 @@ html, body {
     border: 1px solid rgba(255, 255, 255, 0.2);
 }
 
-/* Aurora theme swatch — a condensed slice of the aurora gradient */
+/* Aurora theme swatch: a condensed slice of the aurora gradient */
 .swatch-aurora {
     background: linear-gradient(135deg, #4a173d 0%, #b534fa 50%, #ff66b2 100%);
     box-shadow: 0 0 6px rgba(181, 52, 250, 0.5);
 }
 
-/* Vibrant color code — saturated magenta-violet */
+/* Vibrant color code: saturated magenta-violet */
 .swatch-vibrant {
     background: radial-gradient(circle at 35% 35%, #ff66b2, #b534fa 70%, #6a0dad);
     box-shadow: 0 0 6px rgba(255, 102, 178, 0.6);
@@ -376,7 +384,7 @@ html, body {
 }
 
 .dock-trigger-area {
-    /* Hugs the dock — only the visible sliver + a small hit zone above it
+    /* Hugs the dock: only the visible sliver + a small hit zone above it
        trigger the rise. Was width:100% (the whole bottom strip), which made
        the dock pop up on any bottom-edge hover. Now the trigger is sized to
        the dock container itself via inline-block + auto width. */
@@ -388,6 +396,14 @@ html, body {
     /* The container peeks ~10px above the bottom edge; give a small hover
        margin above it so the user doesn't have to pixel-aim. */
     padding-top: 12px;
+    /* Waking Canvas: hidden below the bottom edge while body.booting, slides
+       up on transition (0.35s delay = after top-bar + aurora ramp). The
+       translateX(-50%) centering is composed, not replaced. */
+    transform: translateX(-50%) translateY(120%);
+    transition: transform 0.7s cubic-bezier(0.175, 0.885, 0.32, 1.1) 0.35s;
+}
+body:not(.booting) .dock-trigger-area {
+    transform: translateX(-50%) translateY(0);
 }
 
 .dock-container {
@@ -525,9 +541,7 @@ html, body {
     font-variant-numeric: tabular-nums;
 }
 
-/* ════════════════════════════════════════════════════════════════════════ */
-/* APP WINDOWS — overlay panels layered over the canvas                       */
-/* ════════════════════════════════════════════════════════════════════════ */
+/* APP WINDOWS: overlay panels layered over the canvas                       */
 /* One Tauri window; these are DOM overlays. z-index 1000 puts them above the
    canvas (z:1) but below the top-bar (z:9999) and dock (z:9998) so system
    chrome stays usable. Dark-violet glassmorphism: the backdrop blur shows the
@@ -587,7 +601,7 @@ html, body {
 /* Modal geometry: centered both axes, auto-sized with clamps.
    Draggable modals (Profile, Codex) are also user-resizable via the native
    resize handle (bottom-right). `.dragged` is applied by JS once the user
-   grabs the header — it drops the centering transform so left/top take over. */
+   grabs the header: it drops the centering transform so left/top take over. */
 .app-window.modal {
     top: 50%;
     left: 50%;
@@ -600,7 +614,7 @@ html, body {
     width: 760px;
     max-height: 82vh;
 }
-/* AI panel — fixed compact width matching its body. No resize handle, no
+/* AI panel: fixed compact width matching its body. No resize handle, no
    movement, just centered content. */
 .app-window.modal.api {
     width: 500px;
@@ -621,7 +635,7 @@ html, body {
     transform: translate(-50%, -50%);
     animation: winOpenModal 0.18s ease-out;
 }
-/* Pure opacity fade — NO transform animation. Animating transform alongside
+/* Pure opacity fade: NO transform animation. Animating transform alongside
    the `display:none→flex` flip caused a one-frame mismatch between the resting
    `translate(-50%,-50%)` and the keyframe's start offset, which read as a
    "flash from bottom then teleport to center." Opacity-only keeps the element
@@ -675,7 +689,6 @@ html, body {
 }
 .app-window-body::-webkit-scrollbar-thumb:hover { background: rgba(181, 52, 250, 0.5); }
 
-/* ── Reusable form controls (Profile + Codex) ─────────────────────────── */
 .field-label {
     display: block;
     font-size: 12px;
@@ -738,7 +751,6 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 }
 .field-btn.danger:hover { background: rgba(255, 60, 60, 0.28); }
 
-/* ── Profile Editor ───────────────────────────────────────────────────── */
 .profile-hint {
     margin: 0 0 4px;
     font-size: 13px;
@@ -757,9 +769,9 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 .profile-status.ok { color: #7eff9c; }
 .profile-status.err { color: #ff8080; }
 
-/* ── AI panel — mode selector (LOCAL | ONLINE) + local model + online
+/* ── AI panel: mode selector (LOCAL | ONLINE) + local model + online
    profile list + editor. Replaces the old radio + "+ New" layout. ─── */
-/* The AI panel is non-scrollable + non-resizable — content is compact and
+/* The AI panel is non-scrollable + non-resizable: content is compact and
    must fit without a scrollbar. Let the body fill the panel width (the panel
    itself is sized by .app-window.modal.api); don't hardcode a narrower body
    width or content shifts left with dead space on the right. */
@@ -820,7 +832,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 }
 .ai-mode-box.active svg { opacity: 1; }
 
-/* LOCAL section — a single centered glowing bubble. Only one local model
+/* LOCAL section: a single centered glowing bubble. Only one local model
    exists today, so it's a list-of-one; the active look is permanent. */
 .ai-local-section {
     margin-top: 22px;
@@ -883,7 +895,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     text-align: center;
 }
 
-/* ONLINE section — hidden unless ONLINE mode is active. */
+/* ONLINE section: hidden unless ONLINE mode is active. */
 .ai-online-section {
     margin-top: 22px;
     display: none;
@@ -904,7 +916,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 }
 .ai-online-stack .field-label:first-child { margin-top: 0; }
 
-/* Generic select styling — replaces .ai-model-select. Same look as text
+/* Generic select styling: replaces .ai-model-select. Same look as text
    inputs but with a dropdown indicator. */
 .ai-select {
     cursor: pointer;
@@ -914,7 +926,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 .ai-select:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* Dropdown LIST (the popup that opens when you click the select). The
-   default OS/Chrome rendering is stark white with gray text — clashes
+   default OS/Chrome rendering is stark white with gray text: clashes
    badly with the dark Aurora UI. These rules style the popup itself so
    it matches the panel's dark theme. */
 .ai-select option {
@@ -928,7 +940,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     color: #ffffff;
 }
 
-/* Online bubble — mirrors the LOCAL 12B bubble shape. Inactive = muted gray;
+/* Online bubble: mirrors the LOCAL 12B bubble shape. Inactive = muted gray;
    .active = same magenta glow treatment as the local bubble so the visual
    language matches. */
 .ai-online-bubble {
@@ -953,7 +965,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     animation: localGlow 3.5s ease-in-out infinite;
 }
 /* Pending = profile + model picked in the dropdowns but not yet connected.
-   Preview state — subdued white, no glow, no animation. */
+   Preview state: subdued white, no glow, no animation. */
 .ai-online-bubble.pending {
     border-color: rgba(255, 255, 255, 0.25);
     background: rgba(255, 255, 255, 0.05);
@@ -977,7 +989,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 }
 .ai-online-bubble.active .ai-online-bubble-model { color: rgba(255, 255, 255, 0.7); }
 
-/* Connect button — pink/magenta primary action, full-width pill. */
+/* Connect button: pink/magenta primary action, full-width pill. */
 .ai-connect-btn {
     margin-top: 16px;
     padding: 12px 28px;
@@ -1014,7 +1026,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     margin: 22px 0 16px;
 }
 
-/* PROFILE header — label on the left, edit + trash tools on the far right. */
+/* PROFILE header: label on the left, edit + trash tools on the far right. */
 .ai-profile-header {
     display: flex;
     align-items: center;
@@ -1052,7 +1064,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     transform: scale(1.18);
 }
 
-/* The centered glowing + button — replaces Save. Big, bold, borderless,
+/* The centered glowing + button: replaces Save. Big, bold, borderless,
    magenta glow. Errors (via the status line) if fields are incomplete. */
 .ai-add-btn {
     display: block;
@@ -1080,7 +1092,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 }
 
 /* Orphaned .api-profile-list rules removed (the dropdown UI replaced the
-   row list — see #aiProfileSelect). */
+   row list: see #aiProfileSelect). */
 .api-profile-row {
     display: flex;
     align-items: center;
@@ -1146,7 +1158,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     background: rgba(255, 255, 255, 0.02);
     transition: border-color 0.2s;
 }
-/* Edit mode — subtle flashing red border so the user can tell their edits
+/* Edit mode: subtle flashing red border so the user can tell their edits
    target an existing profile (Save overwrites, Cancel reverts). */
 .api-editor.editing {
     animation: editorEditPulse 1.6s ease-in-out infinite;
@@ -1165,7 +1177,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     opacity: 1;
 }
 
-/* Action row — Save bottom-left, Cancel bottom-right. */
+/* Action row: Save bottom-left, Cancel bottom-right. */
 .ai-actions {
     display: flex;
     justify-content: space-between;
@@ -1173,7 +1185,6 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     margin-top: 16px;
 }
 
-/* ── Codex — authored lore library (two-pane) ───────────────────── */
 /* Left: searchable list of lore entries. Right: reader / editor for the
    selected entry. The window itself is draggable + resizable (`.modal.draggable`). */
 .codex-body { padding: 0; }
@@ -1355,12 +1366,11 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 .codex-mini-btn:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
 .codex-mini-btn.del:hover { background: rgba(255, 60, 60, 0.22); color: #ff9090; border-color: rgba(255, 60, 60, 0.3); }
 
-/* ── Docks (full-screen home launcher grid) ──────────────────────────── */
-/* winApps is a full-screen overlay (NOT a modal) — the "desktop/home" view.
+/* winApps is a full-screen overlay (NOT a modal): the "desktop/home" view.
    Background stays fully active (stars/aurora animate behind it); the overlay
    itself is nearly transparent so the canvas shows through. App icons live in
    a centered grid; clicking one closes home and opens that surface.
-   NOTE: the flex layout lives under `.home.show` — the base `.app-window` rule
+   NOTE: the flex layout lives under `.home.show`: the base `.app-window` rule
    sets `display:none`, and we must NOT override it here or the overlay covers
    the whole screen invisibly on load (blocking all interaction). */
 .app-window.home {
@@ -1410,7 +1420,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     transform: translateY(-6px) scale(1.05);
 }
 .home-app-icon {
-    /* No background, no border — just the bare SVG glyph, bigger. The purple
+    /* No background, no border: just the bare SVG glyph, bigger. The purple
        square around each icon was visual noise; the outline icons read
        cleaner as pure strokes over the aurora. */
     width: 96px;
@@ -1435,7 +1445,6 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     color: rgba(255, 255, 255, 0.9);
 }
 
-/* ── WUPI Chat ────────────────────────────────────────────────────────── */
 .chat-body {
     padding: 0;
     display: flex;
@@ -1578,3 +1587,67 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     color: rgba(255, 255, 255, 0.8);
 }
 .chat-stop-btn:not(:disabled):hover { background: rgba(255, 80, 80, 0.25); color: #fff; }
+
+/* ───────────────────────────────────────────────────────────────────────
+   Boot splash — paints on first frame before the canvas initializes, so the
+   webview never flashes its default white. Lives in the transparent 500×500
+   boot window. Fades + self-removes once the boot gate resolves (script.js).
+   Pure HTML/CSS: the ring is a conic-gradient masked into a ring + two
+   compositor-only animations (transform rotate + filter pulse). Zero RAF,
+   zero asset weight, ~0 CPU.
+   ─────────────────────────────────────────────────────────────────────── */
+#boot-splash {
+    position: fixed;
+    inset: 0;
+    z-index: 99999;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    /* Dark-violet radial vignette: reads as a floating glass panel over the
+       desktop (transparent window) while hiding the uninitialized canvas.
+       Palette matches the .app-window glass language (#150524 / #02040a). */
+    background: radial-gradient(ellipse at center, #150524 0%, #02040a 75%);
+    transition: opacity 0.6s ease-out;
+}
+#boot-splash.fade-out {
+    opacity: 0;
+    pointer-events: none;
+}
+
+/* Aurora ring: conic sweep magenta → sky → violet → magenta. The radial
+   mask carves the center hole so it reads as a ring, not a disc. The
+   drop-shadow gives the glow halo (NOT a box-shadow: drop-shadow follows
+   the masked ring shape, box-shadow would square off). */
+.boot-ring {
+    width: 120px;
+    height: 120px;
+    border-radius: 50%;
+    background: conic-gradient(from 0deg, #b534fa, #66e0ff, #9b5cff, #b534fa);
+    -webkit-mask: radial-gradient(circle, transparent 58%, #000 60%);
+    mask: radial-gradient(circle, transparent 58%, #000 60%);
+    animation: ringSpin 2s linear infinite, ringPulse 2s ease-in-out infinite;
+}
+@keyframes ringSpin {
+    to { transform: rotate(360deg); }
+}
+@keyframes ringPulse {
+    0%, 100% { filter: drop-shadow(0 0 14px rgba(181, 52, 250, 0.4)); }
+    50%      { filter: drop-shadow(0 0 26px rgba(102, 224, 255, 0.7)); }
+}
+
+.boot-wordmark {
+    margin-top: 28px;
+    font-size: 15px;
+    letter-spacing: 4px;
+    color: rgba(255, 255, 255, 0.85);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+.boot-caption {
+    margin-top: 8px;
+    font-size: 11px;
+    letter-spacing: 1.5px;
+    color: rgba(255, 255, 255, 0.4);
+    text-transform: uppercase;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}

@@ -1,9 +1,9 @@
 //! Wi-Fi integration (Win32 WLAN via the `windows` crate, wlanapi.dll).
 //!
 //! Exposes:
-//! - `wifi_get_current` — the connected network (SSID, signal %) if any.
-//! - `wifi_scan` — visible networks with signal + security flags.
-//! - `wifi_connect` — connect to a network (password for secured networks).
+//! - `wifi_get_current`: the connected network (SSID, signal %) if any.
+//! - `wifi_scan`: visible networks with signal + security flags.
+//! - `wifi_connect`: connect to a network (password for secured networks).
 //!
 //! WLAN is plain C FFI: handle-based, raw pointers, manual WlanFreeMemory.
 //! All calls run on a per-call worker thread (no COM init needed for WLAN,
@@ -39,7 +39,6 @@ pub struct WifiState {
     pub signal_pct: u8,
 }
 
-// ── WLAN handle guard ───────────────────────────────────────────────────────
 
 /// RAII guard for the WLAN client handle: closes on drop. The handle is a
 /// `HANDLE` wrapping a raw pointer; closing it releases the WLAN session.
@@ -110,12 +109,11 @@ fn first_interface(handle: &WlanHandle) -> Result<GUID, String> {
 /// Pull an SSID byte buffer (up to 32 bytes, DOT11_SSID length) into a String.
 fn ssid_to_string(uc_ssid: &[u8], length: u32) -> String {
     let len = (length as usize).min(uc_ssid.len());
-    // SSIDs are bytes, not strictly utf-16 — DOT11_SSID defines a byte buffer,
+    // SSIDs are bytes, not strictly utf-16: DOT11_SSID defines a byte buffer,
     // commonly ASCII. Use from_utf8_lossy for safety.
     String::from_utf8_lossy(&uc_ssid[..len]).to_string()
 }
 
-// ── Tauri commands ──────────────────────────────────────────────────────────
 
 #[tauri::command]
 pub fn wifi_get_current() -> Result<WifiState, String> {
@@ -189,7 +187,7 @@ pub fn wifi_scan() -> Result<Vec<WifiNetwork>, String> {
                 list.wlanBssEntries.as_ptr(),
                 list.dwNumberOfItems as usize,
             );
-            // One BSS entry PER ACCESS POINT — a mesh/multi-AP network like a
+            // One BSS entry PER ACCESS POINT: a mesh/multi-AP network like a
             // home Wi-Fi produces 3-6 entries for the SAME SSID. Collapse to
             // one network per SSID, keeping the strongest signal. This is why
             // the panel showed "MyNet 85%, MyNet 90%, MyNet 85%" etc.
@@ -228,7 +226,7 @@ pub fn wifi_scan() -> Result<Vec<WifiNetwork>, String> {
 }
 
 /// Toggle the Wi-Fi radio on/off via the WinRT Radio API. The Win32 WLAN API
-/// (wlanapi.dll) has no clean radio on/off — Windows exposes that through the
+/// (wlanapi.dll) has no clean radio on/off: Windows exposes that through the
 /// same `Devices::Radios::Radio` interface Bluetooth uses. Run on a worker
 /// thread with MTA CoInitializeEx + block on the IAsyncOperation via `.get()`.
 #[tauri::command]
