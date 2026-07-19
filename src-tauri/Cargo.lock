@@ -5073,7 +5073,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "wupi-os"
+name = "wupi"
 version = "0.1.0"
 dependencies = [
  "anyhow",

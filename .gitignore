@@ -23,3 +23,11 @@ tools/
 .DS_Store
 .vscode/
 .idea/
+
+# --- Tauri updater signing keys (CRITICAL: never commit).
+#     The pubkey goes in tauri.conf.json (safe to commit); the PRIVATE key
+#     must stay outside the repo at ~/.tauri/wupi.key. These rules are a
+#     backstop in case a future key gen lands one inside the tree. ---
+*.key
+*.key.pub
+~/

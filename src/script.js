@@ -898,7 +898,7 @@ function setTitleState(state) {
   //    is special: it's only emitted when the real model-status:ready event
   //    fires (listened below). Other lines are fake but flavored to look real.
   const TERMINAL_LINES = [
-    '› wupi-os v0.1.0 (gemma-4 12B)',
+    '› wupi v0.1.0 (gemma-4 12B)',
     '› initializing kernel...',
     '› mounting shared_backend()...',
     '› allocating LlamaContext: chat (n_ctx=4000)',

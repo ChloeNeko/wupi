@@ -1,10 +1,10 @@
 [package]
-name = "wupi-os"
+name = "wupi"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "wupi_os_lib"
+name = "wupi_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
