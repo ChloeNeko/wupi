@@ -1661,9 +1661,11 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     filter: drop-shadow(0 0 14px rgba(181, 120, 255, 0.45));
 }
 
-/* Sparkles: tiny 4-point stars that burst outward at each hop apex.
-   Spawned by script.js as children of #boot-paw, animated via the
-   bootSparkle keyframe (one-shot, then self-removed). */
+/* Sparkles: tiny 4-pointed stars. Two contexts:
+   - Burst sparkles (children of #boot-paw): fly outward at hop apexes + on
+     landing. Animated via bootSparkle (one-shot, self-removed).
+   - Trail sparkles (children of <body>): spawn along the paw's path during
+     entry/circle/flight. Fixed viewport position, just fade + shrink. */
 .boot-sparkle {
     position: absolute;
     left: 50%;
@@ -1673,15 +1675,44 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     margin-left: -4px;
     margin-top: -4px;
     pointer-events: none;
-    /* 4-pointed star via two rotated squares (clip-path diamond). Cheap
-       and crisp at any scale. */
+    /* 4-pointed star via clip-path. Cheap and crisp at any scale. */
     background: #ffe6ff;
     clip-path: polygon(50% 0%, 60% 40%, 100% 50%, 60% 60%, 50% 100%, 40% 60%, 0% 50%, 40% 40%);
     filter: drop-shadow(0 0 6px rgba(255, 150, 255, 0.9));
     animation: bootSparkle 0.7s ease-out forwards;
 }
+/* Escalated burst: hop 2 + the landing capstone. Bigger star, longer life,
+   wider burst distance. script.js also overrides the background + glow hue
+   per-sparkle for a multi-colored effect (magenta/cyan/violet palette). */
+.boot-sparkle.big {
+    width: 14px;
+    height: 14px;
+    margin-left: -7px;
+    margin-top: -7px;
+    animation: bootSparkleBig 0.95s ease-out forwards;
+}
+/* Trail sparkle: spawned at a fixed viewport coord (left/top set inline by
+   JS). No outward burst — it just fades + shrinks in place so it reads as
+   a stationary point the paw left behind. */
+.boot-sparkle.trail {
+    position: fixed;
+    margin-left: -3px;
+    margin-top: -3px;
+    width: 6px;
+    height: 6px;
+    animation: bootSparkleTrail 0.45s ease-out forwards;
+}
 @keyframes bootSparkle {
     0%   { transform: translate(0, 0) scale(0) rotate(0deg);   opacity: 1; }
     40%  { opacity: 1; }
     100% { transform: var(--burst, translate(40px, -30px)) scale(1.2) rotate(180deg); opacity: 0; }
+}
+@keyframes bootSparkleBig {
+    0%   { transform: translate(0, 0) scale(0) rotate(0deg);   opacity: 1; }
+    25%  { opacity: 1; }
+    100% { transform: var(--burst, translate(60px, -40px)) scale(1.6) rotate(360deg); opacity: 0; }
+}
+@keyframes bootSparkleTrail {
+    0%   { transform: scale(0.4); opacity: 0.9; }
+    100% { transform: scale(0);   opacity: 0; }
 }

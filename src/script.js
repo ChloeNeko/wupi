@@ -456,15 +456,19 @@ function setTitleState(state) {
 //   - body:not(.booting)   → #02040a (CSS)     → solid black covers desktop.
 //
 // CHOREOGRAPHY (per spec, refined):
-//   0.0s  Blank screen (paw parked below the bottom edge, off-screen).
-//   1.0s  Paw ENTERS from the bottom, jumping up to viewport center.
-//         Two hops total; sparkles burst at each hop apex.
-//   ~3.4s After hop 2 lands, paw FLIES to its home spot in the top-left
-//         (the real .paw-img rect, read via getBoundingClientRect), shrinking
-//         from ~120px → 45px. easeOutQuint, no overshoot.
-//   land  Staged reveal (see revealAfterLand): body opaque → top-bar fades in
-//         → canvas paints sky+stars → aurora LEFT-TO-RIGHT wipe (cheap during
-//         reveal) → boot-paw removed → dock fades in last.
+//   0.0s  Blank screen (paw parked below the bottom edge, off-screen,
+//         opacity:0 so no top-left flash).
+//   1.0s  Paw ENTERS from the bottom, RISES + does a QUICK CLOCKWISE CIRCLE
+//         around viewport center, settles at center. Sparkle TRAIL follows
+//         the paw's path (small fixed-position sparkles spawned every ~55ms).
+//   ~1.9s Two QUICK hops. Each apex spawns a sparkle burst that ESCALATES:
+//         hop 1 = 8 small sparkles, hop 2 = 16 bigger multi-colored ones.
+//         Trail is paused during the hops so the bursts get the spotlight.
+//   ~3.0s Paw FLIES to its home spot in the top-left (the real .paw-img
+//         rect), shrinking ~120px → 45px. Trail restarts for the flight.
+//   land  Final big multi-colored burst (capstone), then staged reveal (see
+//         revealAfterLand): body opaque → top-bar fades in → canvas paints
+//         sky+stars → aurora LEFT-TO-RIGHT wipe → boot-paw removed → dock.
 //
 // STAGING NOTE: the top-bar's backdrop-filter:blur and the aurora's blur(30px)
 // are the two heavy GPU costs. They are now staged so they DON'T overlap —
@@ -480,12 +484,16 @@ function setTitleState(state) {
 // so the title's `typing` no-op guard can't swallow the wake signal.
 (function setupBootSplash() {
   // Timing constants (ms).
-  const ENTRY_DELAY = 3000;       // blank screen before paw enters (+2s per spec)
-  const ENTRY_DURATION = 700;     // paw rises from bottom → center
-  const HOP_DURATION = 450;       // each hop (up + down) — faster per spec
+  const ENTRY_DELAY = 1000;       // blank screen before paw enters (1s per spec)
+  const ENTRY_DURATION = 900;     // paw rises from bottom + quick circle → center
+  const HOP_DURATION = 450;       // each hop (up + down) — quick per spec
   const HOP_APEX = HOP_DURATION / 2;
   const HOP_HEIGHT = 80;          // px the inner img rises per hop
   const PAUSE_BETWEEN_HOPS = 120; // tiny rest between hop 1 and hop 2
+  // Sparkle trail: a small sparkle spawns every TRAIL_INTERVAL ms along the
+  // paw's path during entry + flight (NOT during hops — those get the big
+  // escalating bursts). Each trail sparkle is short-lived.
+  const TRAIL_INTERVAL = 55;
   // Paw display size at center. The resting paw-img is 45px; ~2.67x makes
   // it ~120px, prominent in the middle of the screen during the hops.
   const PAW_BOOT_SCALE = 2.67;
@@ -530,55 +538,117 @@ function setTitleState(state) {
 
   // ── Sparkle burst. Spawns N .boot-sparkle children of #boot-paw, each
   //    flying outward in a random direction via the --burst CSS var. They
-  //    self-clean via the animation's `forwards` + a transitionend remover.
-  function spawnSparkles(count = 8) {
+  //    self-clean on animationend. The `tier` arg escalates the burst:
+  //      0 = small/short (trail sparkles, default hop-1 burst)
+  //      1 = bigger, more colorful, longer lifetime (hop-2 burst)
+  //    so each hop reads as a bigger, prettier event than the last.
+  function spawnSparkles(count = 8, tier = 0) {
     if (!bootPaw) return;
     for (let i = 0; i < count; i++) {
       const s = document.createElement('div');
-      s.className = 'boot-sparkle';
+      s.className = tier > 0 ? 'boot-sparkle big' : 'boot-sparkle';
       const angle = (Math.PI * 2 * i) / count + Math.random() * 0.4;
-      const dist = 30 + Math.random() * 40;
+      const baseDist = tier > 0 ? 55 : 30;
+      const dist = baseDist + Math.random() * (tier > 0 ? 50 : 40);
       const dx = Math.cos(angle) * dist;
       const dy = Math.sin(angle) * dist - 10; // bias upward slightly
       s.style.setProperty('--burst', `translate(${dx.toFixed(1)}px, ${dy.toFixed(1)}px)`);
+      // Hue jitter on the big tier so the escalated burst reads as
+      // multi-colored (magenta/cyan/violet palette).
+      if (tier > 0) {
+        const hues = [320, 190, 270, 300, 220];
+        const h = hues[Math.floor(Math.random() * hues.length)];
+        s.style.background = `hsl(${h}, 100%, 75%)`;
+        s.style.filter = `drop-shadow(0 0 8px hsla(${h}, 100%, 70%, 0.95))`;
+      }
       bootPaw.appendChild(s);
       s.addEventListener('animationend', () => s.remove(), { once: true });
     }
   }
 
+  // ── Trail sparkle: one small sparkle spawned at the paw's current screen
+  //    position. Used by the trail timer during entry/circle/flight. The
+  //    sparkle is appended to <body> (NOT #boot-paw) at fixed viewport
+  //    coords so it stays where it spawned instead of inheriting the paw's
+  //    transform. Self-cleans on animationend.
+  function spawnTrailSparkle() {
+    if (!bootPaw) return;
+    const r = bootPaw.getBoundingClientRect();
+    // getBoundingClientRect already accounts for the paw's scale, so r is
+    // the visual box. Spawn somewhere inside it (slight jitter) so the
+    // trail doesn't look like a single dot.
+    const jx = (Math.random() - 0.5) * r.width * 0.6;
+    const jy = (Math.random() - 0.5) * r.height * 0.6;
+    const s = document.createElement('div');
+    s.className = 'boot-sparkle trail';
+    s.style.left = (r.left + r.width / 2 + jx) + 'px';
+    s.style.top = (r.top + r.height / 2 + jy) + 'px';
+    document.body.appendChild(s);
+    s.addEventListener('animationend', () => s.remove(), { once: true });
+  }
+
+  // Trail control: setInterval-spawned trail sparkles while `trailActive`
+  // is true. Started before entry, stopped when hops begin (hops get the
+  // escalating bursts instead), restarted for the flight.
+  let trailTimer = null;
+  function startTrail() {
+    if (trailTimer) return;
+    trailTimer = setInterval(spawnTrailSparkle, TRAIL_INTERVAL);
+  }
+  function stopTrail() {
+    if (trailTimer) { clearInterval(trailTimer); trailTimer = null; }
+  }
+
   // ── Entry + hops. Uses the Web Animations API so we can dispatch sparkle
-  //    bursts at exact hop apexes (timings.onFrame). The inner img's
-  //    translateY animates; #boot-paw's translate/scale are reserved for the
-  //    entry rise + the later flight.
+  //    bursts at exact hop apexes. The inner img's translateY animates the
+  //    hops; #boot-paw's translate/scale are reserved for the entry arc +
+  //    circle and the later flight.
   function startEntryAndHops() {
     if (!bootPaw || !bootPawImg) { hopsDone = true; maybeFly(); return; }
 
     // Reveal the paw. CSS defaults it to opacity:0 (avoids a top-left flash
     // before this runs); now that we're about to animate it, flip it on.
-    // No transition on this opacity bump — we want it instant, the entry
-    // animation handles the motion.
     bootPaw.style.transition = 'transform 0.8s cubic-bezier(0.22, 1, 0.36, 1)';
     bootPaw.style.opacity = '1';
 
-    // Entry: animate #boot-paw's transform from "parked below" → "center".
-    // Done via WAAPI so the entry and the hops compose cleanly, and so we
-    // get a precise entry-end callback for starting hop 1.
+    // Start the sparkle trail — it follows the paw through entry + circle.
+    startTrail();
+
+    // Entry path: rise from below → arc into a quick clockwise circle
+    // around viewport center → settle at center. Built as a WAAPI keyframe
+    // sequence so the whole motion is one fluid animation. The circle is
+    // small (CIRCLE_RADIUS px) so it reads as a flourish, not a detour.
     const restCx = (window.innerWidth - PAW_REST_SIZE) / 2;
     const restCy = (window.innerHeight - PAW_REST_SIZE) / 2;
     const parkCy = window.innerHeight + 50;
+    const CIRCLE_RADIUS = 90;
+    // 4 keyframes around the circle (top, right, bottom, left) after the
+    // rise. Offset uses CSS px from the rest center.
+    const circlePoint = (angle) => ({
+      x: restCx + Math.cos(angle) * CIRCLE_RADIUS,
+      y: restCy + Math.sin(angle) * CIRCLE_RADIUS,
+    });
+    const c0 = circlePoint(-Math.PI / 2); // top of circle (entry merges here)
+    const c1 = circlePoint(0);            // right
+    const c2 = circlePoint(Math.PI / 2);  // bottom
+    const c3 = circlePoint(Math.PI);      // left
 
     const entryAnim = bootPaw.animate(
       [
-        { transform: `translate(${restCx}px, ${parkCy}px) scale(${PAW_BOOT_SCALE})` },
-        { transform: `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})` },
+        { transform: `translate(${restCx}px, ${parkCy}px) scale(${PAW_BOOT_SCALE})`, offset: 0 },
+        { transform: `translate(${c0.x}px, ${c0.y}px) scale(${PAW_BOOT_SCALE})`, offset: 0.45 },
+        { transform: `translate(${c1.x}px, ${c1.y}px) scale(${PAW_BOOT_SCALE})`, offset: 0.6 },
+        { transform: `translate(${c2.x}px, ${c2.y}px) scale(${PAW_BOOT_SCALE})`, offset: 0.75 },
+        { transform: `translate(${c3.x}px, ${c3.y}px) scale(${PAW_BOOT_SCALE})`, offset: 0.9 },
+        { transform: `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`, offset: 1 },
       ],
       { duration: ENTRY_DURATION, easing: 'cubic-bezier(0.22, 1, 0.36, 1)', fill: 'forwards' }
     );
-    // Commit the entry's final state to the inline style so subsequent CSS
-    // transitions (the flight) animate FROM this exact matrix.
     entryAnim.onfinish = () => {
       entryAnim.commitStyles();
       entryAnim.cancel();
+      // Stop the trail during hops — hops get the escalating bursts.
+      stopTrail();
       runHops();
     };
   }
@@ -596,13 +666,16 @@ function setTitleState(state) {
         ],
         { duration: HOP_DURATION, easing: 'ease-in-out', fill: 'forwards' }
       );
-      // Sparkle at the apex (HOP_APEX ms in).
-      setTimeout(spawnSparkles, HOP_APEX);
+      // Escalating burst at the apex: hop 1 = 8 small, hop 2 = 16 big +
+      // multi-colored. Each hop is prettier than the last per spec.
+      setTimeout(() => {
+        if (hop === 1) spawnSparkles(8, 0);
+        else spawnSparkles(16, 1);
+      }, HOP_APEX);
       a.onfinish = () => {
         if (hop < 2) {
           setTimeout(doHop, PAUSE_BETWEEN_HOPS);
         } else {
-          // Lock the inner img at translateY(0) so the flight transform is clean.
           a.commitStyles();
           a.cancel();
           hopsDone = true;
@@ -660,16 +733,23 @@ function setTitleState(state) {
       targetY = r.top;
     }
 
+    // Restart the sparkle trail for the flight (it was stopped when hops
+    // began). Stopped again on land.
+    startTrail();
+
     // One-shot: when the flight transition ends, run the staged reveal.
     const onLand = (e) => {
       if (e.propertyName !== 'transform') return;
       bootPaw.removeEventListener('transitionend', onLand);
+      stopTrail();
+      // One final big burst on landing — a celebratory capstone.
+      spawnSparkles(14, 1);
       revealAfterLand();
     };
     bootPaw.addEventListener('transitionend', onLand);
 
     // Set the target transform. The CSS transition on #boot-paw
-    // (transform 1.2s easeOutQuint, no overshoot) animates the flight.
+    // (transform 0.8s easeOutQuint, no overshoot) animates the flight.
     // rAF double-buffer so the browser commits the start transform before
     // we set the target, guaranteeing the transition runs.
     requestAnimationFrame(() => {
