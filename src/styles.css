@@ -1623,18 +1623,20 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 #boot-paw {
     position: fixed;
     left: 0;
-    /* BORN BELOW THE SCREEN. Default layout position is off-screen so the
-       paw never paints at (0,0) before JS parks it — that was causing a
-       one-frame flash at top-left followed by a slide to the bottom. With
-       this, the element is invisible from the very first paint regardless
-       of when JS runs. JS still sets an explicit transform (translate +
-       scale) for the entry/flight choreography, but it no longer has to
-       fight a transition to get the paw off-screen initially. */
-    top: 110vh;
+    top: 0;
     width: 45px;
     height: 45px;
     z-index: 100000;
     pointer-events: none;
+    /* BORN INVISIBLE. opacity:0 by default so there's no top-left flash
+       before JS parks the paw via transform. JS flips opacity to 1 the
+       instant the entry animation starts. This avoids the layout-position
+       conflict that `top: 110vh` caused (translate is added to layout
+       position, so 110vh + translate pushed the paw permanently off-screen
+       during entry — the paw was technically animating, just way below the
+       viewport). With top:0 + opacity:0, transforms are viewport-absolute
+       and the paw appears exactly when we want it. */
+    opacity: 0;
     /* The flight transition. translate + scale are composed by JS into one
        matrix so the browser animates a single compositor transform. The
        opacity transition is for the final removal fade. Easing is

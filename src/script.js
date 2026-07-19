@@ -553,6 +553,13 @@ function setTitleState(state) {
   function startEntryAndHops() {
     if (!bootPaw || !bootPawImg) { hopsDone = true; maybeFly(); return; }
 
+    // Reveal the paw. CSS defaults it to opacity:0 (avoids a top-left flash
+    // before this runs); now that we're about to animate it, flip it on.
+    // No transition on this opacity bump — we want it instant, the entry
+    // animation handles the motion.
+    bootPaw.style.transition = 'transform 0.8s cubic-bezier(0.22, 1, 0.36, 1)';
+    bootPaw.style.opacity = '1';
+
     // Entry: animate #boot-paw's transform from "parked below" → "center".
     // Done via WAAPI so the entry and the hops compose cleanly, and so we
     // get a precise entry-end callback for starting hop 1.
