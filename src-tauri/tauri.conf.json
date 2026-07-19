@@ -43,7 +43,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEUzMzU5RDYwODFGOUZBMDUKUldRRit2bUJZSjAxNHpnZVhhYzljck43QUNGdVNtWWdVaHMxMjU5SXYzZWN1SFlFdmxVamdGdnMK",
       "endpoints": [
-        "https://updates.wupi.os/{{target}}/{{arch}}/{{current_version}}"
+        "https://chloeneko.github.io/WUPI/updater/latest.json"
       ]
     }
   }
