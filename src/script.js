@@ -481,13 +481,13 @@ function setTitleState(state) {
 (function setupBootSplash() {
   // Timing constants (ms).
   const ENTRY_DELAY = 1000;       // blank screen before paw enters (1s per spec)
-  // Fairy-zoom choreography: rise → dart TOP-LEFT (dwell) → dart TOP-RIGHT
-  // (dwell) → drop to CENTER. Each dart is a hard ZOOM_EASE in/out so the
-  // paw reads as a fairy teleporting with momentum. The dwells on the sides
-  // are deliberate holds (same-coord keyframes) so the paw lingers visibly
-  // at each side before darting across — per spec ("stay in the left and
-  // right side a little bit longer").
-  const ENTRY_DURATION = 2200;
+  // Fairy-tour choreography: rise from below → DART to TOP-LEFT MIDDLE
+  // (hold 1s) → DART to TOP-RIGHT MIDDLE (hold 1s) → DART to CENTER
+  // (hold 1s). Each dart is a hard ZOOM_EASE in/out so the paw reads as a
+  // fairy teleporting with momentum. The 1-second holds at each corner are
+  // per spec ("stays for 1 second" at each).
+  // Total = 500 rise + 1000 hold + 500 dart + 1000 hold + 500 dart + 1000 hold = 4500ms.
+  const ENTRY_DURATION = 4500;
   // Sharp accel + sharp decel — the "fairy dart" easing. Most of the
   // motion happens in the middle of the segment, with hard start/stop.
   const ZOOM_EASE = 'cubic-bezier(0.65, 0, 0.35, 1)';
@@ -497,27 +497,27 @@ function setTitleState(state) {
   const PAUSE_BETWEEN_HOPS = 80;  // tight rest between hop 1 and hop 2
   // Sparkle trail: a sparkle spawns every TRAIL_INTERVAL ms along the paw's
   // path during entry + flight (NOT during hops — those get the escalating
-  // bursts). Tight interval + bigger/longer-lived sparkles so the trail
-  // reads as an obvious glowing comet tail, not a sparse dot pattern.
+  // bursts). Tight interval so the trail reads as a glowing comet tail.
   const TRAIL_INTERVAL = 25;
   // Paw display size at center. The resting paw-img is 45px; ~2.8x makes
   // it ~126px — a touch smaller than the previous 3.4x per spec ("a little
   // smaller"), still prominent in the middle of the screen during the hops.
   const PAW_BOOT_SCALE = 2.8;
   const PAW_REST_SIZE = 45;
-  // Flight speed: the post-hop dash from center → top-left corner. Snappy
-  // per spec ("moves quickly and not just stays in the middle any longer").
-  // The entry transition is overridden with this faster curve right before
-  // the flight target is set in flyPawHome().
-  const FLIGHT_DURATION_MS = 500;
+  // Curved corner flight: fires IMMEDIATELY after hop 2 (no model-ready
+  // gate — that was the cause of the center loiter). The path is a
+  // parabolic arc bowing above the straight diagonal, not a straight line.
+  // Per spec: "Not a straight line but a curve as it moves into the corner."
+  const FLIGHT_DURATION_MS = 650;
   // Staged-reveal delays (ms) measured from flight-land (transitionend).
   // Top-bar fade is 0.6s in CSS; aurora wipe arms AFTER it finishes so the
   // two blur costs never overlap.
   const DELAY_SKY = 200;          // canvas RAF starts (sky + stars only)
   const DELAY_PAW_REMOVE = 400;   // boot-paw fades → real paw revealed
   const DELAY_AURORA = 800;       // aurora wipe arms (after top-bar's 0.6s fade)
-  // Min-dwell: gate the FLIGHT on the model being ready + a floor so the
-  // hops always play out even if the model loads instantly.
+  // Min-dwell is no longer a flight gate (the choreography's built-in 1s
+  // holds + hop durations define the length). Kept as a backstop in case
+  // a future regression needs a floor; not currently read for flight.
   const MIN_DWELL_MS = ENTRY_DELAY + ENTRY_DURATION + 2 * HOP_DURATION + PAUSE_BETWEEN_HOPS + 200;
   // Loading screen (runs AFTER the paw lands, BEFORE the staged reveal).
   // 8s per spec — adjustable. The text spans light L→R across this window;
@@ -525,8 +525,6 @@ function setTitleState(state) {
   const LOADING_DURATION_MS = 8000;
   const LOADING_TEXT = 'LOADING OS . . .';
 
-  let modelReady = false;
-  let dwellDone = false;
   let flightApproved = false;
   let hopsDone = false;
 
@@ -568,10 +566,12 @@ function setTitleState(state) {
       const s = document.createElement('div');
       s.className = tier > 0 ? 'boot-sparkle big' : 'boot-sparkle';
       const angle = (Math.PI * 2 * i) / count + Math.random() * 0.4;
-      const baseDist = tier > 0 ? 55 : 30;
-      const dist = baseDist + Math.random() * (tier > 0 ? 50 : 40);
+      // Burst distances scaled DOWN to match the smaller sparkles (the
+      // old 30-70px range made them fly far past the paw's reduced halo).
+      const baseDist = tier > 0 ? 28 : 16;
+      const dist = baseDist + Math.random() * (tier > 0 ? 26 : 22);
       const dx = Math.cos(angle) * dist;
-      const dy = Math.sin(angle) * dist - 10; // bias upward slightly
+      const dy = Math.sin(angle) * dist - 6; // bias upward slightly
       s.style.setProperty('--burst', `translate(${dx.toFixed(1)}px, ${dy.toFixed(1)}px)`);
       // Hue jitter on the big tier so the escalated burst reads as
       // multi-colored (magenta/cyan/violet palette).
@@ -579,7 +579,7 @@ function setTitleState(state) {
         const hues = [320, 190, 270, 300, 220];
         const h = hues[Math.floor(Math.random() * hues.length)];
         s.style.background = `hsl(${h}, 100%, 75%)`;
-        s.style.filter = `drop-shadow(0 0 8px hsla(${h}, 100%, 70%, 0.95))`;
+        s.style.filter = `drop-shadow(0 0 4px hsla(${h}, 100%, 70%, 0.95))`;
       }
       bootPaw.appendChild(s);
       s.addEventListener('animationend', () => s.remove(), { once: true });
@@ -636,19 +636,18 @@ function setTitleState(state) {
     // Start the sparkle trail — it follows the paw through the fairy-zoom.
     startTrail();
 
-    // Entry path: rise from below → dart to TOP-LEFT quadrant → dart to
-    // TOP-RIGHT quadrant → drop to CENTER. The "fairy-zoom": each dart is
-    // a hard in/out ZOOM_EASE so the paw reads as a fairy teleporting with
-    // momentum, leaving a sparkle trail like a comet. Sporadic, not circular.
+    // Entry path: rise from below → DART to TOP-LEFT MIDDLE (hold 1s) →
+    // DART to TOP-RIGHT MIDDLE (hold 1s) → DART to CENTER (hold 1s).
+    // The "fairy-tour": each dart is a hard ZOOM_EASE so the paw reads as a
+    // fairy teleporting with momentum, leaving a sparkle trail like a comet.
+    // 1-second holds at each stop per spec.
     const restCx = (window.innerWidth - PAW_REST_SIZE) / 2;
     const restCy = (window.innerHeight - PAW_REST_SIZE) / 2;
     const parkCy = window.innerHeight + 50;
-    // Dart endpoints. TOP-LEFT + TOP-RIGHT quadrants: the paw darts to the
-    // upper corners (not the full-width sides) per spec ("top left middle
-    // then top right middle, then the center" — "middle" = mid-height of
-    // the upper region, roughly y ≈ 32% of the viewport).
+    // Dart endpoints. TOP-LEFT MIDDLE + TOP-RIGHT MIDDLE = upper quadrants,
+    // roughly y ≈ 32% of viewport height ("middle" of the upper region).
     const DART_X_RANGE = 0.58;    // horizontal reach toward each corner
-    const TOP_Y_RATIO = 0.32;     // vertical position of the side dwells
+    const TOP_Y_RATIO = 0.32;     // vertical position of the side stops
     const leftX = Math.max(40, restCx - window.innerWidth * DART_X_RANGE / 2);
     const rightX = Math.min(window.innerWidth - PAW_REST_SIZE - 40,
                             restCx + window.innerWidth * DART_X_RANGE / 2);
@@ -656,28 +655,29 @@ function setTitleState(state) {
 
     const entryAnim = bootPaw.animate(
       [
-        // 0 → 0.22: rise from below to center.
+        // 0 → 0.11: rise from below to center (brief, just to enter).
         { transform: `translate(${restCx}px, ${parkCy}px) scale(${PAW_BOOT_SCALE})`,
           offset: 0, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' },
         { transform: `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.22, easing: ZOOM_EASE },
-        // 0.22 → 0.40: dart to TOP-LEFT quadrant.
+          offset: 0.11, easing: ZOOM_EASE },
+        // 0.11 → 0.22: dart to TOP-LEFT MIDDLE.
         { transform: `translate(${leftX}px, ${topY}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.40, easing: 'linear' },
-        // 0.40 → 0.52: DWELL at TOP-LEFT (same coord — holds ~260ms so the
-        // paw lingers visibly on the left side before darting across).
+          offset: 0.22, easing: 'linear' },
+        // 0.22 → 0.44: HOLD at TOP-LEFT for 1 second (same coord).
         { transform: `translate(${leftX}px, ${topY}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.52, easing: ZOOM_EASE },
-        // 0.52 → 0.70: dart to TOP-RIGHT quadrant (crosses the whole top).
+          offset: 0.44, easing: ZOOM_EASE },
+        // 0.44 → 0.56: dart to TOP-RIGHT MIDDLE (crosses the whole top).
         { transform: `translate(${rightX}px, ${topY}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.70, easing: 'linear' },
-        // 0.70 → 0.82: DWELL at TOP-RIGHT (same coord — holds ~260ms so the
-        // paw lingers visibly on the right side before dropping to center).
+          offset: 0.56, easing: 'linear' },
+        // 0.56 → 0.78: HOLD at TOP-RIGHT for 1 second (same coord).
         { transform: `translate(${rightX}px, ${topY}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.82, easing: ZOOM_EASE },
-        // 0.82 → 1.0: drop to CENTER (the spot the hops + flight originate).
+          offset: 0.78, easing: ZOOM_EASE },
+        // 0.78 → 0.89: dart down to CENTER.
         { transform: `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 1, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' },
+          offset: 0.89, easing: 'linear' },
+        // 0.89 → 1.0: HOLD at CENTER for 1 second (same coord).
+        { transform: `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`,
+          offset: 1, easing: 'linear' },
       ],
       { duration: ENTRY_DURATION, fill: 'forwards' }
     );
@@ -726,36 +726,28 @@ function setTitleState(state) {
   // Kick off the entry + hops on a timer (the 1s blank pause).
   setTimeout(startEntryAndHops, ENTRY_DELAY);
 
-  // ── Flight gate. Both model-ready AND hops-done AND min-dwell must hold.
+  // ── Flight gate. NO model-ready gate: hop 2 chains IMMEDIATELY into the
+  //    curved flight per spec ("right after it finishes its second hop it
+  //    immediately curves into the top left corner"). The model loads in
+  //    parallel during the loading screen; the boot animation is no longer
+  //    blocked on it. (The 8s loading screen after landing is what hides
+  //    any remaining model load — that's the right place for the gate.)
   function maybeFly() {
     if (flightApproved) return;
-    if (!(modelReady && hopsDone && dwellDone)) return;
+    if (!hopsDone) return;
     flyPawHome();
   }
 
-  // Min-dwell floor so the choreography always plays out.
-  setTimeout(() => { dwellDone = true; maybeFly(); }, MIN_DWELL_MS);
+  // Min-dwell floor is no longer used (the entry's built-in holds + hop
+  // durations already define the choreography length). Kept as a no-op
+  // safety net in case hops fail to fire — but it no longer gates flight.
+  // (Intentionally no listener wiring here.)
 
-  // Primary gate: the chat 12B model finished loading.
-  listen('model-status', (e) => {
-    if (e?.payload?.status === 'ready') {
-      modelReady = true;
-      maybeFly();
-    }
-  }).catch(() => {});
-  // Safety net: no_model (echo mode) / error also resolve the gate so the user
-  // is never trapped behind the boot phase if the model path fails. The title
-  // indicator still shows 'offline' via the listener above.
-  listen('model-status', (e) => {
-    const s = e?.payload?.status;
-    if (s === 'no_model' || s === 'error') {
-      modelReady = true;
-      maybeFly();
-    }
-  }).catch(() => {});
-
-  // ── Phase 2: fly the paw from center → home. Reads the real .paw-img's
-  //    current rect so the landing is pixel-accurate regardless of layout.
+  // ── Phase 2: fly the paw from center → home along a CURVED arc. Reads
+  //    the real .paw-img's current rect so the landing is pixel-accurate.
+  //    Per spec: "Not a straight line but a curve as it moves into the
+  //    corner." Implemented as a 3-keyframe WAAPI arc bowing ABOVE the
+  //    straight diagonal (a parabolic swoop up-and-over to the corner).
   function flyPawHome() {
     flightApproved = true;
     if (!bootPaw) { startLoadingScreen(); return; }
@@ -770,16 +762,34 @@ function setTitleState(state) {
       targetY = r.top;
     }
 
+    // Read the paw's current translate so the arc starts from where hop 2
+    // left it (center). commitStyles on the entry animation pinned it there.
+    // Fall back to viewport center if the read fails for any reason.
+    const restCx = (window.innerWidth - PAW_REST_SIZE) / 2;
+    const restCy = (window.innerHeight - PAW_REST_SIZE) / 2;
+    const startRect = bootPaw.getBoundingClientRect();
+    const startX = (startRect && isFinite(startRect.left)) ? startRect.left : restCx;
+    const startY = (startRect && isFinite(startRect.top)) ? startRect.top : restCy;
+
+    // Arc midpoint: bows ABOVE the straight diagonal. We take the geometric
+    // midpoint then push it up by ~25% of the vertical travel so the path
+    // reads as a swoop up-and-over rather than a straight diagonal. Cap the
+    // bow so it can't push the midpoint off the top of the viewport.
+    const midX = (startX + targetX) / 2;
+    const verticalTravel = Math.abs(targetY - startY);
+    const bow = Math.min(verticalTravel * 0.25 + 80, window.innerHeight * 0.22);
+    const midY = Math.min(startY, targetY) - bow;
+
     // Restart the sparkle trail for the flight (it was stopped when hops
     // began). Stopped again on land.
     startTrail();
 
-    // One-shot: when the flight transition ends, start the loading screen
-    // phase. (The staged reveal is now reached only AFTER the 8s loading
-    // screen finishes — see endLoadingScreen → revealAfterLand.)
-    const onLand = (e) => {
-      if (e.propertyName !== 'transform') return;
-      bootPaw.removeEventListener('transitionend', onLand);
+    // One-shot: when the flight animation ends, start the loading screen.
+    // (The staged reveal is now reached only AFTER the 8s loading screen
+    // finishes — see endLoadingScreen → revealAfterLand.)
+    const onLand = () => {
+      flightAnim.commitStyles();
+      flightAnim.cancel();
       stopTrail();
       // One final big burst on landing — a celebratory capstone.
       spawnSparkles(14, 1);
@@ -793,22 +803,23 @@ function setTitleState(state) {
       document.body.classList.add('loading');
       startLoadingScreen();
     };
-    bootPaw.addEventListener('transitionend', onLand);
 
-    // Set the target transform. Override the CSS transition with a SHORTER,
-    // FASTER flight curve per spec ("moves quickly and not just stays in the
-    // middle any longer") — the entry's 0.8s easeOutQuint was too leisurely
-    // for the corner dash. Snappy ease-in-out, no overshoot, ~0.5s.
-    // rAF double-buffer so the browser commits the start transform before
-    // we set the target, guaranteeing the transition runs.
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        bootPaw.style.transition =
-          `transform ${FLIGHT_DURATION_MS}ms cubic-bezier(0.45, 0, 0.55, 1), opacity 0.3s ease-out`;
-        bootPaw.style.transform =
-          `translate(${targetX}px, ${targetY}px) scale(1)`;
-      });
-    });
+    // Curved flight via WAAPI: 3 keyframes (start → arc-midpoint → corner)
+    // with the scale shrinking 2.8 → 1 across the arc so the paw also
+    // shrinks as it travels. Easing: ease-in to launch, ease-out to settle
+    // into the corner (the "swoop" feel).
+    const flightAnim = bootPaw.animate(
+      [
+        { transform: `translate(${startX}px, ${startY}px) scale(${PAW_BOOT_SCALE})`,
+          offset: 0, easing: 'cubic-bezier(0.4, 0, 0.7, 0.4)' },
+        { transform: `translate(${midX}px, ${midY}px) scale(${(PAW_BOOT_SCALE + 1) / 2})`,
+          offset: 0.5, easing: 'cubic-bezier(0.3, 0.6, 0.6, 1)' },
+        { transform: `translate(${targetX}px, ${targetY}px) scale(1)`,
+          offset: 1 },
+      ],
+      { duration: FLIGHT_DURATION_MS, fill: 'forwards' }
+    );
+    flightAnim.onfinish = onLand;
   }
 
   // ── Loading screen phase (between paw-land and the staged reveal).
@@ -884,9 +895,9 @@ function setTitleState(state) {
     // paw-land and stayed visible through loading).
     document.body.classList.remove('loading');
     // If the model-ready milestone never fired (still loading), emit it
-    // anyway so the terminal doesn't look like it gave up. Honest-ish: the
-    // reveal will proceed regardless because the boot gate already required
-    // modelReady for the flight.
+    // anyway so the terminal doesn't look like it gave up. The reveal
+    // proceeds regardless — the boot animation no longer gates on the
+    // model (the loading screen is the gate, hiding any remaining load).
     if (!milestoneEmitted) appendTerminalLine('› still loading — proceeding to UI', false);
     // The staged reveal: starry sky paints → aurora wipes. (.booting was
     // already dropped at paw-land so the top bar could appear; revealAfterLand
@@ -956,9 +967,10 @@ function setTitleState(state) {
     if (terminalTimer) { clearInterval(terminalTimer); terminalTimer = null; }
   }
 
-  // ── Model-ready milestone listener. SEPARATE from the modelReady gate
-  //    listener (that one drives maybeFly; this one just emits the terminal
-  //    line). Both fire off the same Tauri event; harmless duplicate work.
+  // ── Model-ready milestone listener. Emits the terminal line when the
+  //    model finishes loading. The boot animation no longer gates on this
+  //    (the loading screen hides any remaining load); this just reports
+  //    status to the terminal stream.
   listen('model-status', (e) => {
     if (milestoneEmitted) return;
     const s = e?.payload?.status;
