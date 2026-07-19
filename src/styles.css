@@ -39,10 +39,12 @@ html, body {
     z-index: 9999;
     user-select: none;
     /* Waking Canvas: hidden above the top edge while body.booting, slides
-       down on transition. The 0.2s delay stages it just after the aurora
-       ramp begins. cubic-bezier is the house spring curve (see .dock-container). */
+       down on transition. The 0.6s delay stages it just as the boot ring
+       finishes fading (0.6s splash fade-out), so the starry background is
+       briefly visible on its own before the UI chrome enters. cubic-bezier
+       is the house spring curve (see .dock-container). */
     transform: translateY(-100%);
-    transition: transform 0.7s cubic-bezier(0.175, 0.885, 0.32, 1.1) 0.2s;
+    transition: transform 0.9s cubic-bezier(0.175, 0.885, 0.32, 1.1) 0.6s;
 }
 /* Reset to rest position once the boot gate resolves (script.js removes
    .booting from <body>). */
@@ -397,10 +399,11 @@ body:not(.booting) .top-bar {
        margin above it so the user doesn't have to pixel-aim. */
     padding-top: 12px;
     /* Waking Canvas: hidden below the bottom edge while body.booting, slides
-       up on transition (0.35s delay = after top-bar + aurora ramp). The
+       up on transition (1.2s delay = clearly after the top-bar so their
+       backdrop-filter blurs don't both spin up on the same frame). The
        translateX(-50%) centering is composed, not replaced. */
     transform: translateX(-50%) translateY(120%);
-    transition: transform 0.7s cubic-bezier(0.175, 0.885, 0.32, 1.1) 0.35s;
+    transition: transform 0.9s cubic-bezier(0.175, 0.885, 0.32, 1.1) 1.2s;
 }
 body:not(.booting) .dock-trigger-area {
     transform: translateX(-50%) translateY(0);
@@ -1620,18 +1623,18 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
    drop-shadow gives the glow halo (NOT a box-shadow: drop-shadow follows
    the masked ring shape, box-shadow would square off). */
 .boot-ring {
-    width: 120px;
-    height: 120px;
+    width: 260px;
+    height: 260px;
     border-radius: 50%;
     background: conic-gradient(from 0deg, #b534fa, #66e0ff, #9b5cff, #b534fa);
     -webkit-mask: radial-gradient(circle, transparent 58%, #000 60%);
     mask: radial-gradient(circle, transparent 58%, #000 60%);
-    animation: ringSpin 2s linear infinite, ringPulse 2s ease-in-out infinite;
+    animation: ringSpin 3s linear infinite, ringPulse 2.4s ease-in-out infinite;
 }
 @keyframes ringSpin {
     to { transform: rotate(360deg); }
 }
 @keyframes ringPulse {
-    0%, 100% { filter: drop-shadow(0 0 14px rgba(181, 52, 250, 0.4)); }
-    50%      { filter: drop-shadow(0 0 26px rgba(102, 224, 255, 0.7)); }
+    0%, 100% { filter: drop-shadow(0 0 22px rgba(181, 52, 250, 0.5)); }
+    50%      { filter: drop-shadow(0 0 42px rgba(102, 224, 255, 0.8)); }
 }

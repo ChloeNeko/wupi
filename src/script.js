@@ -104,16 +104,18 @@ window.addEventListener('resize', () => { cachedSkyGrad = null; });
 // difference is imperceptible (alpha quantized to 8 bands of 0.1).
 const STAR_COLORS = ['#ffffff', '#e8f0ff', '#fff4e6', '#ffe6ee'];
 
-// Waking Canvas: aurora ramp 0 → 1 over ~1.6s after the boot gate resolves.
+// Waking Canvas: aurora ramp 0 → 1 over ~3s after the boot gate resolves.
 // `auroraIntensity` multiplies ONLY the curtain alpha inside animate() — sky,
 // stars, blur filter, composite op, and the pause logic are untouched. Starts
-// at 0 so during the splash the canvas reads as pitch-black space + stars
-// only; the curtains bloom in as the ramp climbs. Advanced at the top of
-// animate() so it inherits the existing pause/visibility gating for free
-// (no separate RAF loop, no extra pause wiring).
+// at 0 so the first canvas frame paints sky + stars only; the curtains bloom
+// in as the ramp climbs. Advanced at the top of animate() so it inherits the
+// existing pause/visibility gating for free (no separate RAF loop, no extra
+// pause wiring). The curtain DRAW block is also gated on intensity > 0.001
+// (see animate) so the cheap first frame never pays the 5x blur(30px) cost —
+// that was the lag spike when the aurora spawned in.
 let auroraIntensity = 0;
 let auroraRampStart = 0;
-const AURORA_RAMP_MS = 1600;
+const AURORA_RAMP_MS = 3000;
 
 function animate() {
   if (auroraRampStart && auroraIntensity < 1) {
@@ -165,6 +167,13 @@ function animate() {
   // point. Kept as-is per Chloe: do NOT collapse into one fill.
   // The perf gains live elsewhere (visibility pause, cached sky, star
   // batching) so the aurora can stay visually rich.
+  //
+  // Waking Canvas cost gate: while intensity is ~0 (boot ring phase + the
+  // first post-gate frame), SKIP the entire curtain block. Drawing 5 fills
+  // through blur(30px) with alpha 0 still costs the full 5x Gaussian pass —
+  // that was the first-frame lag spike when the aurora spawned in. Once the
+  // ramp climbs past the epsilon, the block runs normally.
+  if (auroraIntensity > 0.001) {
   ctx.globalCompositeOperation = 'screen';
   ctx.filter = 'blur(30px)';
 
@@ -207,6 +216,7 @@ function animate() {
   }
 
   ctx.filter = 'none';
+  } // end auroraIntensity > 0.001 cost gate
   time += 0.0025;
   // Don't schedule the next frame while paused: see `paused` + the
   // visibility/focus handlers below. The canvas RAF is the app's dominant
@@ -215,8 +225,12 @@ function animate() {
   if (!paused) requestAnimationFrame(animate);
 }
 
-// Render loop control. `paused` is set by THREE independent signals so the
+// Render loop control. `paused` is set by FOUR independent signals so the
 // expensive RAF loop stops the moment the canvas isn't visible to the user:
+//   0. BOOT GATE: `bootDone` is false until wakeCanvas() runs. startLoop()
+//      refuses to start while it's false, so no early focus/visibility event
+//      can paint stars behind the boot ring. The canvas stays dormant while
+//      the ring is showing so the body's #02040a is the only thing on screen.
 //   1. `canvas-pause` event from Rust (system_menu power_sleep).
 //   2. `document.visibilitychange` → hidden (alt-tab, minimize, another app
 //      fully covering the window). The standard browser RAF throttle isn't
@@ -226,9 +240,14 @@ function animate() {
 //      fallback when visibilitychange doesn't fire (e.g. another window
 //      dragged over this one without minimizing).
 // Resume mirrors all three. The animate() loop self-gates on `paused`.
-let paused = false;
+let paused = true;
+let bootDone = false;
 
 function startLoop() {
+  // Boot dormancy: refuse to start until wakeCanvas() clears the gate. Without
+  // this, an early focus/visibility event during the 4s ring hold would
+  // un-pause and paint stars behind the ring.
+  if (!bootDone) return;
   if (paused) { paused = false; requestAnimationFrame(animate); }
 }
 
@@ -258,7 +277,12 @@ window.addEventListener('focus', () => {
   if (!document.hidden) startLoop();
 });
 
-animate();
+// NOTE: animate() is NOT kicked off here at module-load time. The canvas is
+// dormant during the boot ring phase (paused = true). wakeCanvas() starts the
+// RAF once the gate resolves — the first animate() frame paints sky + stars
+// only, then the aurora blooms in over AURORA_RAMP_MS. Calling animate() here
+// would paint stars behind the ring (the bug: "background shows with the
+// circle") AND fight the boot gate.
 
 // "WUPI OS" title: live AI-status indicator
 // The title reflects the live state of the MAIN chat model (local 12B OR the
@@ -357,7 +381,7 @@ function setTitleState(state) {
 // job; this is a SEPARATE listener so the title's `typing` no-op guard can't
 // swallow the wake signal.
 (function setupBootSplash() {
-  const MIN_DWELL_MS = 1200;
+  const MIN_DWELL_MS = 4000;
   let modelReady = false;
   let dwellDone = false;
   let transitioned = false;
@@ -395,14 +419,22 @@ function setTitleState(state) {
   }).catch(() => {});
 
   function wakeCanvas() {
-    // 1. Arm the aurora ramp. animate() advances auroraIntensity 0 → 1 over
-    //    AURORA_RAMP_MS; until then curtains stay invisible (pitch-black space
-    //    + stars only), which is the spec'd "Waking Canvas" opening state.
+    // 1. Open the boot gate so startLoop() will accept the RAF, then start
+    //    the canvas. `paused` was true during the boot ring phase (canvas
+    //    dormant, body #02040a was the only thing on screen). The first
+    //    animate() frame paints sky + stars only — the curtain block is
+    //    gated on auroraIntensity > 0.001, which is still 0 here.
+    bootDone = true;
+    startLoop();
+    // 2. Arm the aurora ramp. animate() advances auroraIntensity 0 → 1 over
+    //    AURORA_RAMP_MS; the first post-gate frame paints sky + stars only,
+    //    then the curtains bloom in over ~3s.
     auroraRampStart = performance.now();
-    // 2. Drop body.booting → CSS slides the top-bar down (0.2s delay) and the
-    //    dock up (0.35s delay), staged after the aurora ramp begins.
+    // 3. Drop body.booting → CSS slides the top-bar down (0.6s delay) and the
+    //    dock up (1.2s delay), staged after the ring fades so their
+    //    backdrop-filter blurs don't spike the GPU on the same frame.
     document.body.classList.remove('booting');
-    // 3. Fade the splash out, then remove it from the DOM. transitionend +
+    // 4. Fade the splash out, then remove it from the DOM. transitionend +
     //    {once:true} guarantees one-shot cleanup; pointer-events:none on
     //    .fade-out means even a stalled transition can't block the UI.
     const splash = document.getElementById('boot-splash');
