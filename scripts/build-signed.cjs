@@ -87,14 +87,24 @@ if (!privateKey) {
 
 // ── Password resolution (in priority order):
 //    1. --password flag
-//    2. TAURI_KEY_PASSWORD env var
-//    3. ~/.tauri/wupi.key.pw file
-//    4. empty string (key was generated without a password)
+//    2. TAURI_SIGNING_PRIVATE_KEY_PASSWORD env var (Tauri's current name)
+//    3. TAURI_KEY_PASSWORD env var (legacy name, kept for backward compat)
+//    4. ~/.tauri/wupi.key.pw file
+//    5. empty string (key was generated without a password)
+//
+//    IMPORTANT: Tauri's signer reads `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+//    as of Tauri 2.x. The older `TAURI_KEY_PASSWORD` name is no longer
+//    recognized by the signer itself (it silently falls through to the
+//    interactive rpassword prompt and hangs the build). We accept both
+//    env vars as INPUT here, but pass only the correct one to the child
+//    process below.
 // ──
 const pwFilePath = join(homedir(), '.tauri', 'wupi.key.pw');
 let password = '';
 if (passwordFromArg) {
   password = passwordFromArg;
+} else if (process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
+  password = process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD;
 } else if (process.env.TAURI_KEY_PASSWORD) {
   password = process.env.TAURI_KEY_PASSWORD;
 } else if (existsSync(pwFilePath)) {
@@ -107,16 +117,18 @@ if (passwordFromArg) {
   }
 } else {
   console.warn('[build-signed] no password source found (no --password flag,');
-  console.warn('                 no TAURI_KEY_PASSWORD env, no ~/.tauri/wupi.key.pw file).');
-  console.warn('                 If the key was generated WITH a password, this will fail.');
+  console.warn('                 no TAURI_SIGNING_PRIVATE_KEY_PASSWORD env, no ~/.tauri/wupi.key.pw file).');
+  console.warn('                 If the key was generated WITH a password, this will hang.');
 }
 
 // ── Build the child env: parent env + the two signing vars. ──
 //    The vars are scoped to this.spawn call — they do NOT leak into the
-//    parent shell (Node never mutates process.env here).
+//    parent shell (Node never mutates process.env here). Both Tauri-era
+//    names are set so any external tool reading either one finds the value.
 const childEnv = {
   ...process.env,
   TAURI_SIGNING_PRIVATE_KEY: privateKey,
+  TAURI_SIGNING_PRIVATE_KEY_PASSWORD: password,
   TAURI_KEY_PASSWORD: password,
   // Preserve the CUDA build parallelism used by the regular build path.
   CMAKE_BUILD_PARALLEL_LEVEL: process.env.CMAKE_BUILD_PARALLEL_LEVEL || '8',

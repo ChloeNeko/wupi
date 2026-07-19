@@ -41,7 +41,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEUzMzU5RDYwODFGOUZBMDUKUldRRit2bUJZSjAxNHpnZVhhYzljck43QUNGdVNtWWdVaHMxMjU5SXYzZWN1SFlFdmxVamdGdnMK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk2NjdBMEYwMTc3QTQwQTAKUldTZ1FIb1g4S0JubGlMYURPalE1c2NxdjJNS0hrYmtZbmJyR2tmcDlxZmllNkRlZTM2YlJkZDkK",
       "endpoints": [
         "https://chloeneko.github.io/WUPI/updater/latest.json"
       ]

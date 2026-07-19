@@ -9,7 +9,8 @@
     "build": "npm run clear:webview2 && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "build:signed": "node scripts/build-signed.cjs"
+    "build:signed": "node scripts/build-signed.cjs",
+    "release": "node scripts/release.cjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
