@@ -30,4 +30,5 @@ tools/
 #     backstop in case a future key gen lands one inside the tree. ---
 *.key
 *.key.pub
+*.key.pw
 ~/

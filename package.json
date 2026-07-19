@@ -1,5 +1,5 @@
 {
-  "name": "wupi-os",
+  "name": "wupi",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -8,10 +8,13 @@
     "clear:webview2": "node scripts/clear-webview2-cache.cjs",
     "build": "npm run clear:webview2 && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "build:signed": "node scripts/build-signed.cjs"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2"
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-process": "^2.3.1",
+    "@tauri-apps/plugin-updater": "^2.10.1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",

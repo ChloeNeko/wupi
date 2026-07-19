@@ -1,5 +1,10 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+// Updater plugin: signed-update distribution. JS drives the whole flow
+// (check() + downloadAndInstall() + relaunch()); Rust just registers the
+// plugin. See paw-menu "Check for Updates" handler for the user-facing path.
+import { check } from '@tauri-apps/plugin-updater';
+import { relaunch } from '@tauri-apps/plugin-process';
 
 const canvas = document.getElementById('aurora-canvas');
 const ctx = canvas.getContext('2d');
@@ -1074,6 +1079,52 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   document.getElementById('sleepBtn')?.addEventListener('click', () => {
     closePawMenu();
     invoke('power_sleep_cmd');
+  });
+
+  // ── Check for Updates. Drives the tauri-plugin-updater flow from the JS
+  //    side: check() → if available, confirm() → downloadAndInstall() →
+  //    relaunch(). Uses browser-native confirm()/alert() to match the rest
+  //    of the app's dialog UX (no tauri-plugin-dialog dependency). Errors
+  //    at any stage surface via alert() so the user always knows what
+  //    happened. Endpoint + pubkey live in tauri.conf.json (plugins.updater).
+  document.getElementById('checkForUpdatesBtn')?.addEventListener('click', async () => {
+    closePawMenu();
+    let update;
+    try {
+      update = await check();
+    } catch (e) {
+      alert(`Update check failed:\n${e}`);
+      return;
+    }
+    if (!update?.available) {
+      alert('WUPI is up to date.');
+      return;
+    }
+    // Update available — confirm before install. Per spec: "describe the
+    // current version saying its up to date or say there's an update
+    // available and ask if you'd like to install it."
+    const notes = update.body ? `\n\n${update.body}\n` : '\n';
+    const ok = confirm(
+      `WUPI v${update.version} is available.${notes}\nInstall now? The app will restart.`
+    );
+    if (!ok) return;
+    try {
+      // Silent download + install. The two callbacks stream progress +
+      // completion; we log to console for now (a future polish pass can
+      // surface this as a progress toast). On completion, relaunch.
+      await update.downloadAndInstall(
+        (chunkLength, contentLength) => {
+          if (contentLength) {
+            const pct = ((chunkLength / contentLength) * 100).toFixed(1);
+            console.log(`update download: ${pct}%`);
+          }
+        },
+        () => { console.log('update download finished'); }
+      );
+      await relaunch();
+    } catch (e) {
+      alert(`Update install failed:\n${e}`);
+    }
   });
 
   // Three aligned panels. Clicking Theme opens panel 2; clicking a theme opens

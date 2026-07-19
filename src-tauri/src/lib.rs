@@ -202,6 +202,12 @@ pub fn run() {
 
     tracing::info!("=== WUPI OS starting ===");
     tauri::Builder::default()
+        // Updater: signed-update distribution. The JS side drives check() +
+        // downloadAndInstall(); process plugin provides relaunch() after
+        // install. Both plugins MUST be registered before .setup() so the
+        // IPC surface is ready when the frontend loads.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(AppState::new())
         .manage(hardware::AudioRegistry)
         .setup(|app| {
