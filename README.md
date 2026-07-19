@@ -1,7 +1,7 @@
 # **WUPI OS** 🐾
-> Minimalist. Smart. Plug and Play.
+> Minimalist. Smart. Easy.
 >
-> Your RolePlay experience, upgraded.
+> Your AI experience, upgraded.
 
 <br>
 <br>

@@ -1,34 +1,13 @@
-# --- Frontend build deps / output ---
 node_modules/
 dist/
 dist-ssr/
-*.local
-
-# --- Rust / Tauri build artifacts ---
 src-tauri/target/
 src-tauri/**/*.log
 src-tauri/**/debug/
 src-tauri/**/release/
-
-# --- Models (locked naming convention, but never tracked in git).
-#     WUPI.gguf alone is ~9.8 GB; Embed.gguf is 36 MB. Both are local-only. ---
-*.gguf
-
-# --- llama.cpp toolchain + quant workspace (tools/quant).
-#     ~1.8 GB of CUDA DLLs, llama-* exes, and Chloe's quant/training data
-#     (wiki.train.raw, slice_*.txt, *.log). None of this belongs in VCS. ---
 tools/
-
-# --- Editor / OS cruft ---
 .DS_Store
 .vscode/
 .idea/
-
-# --- Tauri updater signing keys (CRITICAL: never commit).
-#     The pubkey goes in tauri.conf.json (safe to commit); the PRIVATE key
-#     must stay outside the repo at ~/.tauri/wupi.key. These rules are a
-#     backstop in case a future key gen lands one inside the tree. ---
-*.key
-*.key.pub
-*.key.pw
-~/
+*.local
+*.gguf
