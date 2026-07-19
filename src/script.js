@@ -513,34 +513,19 @@ function setTitleState(state) {
   // for the dev-preview case where the HTML might not have it.
   document.body.classList.add('booting');
 
-  // ── Phase 0: park the paw off-screen below center, scaled up, BEFORE any
-  //    transition can fire. Setting transform inline at module-eval time
-  //    means the first paint already has it hidden — no flash at center.
-  //
-  //    CRITICAL: the CSS rule on #boot-paw has `transition: transform 1.2s`
-  //    always active. If we just set style.transform, the browser animates
-  //    from the default (translate(0,0) scale(1) = top-left) to the parked
-  //    position over 1.2s — making the paw visibly slide across the screen
-  //    during the 1s "blank" phase. Fix: disable the transition, set the
-  //    transform, force a reflow so the browser commits the un-transitioned
-  //    state, then re-enable the transition. Subsequent transform changes
-  //    (the entry WAAPI animation + the flight) animate correctly.
+  // ── Phase 0: park the paw off-screen below the viewport, scaled up.
+  //    The CSS default `top: 110vh` already places the element off-screen
+  //    at first paint (so there's never a top-left flash). Here we also
+  //    set an explicit transform so the entry WAAPI animation has a
+  //    concrete from-position. No transition-suppression / reflow dance
+  //    needed anymore — the element is born invisible thanks to the CSS.
   if (bootPaw) {
     const restCx = (window.innerWidth - PAW_REST_SIZE) / 2;
     const parkCy = window.innerHeight + 50; // just below the bottom edge
-    bootPaw.style.transition = 'none';      // suppress the slide-to-park
     bootPaw.style.width = PAW_REST_SIZE + 'px';
     bootPaw.style.height = PAW_REST_SIZE + 'px';
     bootPaw.style.transform =
       `translate(${restCx}px, ${parkCy}px) scale(${PAW_BOOT_SCALE})`;
-    // Force reflow: reading offsetHeight synchronously flushes the style
-    // queue so the browser commits the parked transform BEFORE we restore
-    // the transition. Without this the two style writes batch together and
-    // the transition still fires on the park.
-    void bootPaw.offsetHeight;
-    // Restore the CSS transition for the flight (entry uses WAAPI which
-    // overrides inline style anyway, but the flight relies on this).
-    bootPaw.style.transition = '';
   }
 
   // ── Sparkle burst. Spawns N .boot-sparkle children of #boot-paw, each
