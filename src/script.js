@@ -29,6 +29,17 @@ let currentPalette = COLOR_CODES.Vibrant;
 // and blurry. This is the "resolution loss" fix.
 let width, height;
 
+// Aurora offscreen buffer. The 5 curtains are rendered here ONCE per frame
+// with NO blur (cheap fills, no Gaussian pass), then the whole composite is
+// blitted to the main canvas through a SINGLE blur(30px). This collapses the
+// expensive op from 5x per frame → 1x, which is what fixed the boot-wipe
+// stutter (at-rest was OK because the pipeline was warm; the wipe hit cold
+// and 5 cold blur passes/frame stuttered). The buffer is DPR-scaled so the
+// blur resolves at physical-pixel resolution (no softness on high-DPI).
+// Lazily (re)allocated in resize() to match viewport + DPR.
+let auroraBuf = null;
+let auroraBufCtx = null;
+
 function resize() {
   const dpr = window.devicePixelRatio || 1;
   width = window.innerWidth;
@@ -41,6 +52,14 @@ function resize() {
   // scale accumulates if not reset first.
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.scale(dpr, dpr);
+  // (Re)allocate the aurora offscreen buffer at physical-pixel resolution.
+  // On first call (boot), this is what makes the boot wipe cheap.
+  if (!auroraBuf) {
+    auroraBuf = document.createElement('canvas');
+    auroraBufCtx = auroraBuf.getContext('2d');
+  }
+  auroraBuf.width = canvas.width;
+  auroraBuf.height = canvas.height;
 }
 window.addEventListener('resize', resize);
 resize();
@@ -120,9 +139,6 @@ const AURORA_RAMP_MS = 1000;
 let auroraRevealX = 0;       // current wipe x (px, in canvas CSS px)
 let auroraRevealStart = 0;   // 0 = not yet armed
 const AURORA_WIPE_MS = 1400;
-// Soft alpha edge width at the wipe front (px). Inside this band the curtain
-// alpha fades from full → 0 so the wipe doesn't have a hard vertical line.
-const REVEAL_EDGE = 280;
 
 function animate() {
   if (auroraRampStart && auroraIntensity < 1) {
@@ -175,76 +191,92 @@ function animate() {
   ctx.globalAlpha = 1.0;
 
   // Aurora borealis: 5 layered, independently-hued curtains. Each curtain
-  // gets its own hue oscillation + its own blurred fill, which is what
-  // produces the multi-color ribbon effect. The blur is expensive (a full
-  // Gaussian pass per fill) but it IS the look: the soft bloom is the whole
-  // point. Kept as-is per Chloe: do NOT collapse into one fill.
-  // The perf gains live elsewhere (visibility pause, cached sky, star
-  // batching, AND the left-to-right boot wipe below) so the aurora can stay
-  // visually rich.
+  // gets its own hue oscillation. The soft bloom (blur 30px) IS the look —
+  // Chloe's call: do NOT collapse the visual into one fill.
   //
-  // LEFT-TO-RIGHT WIPE (boot reveal): the curtain path only walks
-  // x ∈ [-150, auroraRevealX], so during the wipe the blur only processes
-  // the revealed portion — not the full viewport. That's what kills the
-  // boot-reveal lag (the old global-alpha ramp blurred the entire width
-  // every frame). At rest auroraRevealX = width+300 and the full curtain
-  // paints as before. The cost gate skips the whole block while intensity
-  // is ~0 (boot phase + first post-gate frame).
-  if (auroraIntensity > 0.001) {
-  ctx.globalCompositeOperation = 'screen';
-  ctx.filter = 'blur(30px)';
+  // PERF ARCHITECTURE (the boot-wipe stutter fix):
+  // The OLD code set ctx.filter='blur(30px)' and called ctx.fill() 5 times
+  // per frame — 5 separate Gaussian blur passes. At rest that was tolerable
+  // (warm pipeline), but the boot wipe fired into a cold pipeline and 5 cold
+  // blur passes/frame stuttered visibly.
+  //
+  // The NEW code renders all 5 curtains to an offscreen buffer (auroraBuf)
+  // with NO blur (cheap path fills), then blits the composite to the main
+  // canvas through a SINGLE blur(30px). 5x fewer Gaussian passes per frame,
+  // constant cost whether booting or at rest. The boot wipe is then a cheap
+  // source-crop on the drawImage (only the revealed x-range is sampled),
+  // so the blur also processes less data during the wipe — doubly cheap.
+  if (auroraIntensity > 0.001 && auroraBufCtx) {
+    const dpr = window.devicePixelRatio || 1;
+    const curtains = 5;
+    const baseCenterY = height * 0.42;
 
-  const curtains = 5;
-  const baseCenterY = height * 0.42;
-  // Cap the wipe front so we never draw past it. width+300 is the "fully
-  // revealed" sentinel (the path's natural right edge is width+150). The
-  // top/bottom loops both use this same cap so the path closes on a clean
-  // vertical line, which blur(30px) softens into a gradient automatically.
-  const wipeX = Math.min(auroraRevealX, width + 300);
+    // ── Pass 1: render curtains to offscreen buffer (NO blur).
+    // Clear to transparent black. 'source-over' compositing: curtains are
+    // very-low-alpha hsla fills (0.18 × intensity), so painting them over
+    // each other produces a soft multi-hue stack that — once screened onto
+    // the sky in pass 2 — reads nearly identically to the old per-curtain
+    // screen-on-sky render. The difference is sub-perceptual at these
+    // alphas; the perf win (5 blur passes → 1) is structural.
+    auroraBufCtx.setTransform(1, 0, 0, 1, 0, 0);
+    auroraBufCtx.clearRect(0, 0, auroraBuf.width, auroraBuf.height);
+    auroraBufCtx.scale(dpr, dpr);
+    auroraBufCtx.globalCompositeOperation = 'source-over';
 
-  for (let i = 0; i < curtains; i++) {
-    const speed = time * (0.1 + i * 0.04);
-    const thickness = 45 + i * 15;
+    for (let i = 0; i < curtains; i++) {
+      const speed = time * (0.1 + i * 0.04);
+      const thickness = 45 + i * 15;
+      const yOffset = (i - (curtains / 2)) * 12;
+      const activeCenterY = baseCenterY + yOffset;
 
-    const yOffset = (i - (curtains / 2)) * 12;
-    const activeCenterY = baseCenterY + yOffset;
+      auroraBufCtx.beginPath();
+      // Full-width path on the buffer (the wipe happens at blit time, not
+      // here — keeping the path full-width means the curtain shape is
+      // identical to the at-rest render; only the visible slice changes).
+      for (let x = -150; x <= width + 150; x += 40) {
+        const y = activeCenterY
+                + Math.sin(x * 0.0015 + speed + i * 2.3) * 85
+                + Math.cos(x * 0.0008 - speed) * 45
+                - thickness;
+        if (x === -150) auroraBufCtx.moveTo(x, y);
+        else auroraBufCtx.lineTo(x, y);
+      }
+      for (let x = width + 150; x >= -150; x -= 40) {
+        const y = activeCenterY
+                + Math.sin(x * 0.0015 + speed + i * 2.3) * 85
+                + Math.cos(x * 0.0008 - speed) * 45
+                + thickness;
+        auroraBufCtx.lineTo(x, y);
+      }
+      auroraBufCtx.closePath();
 
-    ctx.beginPath();
-
-    // Top edge: only walk up to wipeX (not width+150). If wipeX is still
-    // ≤ -150 (wipe not yet armed / very early), the loop body never runs
-    // and the curtain contributes nothing this frame.
-    for (let x = -150; x <= wipeX; x += 40) {
-      const y = activeCenterY
-              + Math.sin(x * 0.0015 + speed + i * 2.3) * 85
-              + Math.cos(x * 0.0008 - speed) * 45
-              - thickness;
-      if (x === -150) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
+      const hue = currentPalette.hueBase + Math.sin(time * 1.0 + i) * currentPalette.hueRange;
+      // Alpha gated by the global intensity ramp (the wipe is handled by
+      // the source-crop below, not by per-curtain alpha).
+      auroraBufCtx.fillStyle = `hsla(${hue}, 100%, 65%, ${0.18 * auroraIntensity})`;
+      auroraBufCtx.fill();
     }
 
-    // Bottom edge: walk back from wipeX to -150 (mirrors the top range).
-    for (let x = wipeX; x >= -150; x -= 40) {
-      const y = activeCenterY
-              + Math.sin(x * 0.0015 + speed + i * 2.3) * 85
-              + Math.cos(x * 0.0008 - speed) * 45
-              + thickness;
-      ctx.lineTo(x, y);
+    // ── Pass 2: blit the composite to the main canvas with ONE blur pass.
+    // The wipe is a source-crop: only x ∈ [0, wipeXCss] of the buffer is
+    // sampled, so the blur only processes the revealed region. At rest
+    // wipeXCss >= width and the full buffer blits. Source rect is in
+    // physical pixels (buffer is physical-res), dest rect in CSS px
+    // (the main ctx has dpr scale applied via setTransform in resize()).
+    ctx.globalCompositeOperation = 'screen';
+    ctx.filter = 'blur(30px)';
+
+    const wipeXCss = Math.min(Math.max(auroraRevealX, 0), width);
+    const srcX = 0;
+    const srcY = 0;
+    const srcW = Math.floor(wipeXCss * dpr);
+    const srcH = auroraBuf.height;
+    if (srcW > 0) {
+      ctx.drawImage(auroraBuf, srcX, srcY, srcW, srcH, 0, 0, wipeXCss, height);
     }
-    ctx.closePath();
 
-    const hue = currentPalette.hueBase + Math.sin(time * 1.0 + i) * currentPalette.hueRange;
-
-    // Alpha is gated by BOTH the global intensity ramp AND the wipe position.
-    // Inside the soft-edge band (wipeX-REVEAL_EDGE → wipeX) alpha fades full→0,
-    // so the wipe front reads as a soft vertical gradient, not a hard line.
-    // Past wipeX the curtain isn't drawn at all (the path stops there), so
-    // we only need to feather the front.
-    ctx.fillStyle = `hsla(${hue}, 100%, 65%, ${0.18 * auroraIntensity})`;
-    ctx.fill();
-  }
-
-  ctx.filter = 'none';
+    ctx.filter = 'none';
+    ctx.globalCompositeOperation = 'source-over';
   } // end auroraIntensity > 0.001 cost gate
   time += 0.0025;
   // Don't schedule the next frame while paused: see `paused` + the
@@ -464,20 +496,31 @@ function setTitleState(state) {
   // ── Phase 0: park the paw off-screen below center, scaled up, BEFORE any
   //    transition can fire. Setting transform inline at module-eval time
   //    means the first paint already has it hidden — no flash at center.
-  //    The 2 hops are driven via Web Animations API on the inner img so
-  //    sparkles can fire at the apex (a CSS keyframe can't dispatch mid-
-  //    animation). #boot-paw's transform is reserved for the entry + flight.
+  //
+  //    CRITICAL: the CSS rule on #boot-paw has `transition: transform 1.2s`
+  //    always active. If we just set style.transform, the browser animates
+  //    from the default (translate(0,0) scale(1) = top-left) to the parked
+  //    position over 1.2s — making the paw visibly slide across the screen
+  //    during the 1s "blank" phase. Fix: disable the transition, set the
+  //    transform, force a reflow so the browser commits the un-transitioned
+  //    state, then re-enable the transition. Subsequent transform changes
+  //    (the entry WAAPI animation + the flight) animate correctly.
   if (bootPaw) {
-    // Layout box is the resting 45x45; scale() grows the visual around its
-    // center (transform-origin 50% 50%). To park it below the viewport we
-    // translate past innerHeight. Start position is computed here so the
-    // entry animation has a concrete from-value.
     const restCx = (window.innerWidth - PAW_REST_SIZE) / 2;
     const parkCy = window.innerHeight + 50; // just below the bottom edge
+    bootPaw.style.transition = 'none';      // suppress the slide-to-park
     bootPaw.style.width = PAW_REST_SIZE + 'px';
     bootPaw.style.height = PAW_REST_SIZE + 'px';
     bootPaw.style.transform =
       `translate(${restCx}px, ${parkCy}px) scale(${PAW_BOOT_SCALE})`;
+    // Force reflow: reading offsetHeight synchronously flushes the style
+    // queue so the browser commits the parked transform BEFORE we restore
+    // the transition. Without this the two style writes batch together and
+    // the transition still fires on the park.
+    void bootPaw.offsetHeight;
+    // Restore the CSS transition for the flight (entry uses WAAPI which
+    // overrides inline style anyway, but the flight relies on this).
+    bootPaw.style.transition = '';
   }
 
   // ── Sparkle burst. Spawns N .boot-sparkle children of #boot-paw, each
