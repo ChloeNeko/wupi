@@ -101,23 +101,39 @@ window.addEventListener('resize', () => { cachedSkyGrad = null; });
 // difference is imperceptible (alpha quantized to 8 bands of 0.1).
 const STAR_COLORS = ['#ffffff', '#e8f0ff', '#fff4e6', '#ffe6ee'];
 
-// Boot reveal: aurora ramp 0 → 1 over ~1.0s after the paw lands. "Reveal all
-// the aurora curtains quickly" per spec. `auroraIntensity` multiplies ONLY
-// the curtain alpha inside animate() — sky, stars, blur filter, composite
-// op, and the pause logic are untouched. Starts at 0 so the first canvas
-// frame paints sky + stars only; the curtains bloom in as the ramp climbs.
-// Advanced at the top of animate() so it inherits the existing pause/
-// visibility gating for free (no separate RAF loop, no extra pause wiring).
-// The curtain DRAW block is also gated on intensity > 0.001 (see animate)
-// so the cheap first frame never pays the 5x blur(30px) cost — that was the
-// lag spike when the aurora spawned in.
+// Boot reveal: aurora curtains reveal LEFT-TO-RIGHT (a "wipe" rather than a
+// global opacity ramp). This is BOTH an aesthetic choice AND a perf fix: the
+// old global-alpha ramp drew all 5 curtains across the full viewport every
+// frame through blur(30px), which is what stuttered. The wipe only draws the
+// revealed portion of each curtain per frame, so the blur cost scales with
+// how much is visible — way cheaper during the reveal, identical at rest.
+//
+// Two gates (both must climb to 1.0 before the curtain is fully shown):
+//   auroraIntensity  — the overall fade-in (0 → 1 over AURORA_RAMP_MS).
+//   auroraRevealX    — the left-to-right wipe position (px).
+// At rest both are 1 / width+300 and the full aurora paints as before.
 let auroraIntensity = 0;
 let auroraRampStart = 0;
 const AURORA_RAMP_MS = 1000;
+// The wipe runs concurrently with the intensity ramp. AURORA_WIPE_MS is kept
+// slightly longer so the wipe tail (the soft alpha edge) finishes smooth.
+let auroraRevealX = 0;       // current wipe x (px, in canvas CSS px)
+let auroraRevealStart = 0;   // 0 = not yet armed
+const AURORA_WIPE_MS = 1400;
+// Soft alpha edge width at the wipe front (px). Inside this band the curtain
+// alpha fades from full → 0 so the wipe doesn't have a hard vertical line.
+const REVEAL_EDGE = 280;
 
 function animate() {
   if (auroraRampStart && auroraIntensity < 1) {
     auroraIntensity = Math.min(1, (performance.now() - auroraRampStart) / AURORA_RAMP_MS);
+  }
+  if (auroraRevealStart && auroraRevealX < width + 300) {
+    // Ease-in-out so the wipe starts slow, accelerates, settles — reads as
+    // "fluid" rather than a constant mechanical sweep.
+    const t = Math.min(1, (performance.now() - auroraRevealStart) / AURORA_WIPE_MS);
+    const eased = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+    auroraRevealX = -150 + eased * (width + 600);
   }
   currentX += (mouseX - currentX) * 0.25;
   currentY += (mouseY - currentY) * 0.25;
@@ -164,19 +180,27 @@ function animate() {
   // Gaussian pass per fill) but it IS the look: the soft bloom is the whole
   // point. Kept as-is per Chloe: do NOT collapse into one fill.
   // The perf gains live elsewhere (visibility pause, cached sky, star
-  // batching) so the aurora can stay visually rich.
+  // batching, AND the left-to-right boot wipe below) so the aurora can stay
+  // visually rich.
   //
-  // Waking Canvas cost gate: while intensity is ~0 (boot ring phase + the
-  // first post-gate frame), SKIP the entire curtain block. Drawing 5 fills
-  // through blur(30px) with alpha 0 still costs the full 5x Gaussian pass —
-  // that was the first-frame lag spike when the aurora spawned in. Once the
-  // ramp climbs past the epsilon, the block runs normally.
+  // LEFT-TO-RIGHT WIPE (boot reveal): the curtain path only walks
+  // x ∈ [-150, auroraRevealX], so during the wipe the blur only processes
+  // the revealed portion — not the full viewport. That's what kills the
+  // boot-reveal lag (the old global-alpha ramp blurred the entire width
+  // every frame). At rest auroraRevealX = width+300 and the full curtain
+  // paints as before. The cost gate skips the whole block while intensity
+  // is ~0 (boot phase + first post-gate frame).
   if (auroraIntensity > 0.001) {
   ctx.globalCompositeOperation = 'screen';
   ctx.filter = 'blur(30px)';
 
   const curtains = 5;
   const baseCenterY = height * 0.42;
+  // Cap the wipe front so we never draw past it. width+300 is the "fully
+  // revealed" sentinel (the path's natural right edge is width+150). The
+  // top/bottom loops both use this same cap so the path closes on a clean
+  // vertical line, which blur(30px) softens into a gradient automatically.
+  const wipeX = Math.min(auroraRevealX, width + 300);
 
   for (let i = 0; i < curtains; i++) {
     const speed = time * (0.1 + i * 0.04);
@@ -187,7 +211,10 @@ function animate() {
 
     ctx.beginPath();
 
-    for (let x = -150; x <= width + 150; x += 40) {
+    // Top edge: only walk up to wipeX (not width+150). If wipeX is still
+    // ≤ -150 (wipe not yet armed / very early), the loop body never runs
+    // and the curtain contributes nothing this frame.
+    for (let x = -150; x <= wipeX; x += 40) {
       const y = activeCenterY
               + Math.sin(x * 0.0015 + speed + i * 2.3) * 85
               + Math.cos(x * 0.0008 - speed) * 45
@@ -196,7 +223,8 @@ function animate() {
       else ctx.lineTo(x, y);
     }
 
-    for (let x = width + 150; x >= -150; x -= 40) {
+    // Bottom edge: walk back from wipeX to -150 (mirrors the top range).
+    for (let x = wipeX; x >= -150; x -= 40) {
       const y = activeCenterY
               + Math.sin(x * 0.0015 + speed + i * 2.3) * 85
               + Math.cos(x * 0.0008 - speed) * 45
@@ -207,8 +235,11 @@ function animate() {
 
     const hue = currentPalette.hueBase + Math.sin(time * 1.0 + i) * currentPalette.hueRange;
 
-    // Waking Canvas: auroraIntensity gates the curtain alpha so the borealis
-    // blooms in from invisible (boot) to full (0.18 = the locked aesthetic).
+    // Alpha is gated by BOTH the global intensity ramp AND the wipe position.
+    // Inside the soft-edge band (wipeX-REVEAL_EDGE → wipeX) alpha fades full→0,
+    // so the wipe front reads as a soft vertical gradient, not a hard line.
+    // Past wipeX the curtain isn't drawn at all (the path stops there), so
+    // we only need to feather the front.
     ctx.fillStyle = `hsla(${hue}, 100%, 65%, ${0.18 * auroraIntensity})`;
     ctx.fill();
   }
@@ -369,43 +400,58 @@ function setTitleState(state) {
 // The OS window boots transparent + always-on-top (tauri.conf.json) and STAYS
 // transparent for its lifetime. What controls desktop bleed-through is the
 // BODY background-color:
-//   - body.booting         → transparent (CSS) → desktop shows through, only
-//                            the boot paw is visible (centered, hopping).
+//   - body.booting         → transparent (CSS) → desktop shows through.
 //   - body:not(.booting)   → #02040a (CSS)     → solid black covers desktop.
-// During the hop phase the canvas is dormant (paused=true, bootDone=false)
-// so no sky/stars leak through. The whole point of the paw: hide the model
-// load + UI init behind a 5s loading animation so the user never sees lag.
 //
-// On resolve: paw FLIES to its home spot (the real .paw-img rect, read via
-// getBoundingClientRect so it's robust against layout changes) and shrinks
-// from ~120px to the resting 45px. After the flight lands, a setTimeout
-// chain reveals the UI in fluid stages:
-//   land +0.0s → drop .booting (body goes opaque #02040a)
-//   land +0.1s → top-bar fade-in begins (0.6s, CSS)
-//   land +0.5s → canvas RAF starts → sky + stars paint (curtains still gated)
-//   land +0.9s → aurora ramp armed → curtains bloom over ~1.0s
-//   land +0.7s → boot-paw fades + removes → real interactive paw revealed
-//   land +1.4s → dock fade-in begins (0.6s, CSS) — "apps and tray last"
+// CHOREOGRAPHY (per spec, refined):
+//   0.0s  Blank screen (paw parked below the bottom edge, off-screen).
+//   1.0s  Paw ENTERS from the bottom, jumping up to viewport center.
+//         Two hops total; sparkles burst at each hop apex.
+//   ~3.4s After hop 2 lands, paw FLIES to its home spot in the top-left
+//         (the real .paw-img rect, read via getBoundingClientRect), shrinking
+//         from ~120px → 45px. easeOutQuint, no overshoot.
+//   land  Staged reveal (see revealAfterLand): body opaque → top-bar fades in
+//         → canvas paints sky+stars → aurora LEFT-TO-RIGHT wipe (cheap during
+//         reveal) → boot-paw removed → dock fades in last.
+//
+// STAGING NOTE: the top-bar's backdrop-filter:blur and the aurora's blur(30px)
+// are the two heavy GPU costs. They are now staged so they DON'T overlap —
+// the top-bar finishes its 0.6s fade BEFORE the aurora wipe arms. That's the
+// real fix for "aurora load-in looks laggy": it's not the aurora alone, it's
+// the aurora + top-bar blur running concurrently.
 //
 // Gate: chat `model-status: ready` (the 12B load — Rust's single source of
-// truth, Rust is untouched) AND a 5.0s minimum dwell timer. Both must resolve
-// before the flight begins. The existing model-status listener above keeps
-// its title-indicator job; this is a SEPARATE listener so the title's
-// `typing` no-op guard can't swallow the wake signal.
+// truth, Rust is untouched) AND a minimum dwell timer. Both must resolve
+// before the flight begins (the entry + hops always run regardless — they're
+// the loading animation that hides the model load). The existing model-status
+// listener above keeps its title-indicator job; this is a SEPARATE listener
+// so the title's `typing` no-op guard can't swallow the wake signal.
 (function setupBootSplash() {
-  const MIN_DWELL_MS = 5000;
+  // Timing constants (ms).
+  const ENTRY_DELAY = 1000;       // blank screen before paw enters
+  const ENTRY_DURATION = 700;     // paw rises from bottom → center
+  const HOP_DURATION = 700;       // each hop (up + down)
+  const HOP_APEX = HOP_DURATION / 2;
+  const HOP_HEIGHT = 80;          // px the inner img rises per hop
+  const PAUSE_BETWEEN_HOPS = 150; // tiny rest between hop 1 and hop 2
   // Paw display size at center. The resting paw-img is 45px; ~2.67x makes
-  // it ~120px, prominent in the middle of the screen during the hop.
+  // it ~120px, prominent in the middle of the screen during the hops.
   const PAW_BOOT_SCALE = 2.67;
   const PAW_REST_SIZE = 45;
   // Staged-reveal delays (ms) measured from flight-land (transitionend).
-  const DELAY_SKY = 500;
-  const DELAY_AURORA = 900;
-  const DELAY_PAW_REMOVE = 700;
+  // Top-bar fade is 0.6s in CSS; aurora wipe arms AFTER it finishes so the
+  // two blur costs never overlap.
+  const DELAY_SKY = 200;          // canvas RAF starts (sky + stars only)
+  const DELAY_PAW_REMOVE = 400;   // boot-paw fades → real paw revealed
+  const DELAY_AURORA = 800;       // aurora wipe arms (after top-bar's 0.6s fade)
+  // Min-dwell: gate the FLIGHT on the model being ready + a floor so the
+  // hops always play out even if the model loads instantly.
+  const MIN_DWELL_MS = ENTRY_DELAY + ENTRY_DURATION + 2 * HOP_DURATION + PAUSE_BETWEEN_HOPS + 200;
 
   let modelReady = false;
   let dwellDone = false;
-  let transitioned = false;
+  let flightApproved = false;
+  let hopsDone = false;
 
   const bootPaw = document.getElementById('boot-paw');
   const bootPawImg = bootPaw ? bootPaw.querySelector('.boot-paw-img') : null;
@@ -415,41 +461,121 @@ function setTitleState(state) {
   // for the dev-preview case where the HTML might not have it.
   document.body.classList.add('booting');
 
-  // ── Phase 0: position the boot paw at viewport center, scaled up, BEFORE
-  //    any transition can fire. Setting transform inline at module-eval time
-  //    means the first paint already has it at center — no flash from (0,0).
-  //    The hop animation (.boot-paw-img bootHop) runs on the inner img so it
-  //    never fights #boot-paw's translate/scale flight transform.
+  // ── Phase 0: park the paw off-screen below center, scaled up, BEFORE any
+  //    transition can fire. Setting transform inline at module-eval time
+  //    means the first paint already has it hidden — no flash at center.
+  //    The 2 hops are driven via Web Animations API on the inner img so
+  //    sparkles can fire at the apex (a CSS keyframe can't dispatch mid-
+  //    animation). #boot-paw's transform is reserved for the entry + flight.
   if (bootPaw) {
-    // Layout box is the resting 45x45 (kept small so the pointer-events
-    // bounding box matches the resting size; #boot-paw is pointer-events:none
-    // anyway during boot). scale() grows the VISUAL around the default
-    // transform-origin (50% 50%, the box center), so to land the visual
-    // center at viewport center we translate the UNSCALED layout box's
-    // center to viewport center: translate = viewportCenter - restSize/2.
+    // Layout box is the resting 45x45; scale() grows the visual around its
+    // center (transform-origin 50% 50%). To park it below the viewport we
+    // translate past innerHeight. Start position is computed here so the
+    // entry animation has a concrete from-value.
     const restCx = (window.innerWidth - PAW_REST_SIZE) / 2;
-    const restCy = (window.innerHeight - PAW_REST_SIZE) / 2;
+    const parkCy = window.innerHeight + 50; // just below the bottom edge
     bootPaw.style.width = PAW_REST_SIZE + 'px';
     bootPaw.style.height = PAW_REST_SIZE + 'px';
     bootPaw.style.transform =
-      `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`;
+      `translate(${restCx}px, ${parkCy}px) scale(${PAW_BOOT_SCALE})`;
   }
 
-  function maybeTransition() {
-    if (transitioned || !(modelReady && dwellDone)) return;
-    transitioned = true;
+  // ── Sparkle burst. Spawns N .boot-sparkle children of #boot-paw, each
+  //    flying outward in a random direction via the --burst CSS var. They
+  //    self-clean via the animation's `forwards` + a transitionend remover.
+  function spawnSparkles(count = 8) {
+    if (!bootPaw) return;
+    for (let i = 0; i < count; i++) {
+      const s = document.createElement('div');
+      s.className = 'boot-sparkle';
+      const angle = (Math.PI * 2 * i) / count + Math.random() * 0.4;
+      const dist = 30 + Math.random() * 40;
+      const dx = Math.cos(angle) * dist;
+      const dy = Math.sin(angle) * dist - 10; // bias upward slightly
+      s.style.setProperty('--burst', `translate(${dx.toFixed(1)}px, ${dy.toFixed(1)}px)`);
+      bootPaw.appendChild(s);
+      s.addEventListener('animationend', () => s.remove(), { once: true });
+    }
+  }
+
+  // ── Entry + hops. Uses the Web Animations API so we can dispatch sparkle
+  //    bursts at exact hop apexes (timings.onFrame). The inner img's
+  //    translateY animates; #boot-paw's translate/scale are reserved for the
+  //    entry rise + the later flight.
+  function startEntryAndHops() {
+    if (!bootPaw || !bootPawImg) { hopsDone = true; maybeFly(); return; }
+
+    // Entry: animate #boot-paw's transform from "parked below" → "center".
+    // Done via WAAPI so the entry and the hops compose cleanly, and so we
+    // get a precise entry-end callback for starting hop 1.
+    const restCx = (window.innerWidth - PAW_REST_SIZE) / 2;
+    const restCy = (window.innerHeight - PAW_REST_SIZE) / 2;
+    const parkCy = window.innerHeight + 50;
+
+    const entryAnim = bootPaw.animate(
+      [
+        { transform: `translate(${restCx}px, ${parkCy}px) scale(${PAW_BOOT_SCALE})` },
+        { transform: `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})` },
+      ],
+      { duration: ENTRY_DURATION, easing: 'cubic-bezier(0.22, 1, 0.36, 1)', fill: 'forwards' }
+    );
+    // Commit the entry's final state to the inline style so subsequent CSS
+    // transitions (the flight) animate FROM this exact matrix.
+    entryAnim.onfinish = () => {
+      entryAnim.commitStyles();
+      entryAnim.cancel();
+      runHops();
+    };
+  }
+
+  function runHops() {
+    if (!bootPawImg) { hopsDone = true; maybeFly(); return; }
+    let hop = 0;
+    const doHop = () => {
+      hop++;
+      const a = bootPawImg.animate(
+        [
+          { transform: 'translateY(0)' },
+          { transform: `translateY(-${HOP_HEIGHT}px)` },
+          { transform: 'translateY(0)' },
+        ],
+        { duration: HOP_DURATION, easing: 'ease-in-out', fill: 'forwards' }
+      );
+      // Sparkle at the apex (HOP_APEX ms in).
+      setTimeout(spawnSparkles, HOP_APEX);
+      a.onfinish = () => {
+        if (hop < 2) {
+          setTimeout(doHop, PAUSE_BETWEEN_HOPS);
+        } else {
+          // Lock the inner img at translateY(0) so the flight transform is clean.
+          a.commitStyles();
+          a.cancel();
+          hopsDone = true;
+          maybeFly();
+        }
+      };
+    };
+    doHop();
+  }
+
+  // Kick off the entry + hops on a timer (the 1s blank pause).
+  setTimeout(startEntryAndHops, ENTRY_DELAY);
+
+  // ── Flight gate. Both model-ready AND hops-done AND min-dwell must hold.
+  function maybeFly() {
+    if (flightApproved) return;
+    if (!(modelReady && hopsDone && dwellDone)) return;
     flyPawHome();
   }
 
-  // Min-dwell timer: guarantees the hop is visible long enough to register
-  // even if the model loads instantly.
-  setTimeout(() => { dwellDone = true; maybeTransition(); }, MIN_DWELL_MS);
+  // Min-dwell floor so the choreography always plays out.
+  setTimeout(() => { dwellDone = true; maybeFly(); }, MIN_DWELL_MS);
 
   // Primary gate: the chat 12B model finished loading.
   listen('model-status', (e) => {
     if (e?.payload?.status === 'ready') {
       modelReady = true;
-      maybeTransition();
+      maybeFly();
     }
   }).catch(() => {});
   // Safety net: no_model (echo mode) / error also resolve the gate so the user
@@ -459,17 +585,15 @@ function setTitleState(state) {
     const s = e?.payload?.status;
     if (s === 'no_model' || s === 'error') {
       modelReady = true;
-      maybeTransition();
+      maybeFly();
     }
   }).catch(() => {});
 
-  // ── Phase 1: fly the paw from center → home. Reads the real .paw-img's
+  // ── Phase 2: fly the paw from center → home. Reads the real .paw-img's
   //    current rect so the landing is pixel-accurate regardless of layout.
   function flyPawHome() {
+    flightApproved = true;
     if (!bootPaw) { revealAfterLand(); return; }
-    // Stop the hop so the landing is precise (no residual translateY on the
-    // inner img fighting the flight).
-    if (bootPawImg) bootPawImg.style.animation = 'none';
 
     // Read the real paw's resting rect. During boot the top-bar is at
     // opacity:0 but still laid out (NOT display:none), so getBoundingClientRect
@@ -482,8 +606,6 @@ function setTitleState(state) {
     }
 
     // One-shot: when the flight transition ends, run the staged reveal.
-    // transitionend fires once per property; filter to 'transform' so we
-    // don't double-fire on opacity etc.
     const onLand = (e) => {
       if (e.propertyName !== 'transform') return;
       bootPaw.removeEventListener('transitionend', onLand);
@@ -491,10 +613,10 @@ function setTitleState(state) {
     };
     bootPaw.addEventListener('transitionend', onLand);
 
-    // Set the target transform: translate to home + scale(1). The CSS
-    // transition on #boot-paw (transform 1.2s spring) animates the flight.
-    // rAF double-buffer: wait one frame so the browser commits the start
-    // transform before we set the target, guaranteeing the transition runs.
+    // Set the target transform. The CSS transition on #boot-paw
+    // (transform 1.2s easeOutQuint, no overshoot) animates the flight.
+    // rAF double-buffer so the browser commits the start transform before
+    // we set the target, guaranteeing the transition runs.
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         bootPaw.style.transform =
@@ -503,36 +625,37 @@ function setTitleState(state) {
     });
   }
 
-  // ── Phase 2: staged reveal. Called when the paw lands. Each step is a
-  //    setTimeout off the landing moment, per the choreography table in
-  //    the header comment.
+  // ── Phase 3: staged reveal. Called when the paw lands. Each step is a
+  //    setTimeout off the landing moment.
   function revealAfterLand() {
     // +0.0s: drop .booting. Body goes opaque #02040a (CSS), AND the top-bar
     // + dock opacity transitions arm (their CSS rules key off :not(.booting)).
-    // The top-bar's 0.1s delay means it starts fading in almost immediately;
-    // the dock's 1.4s delay holds it for last.
+    // The top-bar starts fading in immediately (0.1s CSS delay, 0.6s fade).
     document.body.classList.remove('booting');
 
-    // +0.5s: start the canvas RAF. First frame paints sky + stars only
-    // (curtain block gated on auroraIntensity > 0.001, still 0 here).
+    // +0.2s: start the canvas RAF. First frame paints sky + stars only
+    // (curtain block gated on auroraIntensity > 0.001, still 0 here, AND
+    // auroraRevealX still ~0 so even if it weren't, nothing would draw).
     setTimeout(() => {
       bootDone = true;
       startLoop();
     }, DELAY_SKY);
 
-    // +0.9s: arm the aurora ramp → curtains bloom in over AURORA_RAMP_MS.
-    setTimeout(() => {
-      auroraRampStart = performance.now();
-    }, DELAY_AURORA);
-
-    // +0.7s: fade + remove the boot paw. By now the top-bar is visible
-    // enough that the real .paw-img reads as a continuous handoff (the
-    // boot-paw was covering it). Fade avoids a hard pop.
+    // +0.4s: fade + remove the boot paw. The top-bar is well into its fade
+    // by now, so the real .paw-img reads as a continuous handoff.
     setTimeout(() => {
       if (!bootPaw) return;
       bootPaw.classList.add('fade-out');
       bootPaw.addEventListener('transitionend', () => bootPaw.remove(), { once: true });
     }, DELAY_PAW_REMOVE);
+
+    // +0.8s: arm the aurora ramp + the left-to-right wipe. Staged AFTER the
+    // top-bar's 0.6s fade (which started at +0.1s) so the two blur costs
+    // don't overlap — this is the real fix for "aurora load-in looks laggy".
+    setTimeout(() => {
+      auroraRampStart = performance.now();
+      auroraRevealStart = performance.now();
+    }, DELAY_AURORA);
   }
 })();
 

@@ -413,9 +413,12 @@ body:not(.booting) .top-bar {
        during a transform animation, which is what stuttered. Opacity fade
        keeps the backdrop region fixed + cheap. Centered via translateX(-50%)
        which is composed with the opacity transition (no transform animation
-       on the centered element). The 1.4s delay stages it LAST per spec —
-       top bar, then starry bg, then aurora, then apps/dock. */
-    transition: opacity 0.6s ease-out 1.4s;
+       on the centered element). The 2.3s delay stages it LAST + AFTER the
+       aurora wipe (which arms at +0.8s and runs ~1.4s): the dock's own
+       backdrop-filter:blur(20px) would otherwise overlap the aurora's
+       blur(30px) and re-introduce the lag. Staggering the two blur costs
+       is the structural fix. */
+    transition: opacity 0.6s ease-out 2.3s;
 }
 body.booting .dock-trigger-area {
     opacity: 0;
@@ -1627,8 +1630,10 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     pointer-events: none;
     /* The flight transition. translate + scale are composed by JS into one
        matrix so the browser animates a single compositor transform. The
-       opacity transition is for the final removal fade. */
-    transition: transform 1.2s cubic-bezier(0.175, 0.885, 0.32, 1.1),
+       opacity transition is for the final removal fade. Easing is
+       easeOutQuint (cubic-bezier(0.22, 1, 0.36, 1)) — a smooth decel with
+       NO overshoot. The old 1.1 final y caused the rubberband snap-back. */
+    transition: transform 1.2s cubic-bezier(0.22, 1, 0.36, 1),
                 opacity 0.3s ease-out;
     /* Initial transform is set by script.js at module load (centered +
        scaled up) BEFORE any transition can fire, so the first paint is
@@ -1638,19 +1643,39 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     opacity: 0;
 }
 
-/* Inner img: the hop animation lives here, separate from #boot-paw's
-   translate/scale flight transform. Compositor-only (translateY). Stopped
-   by script.js (animation: none) the instant the flight begins so the
-   landing is precise. */
+/* Inner img. No CSS hop animation: the 2 distinct jumps are driven via the
+   Web Animations API in script.js so sparkles can fire at the apex of each
+   jump (a CSS keyframe can't dispatch mid-animation). The drop-shadow glow
+   stays — it's the paw's halo. */
 .boot-paw-img {
     width: 100%;
     height: 100%;
     object-fit: contain;
     display: block;
     filter: drop-shadow(0 0 14px rgba(181, 120, 255, 0.45));
-    animation: bootHop 0.9s ease-in-out infinite;
 }
-@keyframes bootHop {
-    0%, 100% { transform: translateY(0); }
-    50%      { transform: translateY(-14px); }
+
+/* Sparkles: tiny 4-point stars that burst outward at each hop apex.
+   Spawned by script.js as children of #boot-paw, animated via the
+   bootSparkle keyframe (one-shot, then self-removed). */
+.boot-sparkle {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 8px;
+    height: 8px;
+    margin-left: -4px;
+    margin-top: -4px;
+    pointer-events: none;
+    /* 4-pointed star via two rotated squares (clip-path diamond). Cheap
+       and crisp at any scale. */
+    background: #ffe6ff;
+    clip-path: polygon(50% 0%, 60% 40%, 100% 50%, 60% 60%, 50% 100%, 40% 60%, 0% 50%, 40% 40%);
+    filter: drop-shadow(0 0 6px rgba(255, 150, 255, 0.9));
+    animation: bootSparkle 0.7s ease-out forwards;
+}
+@keyframes bootSparkle {
+    0%   { transform: translate(0, 0) scale(0) rotate(0deg);   opacity: 1; }
+    40%  { opacity: 1; }
+    100% { transform: var(--burst, translate(40px, -30px)) scale(1.2) rotate(180deg); opacity: 0; }
 }

@@ -9,12 +9,13 @@
 <body class="booting">
     <!-- Boot phase: the OS window is transparent (tauri.conf.json) and STAYS
          transparent for its lifetime. What hides the desktop is the BODY
-         background-color. During boot (body.booting) body is transparent, so
-         the user sees their desktop through the window — only the boot paw
-         is visible (centered, hopping). After the 5s gate resolves, the paw
-         flies to its home spot in the top-left, then script.js drops .booting
-         → body's CSS rule gives it #02040a (solid black) which covers the
-         desktop, and the canvas paints the starry sky + aurora on top.
+         background-color. During boot (body.booting) body is transparent so
+         the user sees their desktop through the window. The boot paw starts
+         parked below the viewport; after a 1s blank pause it rises to center,
+         hops twice (sparkles at each apex), then flies to its top-left home.
+         Once it lands, script.js drops .booting → body's CSS rule gives it
+         #02040a (solid black) which covers the desktop, and the canvas paints
+         the starry sky + aurora (left-to-right wipe) on top.
          z-index 100000 puts #boot-paw above the top-bar (9999) and all
          app-windows (1000) so it can fly over everything during landing. -->
     <div id="boot-paw"><img src="paw.png" class="boot-paw-img" alt="" /></div>
