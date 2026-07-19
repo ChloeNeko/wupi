@@ -484,9 +484,12 @@ function setTitleState(state) {
   // Fairy-tour choreography: RISE STRAIGHT TO TOP-LEFT MIDDLE → dart to
   // TOP-RIGHT MIDDLE → dart to CENTER. Each dart is a hard ZOOM_EASE in/out
   // so the paw reads as a fairy teleporting with momentum. Holds at each
-  // stop are ~0.6s per spec ("slightly faster" than the old 1s holds).
-  // Total ≈ 0.4 rise + 0.6 hold + 0.4 dart + 0.6 hold + 0.4 dart + 0.6 hold = 3.0s.
-  const ENTRY_DURATION = 3000;
+  // stop are ~0.6s per spec. The rise from the bottom is paced slower than
+  // the darts (per spec: "when it flies from the bottom it moves a bit too
+  // quick") — that's encoded in the rise getting a longer slice of the
+  // total duration than the dart segments.
+  // Total ≈ 0.6 rise + 0.6 hold + 0.4 dart + 0.6 hold + 0.4 dart + 0.6 hold = 3.2s.
+  const ENTRY_DURATION = 3200;
   // Sharp accel + sharp decel — the "fairy dart" easing. Most of the
   // motion happens in the middle of the segment, with hard start/stop.
   const ZOOM_EASE = 'cubic-bezier(0.65, 0, 0.35, 1)';
@@ -507,11 +510,11 @@ function setTitleState(state) {
   // Loiter after hop 2 before the corner flight fires. Per spec: "after the
   // 2nd hop let it loiter for .5 seconds before moving."
   const POST_HOP_LOITER_MS = 500;
-  // Curved corner flight: fires after the post-hop loiter. The path is a
-  // SLIGHT backwards-J curve (small bow above the straight diagonal), not
-  // a big swoop. Per spec: "Have the curve be tighter it's way too crazy,
-  // it should be a slight curve."
-  const FLIGHT_DURATION_MS = 650;
+  // Straight-line corner flight: fires after the post-hop loiter. Per spec
+  // ("just make it a straight line, you aren't curving it correctly") the
+  // flight is now a single CSS transition to the corner — no WAAPI arc.
+  // Slowed from 650ms to 800ms per spec ("fly a little slower").
+  const FLIGHT_DURATION_MS = 800;
   // Staged-reveal delays (ms) measured from flight-land (transitionend).
   // Top-bar fade is 0.6s in CSS; aurora wipe arms AFTER it finishes so the
   // two blur costs never overlap.
@@ -655,24 +658,28 @@ function setTitleState(state) {
 
     const entryAnim = bootPaw.animate(
       [
-        // 0 → 0.13: rise from below STRAIGHT TO TOP-LEFT MIDDLE (no center).
+        // 0 → 0.22: rise from below STRAIGHT TO TOP-LEFT MIDDLE (no center).
+        // The rise gets a bigger slice of the duration than the darts so
+        // it reads as a graceful arrival rather than a snap upward (per
+        // spec: "when it flies from the bottom it moves a bit too quick").
+        // easeOutQuint so it decelerates as it approaches the corner.
         { transform: `translate(${restCx}px, ${parkCy}px) scale(${PAW_BOOT_SCALE})`,
           offset: 0, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' },
         { transform: `translate(${leftX}px, ${topY}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.13, easing: 'linear' },
-        // 0.13 → 0.33: HOLD at TOP-LEFT for ~0.6s (same coord).
+          offset: 0.22, easing: 'linear' },
+        // 0.22 → 0.41: HOLD at TOP-LEFT for ~0.6s (same coord).
         { transform: `translate(${leftX}px, ${topY}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.33, easing: ZOOM_EASE },
-        // 0.33 → 0.47: dart to TOP-RIGHT MIDDLE (crosses the whole top).
+          offset: 0.41, easing: ZOOM_EASE },
+        // 0.41 → 0.54: dart to TOP-RIGHT MIDDLE (crosses the whole top).
         { transform: `translate(${rightX}px, ${topY}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.47, easing: 'linear' },
-        // 0.47 → 0.67: HOLD at TOP-RIGHT for ~0.6s (same coord).
+          offset: 0.54, easing: 'linear' },
+        // 0.54 → 0.73: HOLD at TOP-RIGHT for ~0.6s (same coord).
         { transform: `translate(${rightX}px, ${topY}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.67, easing: ZOOM_EASE },
-        // 0.67 → 0.80: dart down to CENTER.
+          offset: 0.73, easing: ZOOM_EASE },
+        // 0.73 → 0.83: dart down to CENTER.
         { transform: `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0.80, easing: 'linear' },
-        // 0.80 → 1.0: HOLD at CENTER for ~0.6s (same coord).
+          offset: 0.83, easing: 'linear' },
+        // 0.83 → 1.0: HOLD at CENTER for ~0.6s (same coord).
         { transform: `translate(${restCx}px, ${restCy}px) scale(${PAW_BOOT_SCALE})`,
           offset: 1, easing: 'linear' },
       ],
@@ -743,11 +750,11 @@ function setTitleState(state) {
   // safety net in case hops fail to fire — but it no longer gates flight.
   // (Intentionally no listener wiring here.)
 
-  // ── Phase 2: fly the paw from center → home along a CURVED arc. Reads
+  // ── Phase 2: fly the paw from center → home in a STRAIGHT LINE. Reads
   //    the real .paw-img's current rect so the landing is pixel-accurate.
-  //    Per spec: "Not a straight line but a curve as it moves into the
-  //    corner." Implemented as a 3-keyframe WAAPI arc bowing ABOVE the
-  //    straight diagonal (a parabolic swoop up-and-over to the corner).
+  //    Per spec: "as it moves into the very top left corner just make it a
+  //    straight line, you aren't curving it correctly." Implemented as a
+  //    single CSS transition (transform FLIGHT_DURATION_MS) — no WAAPI arc.
   function flyPawHome() {
     flightApproved = true;
     if (!bootPaw) { startLoadingScreen(); return; }
@@ -762,34 +769,16 @@ function setTitleState(state) {
       targetY = r.top;
     }
 
-    // Read the paw's current translate so the arc starts from where hop 2
-    // left it (center). commitStyles on the entry animation pinned it there.
-    // Fall back to viewport center if the read fails for any reason.
-    const restCx = (window.innerWidth - PAW_REST_SIZE) / 2;
-    const restCy = (window.innerHeight - PAW_REST_SIZE) / 2;
-    const startRect = bootPaw.getBoundingClientRect();
-    const startX = (startRect && isFinite(startRect.left)) ? startRect.left : restCx;
-    const startY = (startRect && isFinite(startRect.top)) ? startRect.top : restCy;
-
-    // Arc midpoint: SLIGHT backwards-J bow above the straight diagonal.
-    // The old bow (25% of vertical travel + 80px) was way too dramatic
-    // ("way too crazy" per spec). Tightened to a subtle ~12% bow with a
-    // small floor so the path reads as a gentle J-curve, not a swoop.
-    const midX = (startX + targetX) / 2;
-    const verticalTravel = Math.abs(targetY - startY);
-    const bow = Math.min(verticalTravel * 0.12 + 24, window.innerHeight * 0.10);
-    const midY = Math.min(startY, targetY) - bow;
-
     // Restart the sparkle trail for the flight (it was stopped when hops
     // began). Stopped again on land.
     startTrail();
 
-    // One-shot: when the flight animation ends, start the loading screen.
-    // (The staged reveal is now reached only AFTER the 8s loading screen
-    // finishes — see endLoadingScreen → revealAfterLand.)
-    const onLand = () => {
-      flightAnim.commitStyles();
-      flightAnim.cancel();
+    // One-shot: when the flight transition ends, start the loading screen
+    // phase. (The staged reveal is now reached only AFTER the 8s loading
+    // screen finishes — see endLoadingScreen → revealAfterLand.)
+    const onLand = (e) => {
+      if (e.propertyName !== 'transform') return;
+      bootPaw.removeEventListener('transitionend', onLand);
       stopTrail();
       // One final big burst on landing — a celebratory capstone.
       spawnSparkles(14, 1);
@@ -803,23 +792,23 @@ function setTitleState(state) {
       document.body.classList.add('loading');
       startLoadingScreen();
     };
+    bootPaw.addEventListener('transitionend', onLand);
 
-    // Curved flight via WAAPI: 3 keyframes (start → arc-midpoint → corner)
-    // with the scale shrinking 2.8 → 1 across the arc so the paw also
-    // shrinks as it travels. Easing: ease-in to launch, ease-out to settle
-    // into the corner (the "swoop" feel).
-    const flightAnim = bootPaw.animate(
-      [
-        { transform: `translate(${startX}px, ${startY}px) scale(${PAW_BOOT_SCALE})`,
-          offset: 0, easing: 'cubic-bezier(0.4, 0, 0.7, 0.4)' },
-        { transform: `translate(${midX}px, ${midY}px) scale(${(PAW_BOOT_SCALE + 1) / 2})`,
-          offset: 0.5, easing: 'cubic-bezier(0.3, 0.6, 0.6, 1)' },
-        { transform: `translate(${targetX}px, ${targetY}px) scale(1)`,
-          offset: 1 },
-      ],
-      { duration: FLIGHT_DURATION_MS, fill: 'forwards' }
-    );
-    flightAnim.onfinish = onLand;
+    // Straight-line flight via a single CSS transition: set the transform
+    // target, the browser's compositor interpolates a linear diagonal from
+    // the current position (center, post-hop-2) to the top-left corner.
+    // easeInOut so the launch + landing are smooth (no snap). Scale shrinks
+    // 2.8 → 1 over the same transition (composed in one matrix = one layer).
+    // rAF double-buffer so the browser commits the start transform before
+    // we set the target, guaranteeing the transition runs.
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        bootPaw.style.transition =
+          `transform ${FLIGHT_DURATION_MS}ms cubic-bezier(0.45, 0, 0.55, 1), opacity 0.3s ease-out`;
+        bootPaw.style.transform =
+          `translate(${targetX}px, ${targetY}px) scale(1)`;
+      });
+    });
   }
 
   // ── Loading screen phase (between paw-land and the staged reveal).
