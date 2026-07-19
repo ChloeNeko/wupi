@@ -547,7 +547,7 @@ impl LlamaCppBackend {
     /// `stream()` calls return the "not ready" error instead of posting to a
     /// dead thread. The synchronous join is load-bearing during model swaps -
     /// the old fire-and-forget version raced VRAM teardown and OOM'd the next
-    /// `load_from_file` (Chloe's 2026-07-18 VRAM-overlap diagnosis). Callers
+    /// `load_from_file` (the 2026-07-18 VRAM-overlap diagnosis). Callers
     /// using this from an async context should wrap it in `spawn_blocking`.
     pub fn shutdown(&self) {
         if let Some(engine) = self.engine.lock().map(|mut g| g.take()).unwrap_or(None) {

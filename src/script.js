@@ -211,7 +211,7 @@ function animate() {
 
   // Aurora borealis: 5 layered, independently-hued curtains. Each curtain
   // gets its own hue oscillation. The soft bloom (blur 30px) IS the look —
-  // Chloe's call: do NOT collapse the visual into one fill.
+  // by design: do NOT collapse the visual into one fill.
   //
   // PERF ARCHITECTURE (the boot-wipe stutter fix):
   // The OLD code set ctx.filter='blur(30px)' and called ctx.fill() 5 times
@@ -422,7 +422,7 @@ function setTitleState(state) {
 }
 
 // Subscribe to Rust's model-status events (already emitted, previously
-// unobserved). Boot starts at 'idle' (steady white) per Chloe's call: the
+// unobserved). Boot starts at 'idle' (steady white) by design: the
 // pulse only fires for actual typing, and the red alarm only for confirmed
 // offline/error states. The first model-status event then corrects to the
 // real state.
@@ -1550,7 +1550,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
 
   // APP WINDOW MANAGER
   // The surfaces (Chat, Profile Editor, Codex, Docks) are DOM overlays in
-  // the ONE Tauri window. Background rules (per Chloe's spec):
+  // the ONE Tauri window. Background rules (by design):
   //   - WUPI Chat (chat): the ONLY window that pauses the canvas (stars +
   //     aurora OFF). Its own background is ~80% opaque so the paused backdrop
   //     doesn't show through. Closing it resumes the canvas.
@@ -1875,7 +1875,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
                    : profiles[0].id;
       profileSelect.value = target;
       // Edit/trash are enabled whenever a real profile is selected.
-      // Per Chloe: even a single profile must be editable/deletable.
+      // By design: even a single profile must be editable/deletable.
       const hasRealSelection = !!profileSelect.value;
       editProfileBtn.disabled = !hasRealSelection;
       deleteProfileBtn.disabled = !hasRealSelection;

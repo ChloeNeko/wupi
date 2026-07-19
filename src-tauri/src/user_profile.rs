@@ -35,7 +35,7 @@ use std::path::Path;
 /// `Option<&str>` gate, same empty-skip as the SIM card fallback).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct UserProfile {
-    /// How Wupi should address the operator (e.g. "Chloe", "Master", "Creator").
+    /// How Wupi should address the operator (e.g. "Operator", "Master", "Creator").
     pub name: String,
     /// A freeform character description for Wupi to refer to the operator as -
     /// who they are, how she should treat them, their relationship/tone, etc.
@@ -217,7 +217,7 @@ fn parse(xml: &str) -> anyhow::Result<UserProfile> {
     // Backward compat: if the old 4-field tags are present (and the new
     // description is absent), fold background + dynamics into description so
     // the old prose isn't lost. `role` is intentionally dropped: it was the
-    // least useful field and Chloe's simplification explicitly removes it.
+    // least useful field and the simplification explicitly removes it.
     if description.trim().is_empty() {
         let background = child_text(root, "background").unwrap_or_default();
         let dynamics = child_text(root, "dynamics").unwrap_or_default();
@@ -264,7 +264,7 @@ mod tests {
 
     const SAMPLE: &str = r#"<?xml version="1.0"?>
 <user_profile>
-  <name>Chloe</name>
+  <name>Operator</name>
   <description><![CDATA[
 The operator. Wupi's Master: direct, ambitious, wants an honest engineering
 partner, not a yes-man. Build WUPI OS alongside her.
@@ -276,7 +276,7 @@ partner, not a yes-man. Build WUPI OS alongside her.
     /// `role` is dropped. An old Operator.xml isn't lost on first load.
     const LEGACY_4FIELD: &str = r#"<?xml version="1.0"?>
 <user_profile>
-  <name>Chloe</name>
+  <name>Operator</name>
   <role>Lead Developer</role>
   <background><![CDATA[
 - Builds WUPI OS from the ground up.
@@ -289,7 +289,7 @@ partner, not a yes-man. Build WUPI OS alongside her.
     #[test]
     fn parse_extracts_all_fields() {
         let p = parse(SAMPLE).expect("sample parses");
-        assert_eq!(p.name, "Chloe");
+        assert_eq!(p.name, "Operator");
         assert!(p.description.contains("honest engineering"));
     }
 
@@ -297,7 +297,7 @@ partner, not a yes-man. Build WUPI OS alongside her.
     fn parse_legacy_4field_folds_into_description() {
         // The old format still loads: background + dynamics → description.
         let p = parse(LEGACY_4FIELD).expect("legacy parses");
-        assert_eq!(p.name, "Chloe");
+        assert_eq!(p.name, "Operator");
         assert!(p.description.contains("Builds WUPI OS"));
         assert!(p.description.contains("devoted to her Master"));
     }
@@ -323,7 +323,7 @@ partner, not a yes-man. Build WUPI OS alongside her.
     fn parse_rejects_malformed_xml() {
         // Graceful degradation on malformed XML (the hot-reload "saved mid-edit"
         // case). parse() errors → load() returns None → section suppressed.
-        let broken = "<user_profile><name>Chloe</name"; // truncated mid-tag
+        let broken = "<user_profile><name>Operator</name"; // truncated mid-tag
         assert!(parse(broken).is_err());
     }
 
@@ -332,7 +332,7 @@ partner, not a yes-man. Build WUPI OS alongside her.
         let p = parse(SAMPLE).expect("parses");
         let rendered = p.render_for_prompt();
         assert!(rendered.starts_with("<user_profile>"));
-        assert!(rendered.contains("name: Chloe"));
+        assert!(rendered.contains("name: Operator"));
         assert!(rendered.contains("description:"));
         assert!(rendered.contains("honest engineering"));
     }
@@ -365,7 +365,7 @@ partner, not a yes-man. Build WUPI OS alongside her.
         // save → load round-trip via render_xml → parse. Guards the byte-
         // stable contract (an unchanged profile re-saves identically).
         let original = UserProfile {
-            name: "Chloe".to_owned(),
+            name: "Operator".to_owned(),
             description: "Master of Wupi.\nDirect and ambitious.".to_owned(),
         };
         let xml = render_xml(&original);

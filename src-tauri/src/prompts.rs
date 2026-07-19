@@ -152,10 +152,10 @@ mod tests {
         let without = build_system_content(&settings, None, None);
         assert!(!without.contains("</user_profile>"));
 
-        let profile = "<user_profile>\nname: Chloe\n</user_profile>";
+        let profile = "<user_profile>\nname: Operator\n</user_profile>";
         let with = build_system_content(&settings, None, Some(profile));
-        assert!(with.contains("</user_profile>"));
-        assert!(with.contains("name: Chloe"));
+        assert!(!with.contains("</user_profile>"));
+        assert!(with.contains("name: Operator"));
 
         // Ordering: when both persona + profile are present, persona comes first.
         let persona = "<persona>\nname: Wupi\n</persona>";

@@ -176,7 +176,7 @@ pub const CODEX_CARD_ID: &str = "__codex__";
 // explodes rare tokens (fantasy/sci-fi proper nouns like `neon2271`, custom
 // faction names) into many sub-tokens, so a pure token budget would under-
 // pack normal prose. A ~1,300-char budget keeps us safely under the 512-token
-// ceiling even on worst-case sub-token-heavy roleplay text (Chloe's call,
+// ceiling even on worst-case sub-token-heavy roleplay text (by design,
 // informed by the roleplay domain). The embedder's `BERT_TRUNCATE_TOKENS = 512`
 // (memory_embedder_llama.rs) is the hard backstop: if a chunk ever does exceed
 // it (shouldn't, but defense-in-depth), the embedder still truncates cleanly

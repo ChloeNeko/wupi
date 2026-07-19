@@ -266,7 +266,7 @@ impl ChatEngine {
     /// Synchronous wait is load-bearing during model swaps: the old
     /// fire-and-forget pattern posted Shutdown and returned immediately, so
     /// the next model load raced the thread's VRAM teardown and OOM'd
-    /// `load_from_file` → `NullResult` (Chloe's 2026-07-18 VRAM-overlap
+    /// `load_from_file` → `NullResult` (the 2026-07-18 VRAM-overlap
     /// diagnosis). Blocking on the JoinHandle guarantees VRAM is released
     /// before any new model allocates.
     pub fn shutdown(&self) {
