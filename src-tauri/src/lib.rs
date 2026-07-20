@@ -574,16 +574,19 @@ pub fn run() {
                     // embedder fallback). Runs synchronously here (setup is
                     // allowed to block: it already blocks on the embedder
                     // readiness channel above).
-                    // (1) User-authored codex from `docs/` → CODEX_CARD_ID. The user's
-                    //     blank slate: empty by default, populated only via the
-                    //     codex_* IPC. Pinned to CODEX_CARD_ID (not active_card_id)
-                    //     so editing lore during a game lands in the user's namespace,
-                    //     NOT the active roleplay card (the pre-Phase-2 bug).
-                    // (2) Wupi's non-editable system knowledge from
-                    //     `cards/wupi_knowledge/` → WUPI_SYSTEM_CARD_ID. The firewall:
-                    //     no user IPC writes here; only this boot seed does. Wupi
-                    //     reads it cross-card via search_wupi_visible regardless of
-                    //     which roleplay card is active.
+                    // (1) User-authored codex from `data/docs/` → CODEX_CARD_ID.
+                    //     The user's blank slate: empty by default, populated
+                    //     only via the codex_* IPC. Pinned to CODEX_CARD_ID
+                    //     (not active_card_id) so editing lore during a game
+                    //     lands in the user's namespace, NOT the active
+                    //     roleplay card (the pre-Phase-2 bug).
+                    //
+                    // (Wupi's non-editable system knowledge seed from
+                    // `cards/wupi_knowledge/` was REMOVED in §8C: those source
+                    // files were deleted pre-session, and the seed path was
+                    // dead code. The WUPI_SYSTEM_CARD_ID sentinel constant +
+                    // search_wupi_visible READ side stay live: a future system-
+                    // knowledge injection path would reuse them.)
                     if let Some(codex_dir) = resolve_codex_dir(app.handle()) {
                         // Cache the resolved path for the codex_* IPC (file CRUD).
                         let _ = state.codex_dir.set(Some(codex_dir.clone()));
@@ -605,30 +608,7 @@ pub fn run() {
                             }
                         }
                     } else {
-                        tracing::info!("no docs/ dir found; skipping user codex seed");
-                    }
-
-                    // Wupi-system seed: her own OS docs (the firewall's read-only side).
-                    if let Some(wupi_knowledge_dir) = resolve_wupi_knowledge_dir(app.handle()) {
-                        if let Some(engine) = state.memory.get() {
-                            match tauri::async_runtime::block_on(
-                                codex::seed_codex(engine, &wupi_knowledge_dir, memory::WUPI_SYSTEM_CARD_ID, "wupi_system"),
-                            ) {
-                                Ok(report) => tracing::info!(
-                                    seeded = report.seeded,
-                                    updated = report.updated,
-                                    purged = report.purged,
-                                    unchanged = report.unchanged,
-                                    "wupi system knowledge seeded"
-                                ),
-                                Err(e) => tracing::warn!(
-                                    error = %format!("{e:#}"),
-                                    "wupi system knowledge seed failed; continuing"
-                                ),
-                            }
-                        }
-                    } else {
-                        tracing::info!("no cards/wupi_knowledge/ dir found; skipping system knowledge seed");
+                        tracing::info!("no data/docs/ dir found; skipping user codex seed");
                     }
                 }
                 Err(e) => {
@@ -1288,39 +1268,6 @@ fn resolve_codex_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     for dir in &candidates {
         if dir.is_dir() {
             tracing::info!("resolved codex (docs/) dir: {}", dir.display());
-            return Some(dir.clone());
-        }
-    }
-    None
-}
-
-/// Resolve the `cards/wupi_knowledge/` directory: the home of Wupi's non-
-/// editable system knowledge (the Phase 2 firewall's read-only seed source).
-///
-/// Walks the exe-relative candidate list (portable layout: `<exe_dir>/cards/
-/// wupi_knowledge` first; dev-repo paths as fallback). Returns `None` if no
-/// such dir exists (graceful - the system knowledge is optional; the seed
-/// loader treats a missing dir as "nothing to seed"). The path sits alongside
-/// `cards/Wupi.sim` and `cards/game_cards/`: all three are bundled tracked
-/// text assets, not user-writable state.
-fn resolve_wupi_knowledge_dir(_app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(exe) = std::env::current_exe().ok() {
-        if let Some(parent) = exe.parent() {
-            // Portable layout: `<exe_dir>/cards/wupi_knowledge`.
-            candidates.push(parent.join("cards").join("wupi_knowledge"));
-            if let Some(grand) = parent.parent().and_then(|g| g.parent()) {
-                candidates.push(grand.join("cards").join("wupi_knowledge"));
-            }
-            if let Some(gg) = parent.parent().and_then(|g| g.parent()).and_then(|g| g.parent()) {
-                candidates.push(gg.join("cards").join("wupi_knowledge"));
-            }
-        }
-    }
-
-    for dir in &candidates {
-        if dir.is_dir() {
-            tracing::info!("resolved wupi_knowledge dir: {}", dir.display());
             return Some(dir.clone());
         }
     }
