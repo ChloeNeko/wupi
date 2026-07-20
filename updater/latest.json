@@ -1,10 +1,10 @@
 {
-  "version": "0.4.0",
-  "notes": "WUPI v0.4.0 (portable)\n\nExtract anywhere and run wupi.exe. Everything stays in the folder.",
-  "pub_date": "2026-07-20T07:53:21.699Z",
+  "version": "0.3.1",
+  "notes": "WUPI v0.3.1 (portable)\n\nExtract anywhere and run wupi.exe. Everything stays in the folder.",
+  "pub_date": "2026-07-20T08:04:15.377Z",
   "platforms": {
     "windows-x86_64": {
-      "url": "https://github.com/ChloeNeko/WUPI/releases/download/v0.4.0/WUPI.zip"
+      "url": "https://github.com/ChloeNeko/WUPI/releases/download/v0.3.1/WUPI.zip"
     }
   }
 }
