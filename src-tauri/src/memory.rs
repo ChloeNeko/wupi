@@ -1168,6 +1168,27 @@ fn init_schema(conn: &Connection) -> anyhow::Result<()> {
     // TABLE above already added it; the probe finds it and skips the ALTER).
     migrate_add_column(conn, "memories", "parent_uuid", "TEXT")?;
 
+    // §8C data migration: the Wupi-assistant card_id sentinel was renamed
+    // from `__wupi_os__` to `__wupi__` (constant WUPI_OS_CARD_ID → WUPI_CARD_ID).
+    // New writes use `__wupi__`; without this one-shot UPDATE, rows from a
+    // prior install stay under `__wupi_os__` and become invisible to the
+    // per-card retrieval filter (`WHERE card_id = ?`). Idempotent: a DB that
+    // has no `__wupi_os__` rows (fresh install OR already-migrated DB) updates
+    // 0 rows. Errors here are non-fatal (logged): a corrupt card_id column is
+    // not a boot-killing condition, and refusing to boot over a memory
+    // migration would be worse than losing pre-§8C chat history.
+    match conn.execute(
+        "UPDATE memories SET card_id = '__wupi__' WHERE card_id = '__wupi_os__'",
+        [],
+    ) {
+        Ok(n) if n > 0 => tracing::info!(
+            migrated = n,
+            "§8C migration: rebranded __wupi_os__ memories → __wupi__"
+        ),
+        Ok(_) => {} // 0 rows: fresh DB or already migrated.
+        Err(e) => tracing::warn!(?e, "§8C card_id migration skipped (non-fatal)"),
+    }
+
     // vec0 DDL separately: its dimension comes from a const, so build the
     // statement with format!. (vec0's parser is picky; keep the literal clean.)
     let vec_ddl = format!(
