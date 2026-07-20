@@ -6,6 +6,10 @@
   "permissions": [
     "core:default",
     "updater:default",
-    "process:default"
+    "updater:allow-check",
+    "updater:allow-download",
+    "updater:allow-download-and-install",
+    "process:default",
+    "process:allow-restart"
   ]
 }
