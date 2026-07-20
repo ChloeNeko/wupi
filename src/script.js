@@ -437,6 +437,124 @@ function setTitleState(state) {
   }
 })();
 
+// ─── First-run LAUNCH button + chime ───────────────────────────────────────
+// When the GGUF download completes, instead of auto-reloading we surface a
+// sparkly LAUNCH button + a synthesized chime. The user clicks it to proceed
+// to the boot choreography. Mirrors the boot-paw sparkle aesthetic: bright
+// pink→magenta gradient + multi-hue sparkle burst + glow pulse.
+
+// Lazy AudioContext singleton. Browsers require a user gesture to start
+// audio; the LAUNCH click IS that gesture. Resumes on suspended (the tab
+// was backgrounded). Returns null if Web Audio is unavailable.
+function getAudioCtx() {
+  if (!window.__wupiAudioCtx) {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return null;
+    try { window.__wupiAudioCtx = new Ctx(); }
+    catch (e) { console.warn('[Wupi] AudioContext init failed', e); return null; }
+  }
+  if (window.__wupiAudioCtx.state === 'suspended') {
+    window.__wupiAudioCtx.resume().catch(() => {});
+  }
+  return window.__wupiAudioCtx;
+}
+
+// Two-ascending-note chime (A5 → E6) — a soft "ready" cue. Sine waves with
+// a quick attack + exponential decay so it reads as a bell-like ping rather
+// than a beep. Total duration ~0.55s. Synthesized = no asset file ships.
+function playLaunchChime() {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  const now = ctx.currentTime;
+  const notes = [
+    { f: 880.0,   t: 0.00 },  // A5
+    { f: 1318.51, t: 0.13 },  // E6
+  ];
+  notes.forEach(({ f, t }) => {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = f;
+    gain.gain.setValueAtTime(0, now + t);
+    gain.gain.linearRampToValueAtTime(0.18, now + t + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + t + 0.45);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(now + t);
+    osc.stop(now + t + 0.5);
+  });
+}
+
+// Show the LAUNCH button on the download overlay. Hides the Start/Cancel
+// buttons, fills the progress bar to 100%, then mounts the LAUNCH button
+// below the stats. The button's click handler plays the chime, spawns a
+// sparkle burst, restores always-on-top, and reloads.
+function showLaunchButton(overlay, startBtn, cancelBtn, subtitle, stats, bar) {
+  // Freeze the progress display at "complete" so the LAUNCH button reads as
+  // the natural next step (no half-filled bar).
+  if (bar) bar.style.width = '100%';
+  if (stats) stats.textContent = '✓ Models ready';
+  if (subtitle) subtitle.textContent = 'Click LAUNCH to enter WUPI.';
+  startBtn.hidden = true;
+  cancelBtn.hidden = true;
+
+  // Mount the LAUNCH button if not already there (idempotent: a re-click
+  // of the Start button on a retry wouldn't double-mount).
+  let launchBtn = document.getElementById('launchBtn');
+  if (!launchBtn) {
+    launchBtn = document.createElement('button');
+    launchBtn.id = 'launchBtn';
+    launchBtn.className = 'launch-btn';
+    launchBtn.textContent = '✦ LAUNCH ✦';
+    // Insert below the actions row so it reads as the capstone CTA.
+    const inner = overlay.querySelector('.download-overlay-inner');
+    if (inner) inner.appendChild(launchBtn);
+    else overlay.appendChild(launchBtn);
+  }
+  launchBtn.hidden = false;
+
+  // Play the chime once on first appearance (no gesture yet — this is the
+  // completion chime, NOT triggered by a click). Some browsers block audio
+  // that wasn't user-gesture-initiated; the .catch swallows the Autoplay
+  // rejection silently (the visual sparkle + button still cue completion).
+  try { playLaunchChime(); } catch (e) { /* autoplay blocked: silent */ }
+
+  launchBtn.addEventListener('click', function onLaunch() {
+    launchBtn.removeEventListener('click', onLaunch);
+    // User gesture: the chime is guaranteed to play here.
+    try { playLaunchChime(); } catch (e) { /* ignore */ }
+    // Spawn a sparkle burst around the button center (reuses the boot-paw
+    // sparkle aesthetic: .boot-sparkle CSS + the spawnSparkles pattern).
+    spawnLaunchSparkles(launchBtn);
+    // Restore always-on-top for the normal OS UX, then reload so setup()
+    // re-runs with WUPI.gguf present + the boot choreography plays.
+    invoke('set_always_on_top', { on: true }).catch(() => {});
+    // Tiny delay so the sparkle + chime land before the reload kills them.
+    setTimeout(() => location.reload(), 350);
+  });
+}
+
+// Sparkle burst for the LAUNCH button. Spawns N .boot-sparkle children of
+// the button (position: relative via .launch-btn CSS), each flying outward
+// in a random direction via the --burst CSS var. Self-cleans on
+// animationend (mirrors spawnSparkles in the boot-paw code, ~line 740).
+function spawnLaunchSparkles(parent, count = 18) {
+  for (let i = 0; i < count; i++) {
+    const s = document.createElement('div');
+    s.className = 'boot-sparkle big';
+    const angle = (Math.PI * 2 * i) / count + Math.random() * 0.4;
+    const dist = 30 + Math.random() * 40;
+    const dx = Math.cos(angle) * dist;
+    const dy = Math.sin(angle) * dist - 8; // bias upward
+    s.style.setProperty('--burst', `translate(${dx.toFixed(1)}px, ${dy.toFixed(1)}px)`);
+    const hues = [320, 190, 270, 300, 220];
+    const h = hues[Math.floor(Math.random() * hues.length)];
+    s.style.background = `hsl(${h}, 100%, 75%)`;
+    s.style.filter = `drop-shadow(0 0 4px hsla(${h}, 100%, 70%, 0.95))`;
+    parent.appendChild(s);
+    s.addEventListener('animationend', () => s.remove(), { once: true });
+  }
+}
+
 // ─── First-run model download gate ─────────────────────────────────────────
 // On a fresh install the GGUFs aren't on disk. setup() in Rust emits
 // `model-status: missing` and we proactively invoke `check_models` here.
@@ -478,6 +596,17 @@ function setTitleState(state) {
   // through). The overlay's CSS fade-in (0.8s) gives a soft reveal.
   overlay.classList.add('show');
 
+  // Drop always-on-top so the user can alt-tab away during the long GGUF
+  // pull (~10 GB, several minutes on a fast connection). The window's
+  // default is alwaysOnTop:true (tauri.conf.json) — that's the right steady
+  // state for normal OS use, but a first-run download is a wait, not an OS
+  // session. Restored to ON when the user clicks LAUNCH ( success path ).
+  // Best-effort: if the IPC fails the download still works, just stays
+  // on-top (the user's not stranded).
+  invoke('set_always_on_top', { on: false }).catch((e) =>
+    console.warn('[Wupi] set_always_on_top(false) failed; overlay will stay on-top', e)
+  );
+
   // Human-readable byte formatting for the stats line.
   const fmtBytes = (n) => {
     if (!n || n <= 0) return '0 MB';
@@ -492,7 +621,7 @@ function setTitleState(state) {
       case 'resolving': return `Preparing ${file || 'download'}…`;
       case 'downloading': return `Downloading ${file || 'models'}…`;
       case 'finalizing': return `Saving ${file || 'file'}…`;
-      case 'done': return 'Download complete. Reloading…';
+      case 'done': return 'Download complete — click LAUNCH to continue.';
       case 'failed': return 'Download failed.';
       default: return 'First-run setup: download the AI models (~10 GB). One-time only.';
     }
@@ -567,14 +696,14 @@ function setTitleState(state) {
     errorEl.textContent = '';
     try {
       await invoke('download_models');
-      // Success: fade the overlay out, then reload so setup() re-runs with
-      // WUPI.gguf present and the normal boot choreography plays.
-      overlay.classList.add('fade-out');
-      setTimeout(() => {
-        if (progressUnlisten) progressUnlisten();
-        clearInterval(pollHandle);
-        location.reload();
-      }, 900);
+      // Success: stop polling + show the LAUNCH button. We no longer
+      // auto-reload — the user clicks LAUNCH, which plays a chime + sparkle
+      // burst, restores always-on-top, and reloads so setup() re-runs with
+      // WUPI.gguf present + the normal boot choreography plays. The chime
+      // is synthesized (Web Audio) so no asset needs to ship.
+      clearInterval(pollHandle);
+      if (progressUnlisten) { progressUnlisten(); progressUnlisten = null; }
+      showLaunchButton(overlay, startBtn, cancelBtn, subtitle, stats, bar);
     } catch (err) {
       console.error('[Wupi] download_models failed', err);
       const msg = typeof err === 'string' ? err : (err?.message || 'Unknown error');
@@ -632,7 +761,25 @@ function setTitleState(state) {
 // the loading animation that hides the model load). The existing model-status
 // listener above keeps its title-indicator job; this is a SEPARATE listener
 // so the title's `typing` no-op guard can't swallow the wake signal.
-(function setupBootSplash() {
+(async function setupBootSplash() {
+  // First-run gate: if the GGUFs are missing, DON'T play the paw animation.
+  // The download overlay (setupModelDownloadGate) takes over the screen and
+  // any paw motion underneath it creates a weird visual bug (the paw flies
+  // through the overlay). We resolve check_models FIRST; on missing → bail
+  // before scheduling any entry/hop/flight timers. The download gate runs
+  // in parallel and is the sole animation when models need downloading.
+  // Tolerant of IPC failure: if check_models throws, assume present (better
+  // to play the paw on a misfire than strand the user on a blank screen).
+  try {
+    const status = await invoke('check_models');
+    if (status?.wupi === 'missing' || status?.embed === 'missing') {
+      console.log('[Wupi] models missing; skipping boot paw (download overlay takes over)');
+      return;
+    }
+  } catch (err) {
+    console.warn('[Wupi] check_models failed during boot gate; proceeding with paw', err);
+  }
+
   // Timing constants (ms).
   const ENTRY_DELAY = 1000;       // blank screen before paw enters (1s per spec)
   // Fairy-tour choreography: RISE STRAIGHT TO TOP-LEFT MIDDLE → dart to
@@ -975,11 +1122,18 @@ function setTitleState(state) {
   let loadingEnded = false;
 
   function startLoadingScreen() {
-    if (!bootLoading) { revealAfterLand(); return; }
+    if (!bootLoading) {
+      // No overlay → no terminal to stream into. Run the gate inline and
+      // proceed straight to reveal. (Defensive: the HTML should always have
+      // #boot-loading; this guards a malformed build.)
+      runBootGate().then(() => revealAfterLand()).catch(() => revealAfterLand());
+      return;
+    }
 
     // Populate the loading text as one <span> per character so each can be
     // lit independently. Non-space chars get a span; spaces get a plain
-    // space text node so layout spacing stays correct.
+    // space text node so layout spacing stays correct. The spans are NOT
+    // lit yet — they stay dark until the boot gate (update check) resolves.
     if (bootLoadingText) {
       bootLoadingText.innerHTML = '';
       let spanIdx = 0;
@@ -1000,9 +1154,88 @@ function setTitleState(state) {
       }
     }
 
-    // Fade the overlay in.
+    // Fade the overlay in. LOADING OS text is dark (un-lit); the gate owns
+    // the moment when it sweeps magenta L→R (post-update-check).
     bootLoading.classList.add('show');
 
+    // Run the boot gate (update check first; model load + LOADING OS fill
+    // do NOT start until it resolves). If an update is found, the gate
+    // installs + restarts and never returns. Otherwise it lights the spans,
+    // starts the cosmetic stream, calls boot_load_model, and starts the 8s
+    // timer that ends the loading screen.
+    runBootGate().catch((err) => {
+      console.error('[Wupi] boot gate failed; proceeding to reveal', err);
+      proceedAfterGate();
+    });
+  }
+
+  // ── The boot gate: update check → install (if any) → proceed.
+  //    The LOADING OS text + cosmetic terminal stream + model load are
+  //    HELD DARK until this resolves. On update-found: install + restart
+  //    (process dies, never proceeds). On up-to-date OR check failure
+  //    (network/manifest unreachable): call proceedAfterGate() so a
+  //    network blip can't strand the user on the loading screen.
+  async function runBootGate() {
+    // Stream the gate steps into the boot terminal as they happen so the
+    // user sees exactly what's blocking the LOADING OS fill.
+    appendTerminalLine('› checking for updates...', false);
+    let current = 'unknown';
+    try { current = await getVersion(); } catch (e) { /* fall through with 'unknown' */ }
+    appendTerminalLine(`› current version ${current}`, false);
+
+    let update = null;
+    try {
+      update = await invoke('updater_check');
+    } catch (err) {
+      // Don't block boot on a network/manifest error. Log + proceed.
+      console.warn('[Wupi] boot update check failed (non-fatal)', err);
+      appendTerminalLine('› update check failed — proceeding', false);
+      proceedAfterGate();
+      return;
+    }
+
+    if (!update) {
+      appendTerminalLine('› no new updates found', false);
+      proceedAfterGate();
+      return;
+    }
+
+    // Update found — install + restart. The model never loads (no wasted
+    // CPU/VRAM on a process about to be replaced). The update-progress
+    // event still drives a progress bar in the paw-menu panel if the user
+    // happened to have it open, but on the boot path the terminal lines
+    // are the visible cue.
+    appendTerminalLine(`› update version ${update.version} found`, false);
+    appendTerminalLine('› Installing update please wait..', false);
+    try {
+      await invoke('updater_apply', { update });
+    } catch (err) {
+      // Apply failed — proceed with the current binary rather than
+      // strand the user. The user can retry from the paw-menu panel.
+      console.error('[Wupi] updater_apply failed during boot gate', err);
+      appendTerminalLine(`› update failed: ${String(err?.message || err).slice(0, 80)}`, false);
+      appendTerminalLine('› proceeding with current version', false);
+      proceedAfterGate();
+      return;
+    }
+    appendTerminalLine('› update successfully installed', false);
+    appendTerminalLine('› restarting...', false);
+    // Restart into the new binary. This call doesn't return.
+    try {
+      invoke('updater_restart');
+    } catch (err) {
+      // restart() should be infallible; if it ever throws, proceed with
+      // the current binary so the user isn't stuck.
+      console.error('[Wupi] updater_restart failed', err);
+      proceedAfterGate();
+    }
+  }
+
+  // Post-gate continuation: light the LOADING OS text, kick off the model
+  // load + cosmetic terminal stream, start the 8s timer that ends the
+  // loading screen. Called when the gate resolves up-to-date OR fails
+  // (defensive — boot must never hang on the loading screen).
+  function proceedAfterGate() {
     // Light the spans L→R staggered across the duration. Each span gets
     // .lit at progressively later moments so the magenta fill sweeps across
     // the whole word as progress climbs to 100%.
@@ -1017,42 +1250,19 @@ function setTitleState(state) {
     // model-status listener (see below) when the real event fires.
     startTerminalStream();
 
-    // Auto-update check: fire-and-forget during the loading window. Does
-    // NOT gate the 8s timer — the check resolves asynchronously alongside
-    // the cosmetic stream. If an update is available it's announced in the
-    // terminal ("› update available — installing on quit"); the actual
-    // install happens silently via Tauri's updater on next relaunch. If
-    // the check fails (endpoint unreachable, signature issue, dev run),
-    // it's swallowed silently — the boot path must NEVER alert() (the OS
-    // isn't "up" for the user yet). The manual paw-menu button is the
-    // surfaced path with alerts.
-    checkForUpdateDuringBoot();
+    // Trigger the deferred chat-model spawn (boot_load_model IPC). The
+    // actual load runs on Rust's loader thread; the model-status:ready
+    // event fires when it's done and the terminal listener emits the
+    // milestone. Fire-and-forget — we don't await this; the 8s loading
+    // timer hides any remaining load.
+    invoke('boot_load_model').catch((e) => {
+      console.error('[Wupi] boot_load_model failed', e);
+    });
 
     // End the loading screen after the full duration. revealAfterLand
     // (called by endLoadingScreen) is what drops .booting and starts the
     // starry sky + aurora wipe.
     loadingTimerHandle = setTimeout(endLoadingScreen, LOADING_DURATION_MS);
-  }
-
-  // Boot-time update check helper. Idempotent + null-safe: by the time the
-  // promise resolves the boot overlay may already be torn down, so every
-  // terminal append is guarded by `bootTerminal` still being in the DOM.
-  // Uses the custom portable updater (updater_check IPC); silent on failure.
-  async function checkForUpdateDuringBoot() {
-    try {
-      const update = await invoke('updater_check');
-      if (update) {
-        appendTerminalLine(`› update available — v${update.version}`, false);
-        appendTerminalLine('› use the paw menu to install', false);
-      } else {
-        appendTerminalLine('› WUPI is up to date', false);
-      }
-    } catch (err) {
-      // Silent on the boot path. Most common cause is the gh-pages manifest
-      // not yet published or a dev run with no network. The paw-menu button
-      // surfaces real failures.
-      console.warn('[Wupi] boot update check failed (non-fatal)', err);
-    }
   }
 
   function endLoadingScreen() {

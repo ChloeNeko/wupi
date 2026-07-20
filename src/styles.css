@@ -2124,6 +2124,62 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     border-color: rgba(185, 138, 214, 0.7);
 }
 
+/* LAUNCH button: shown on the download overlay when the GGUF pull finishes.
+   The capstone CTA — brighter + bigger than the primary Download button so
+   it reads as the natural next step. Pink→magenta gradient pill + a slow
+   idle glow pulse (launchGlow keyframe below) + sparkles spawned on click.
+   `position: relative` + `overflow: visible` so .boot-sparkle children
+   (added by spawnLaunchSparkles in script.js) can fly outward past the
+   button edge. */
+.launch-btn {
+    position: relative;
+    overflow: visible;
+    display: block;
+    margin: 28px auto 8px;
+    padding: 16px 56px;
+    border: none;
+    border-radius: 999px;
+    background: linear-gradient(135deg, #ff66b2 0%, #b534fa 100%);
+    color: #ffffff;
+    font-family: 'Fredoka', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-weight: 700;
+    font-size: 20px;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    cursor: pointer;
+    box-shadow:
+        0 0 28px rgba(255, 102, 178, 0.6),
+        0 0 60px rgba(181, 52, 250, 0.35),
+        inset 0 1px 0 rgba(255, 255, 255, 0.3);
+    text-shadow: 0 0 12px rgba(255, 255, 255, 0.6);
+    animation: launchGlow 2.2s ease-in-out infinite;
+    transition: transform 0.15s ease;
+}
+.launch-btn:hover {
+    transform: translateY(-2px) scale(1.03);
+}
+.launch-btn:active {
+    transform: translateY(0) scale(0.99);
+}
+
+/* Slow magenta→pink glow pulse. The box-shadow alpha breathes between 0.4
+   and 0.8 so the button reads as alive + inviting without strobing. Mirrors
+   localGlow's mood (the AI panel's idle indicator). */
+@keyframes launchGlow {
+    0%, 100% {
+        box-shadow:
+            0 0 22px rgba(255, 102, 178, 0.45),
+            0 0 48px rgba(181, 52, 250, 0.25),
+            inset 0 1px 0 rgba(255, 255, 255, 0.3);
+    }
+    50% {
+        box-shadow:
+            0 0 34px rgba(255, 102, 178, 0.8),
+            0 0 72px rgba(181, 52, 250, 0.5),
+            inset 0 1px 0 rgba(255, 255, 255, 0.4);
+    }
+}
+
 /* Error text: shown when phase == Failed. Dim red, sits below the actions. */
 .download-error {
     margin-top: 18px;
