@@ -202,9 +202,11 @@ if (bumpKind && !dryRun) {
 // Discovery order (process env is unreliable on Windows: Git Bash background
 // tasks / CI runners don't always source ~/.bashrc before spawning node, so
 // process.env.HF_TOKEN can be empty even when the user "set it"):
-//   1. process.env.HF_TOKEN              (explicit export in the parent shell)
-//   2. ~/.bashrc `export HF_TOKEN=hf_…`  (persistent user setting)
-//   3. keys/.hf_token                    (file fallback; gitignored)
+//   1. keys/hf.key                       (PRIMARY — repo-relative, gitignored,
+//                                        bare token, same convention as
+//                                        keys/wupi.key)
+//   2. process.env.HF_TOKEN              (explicit export in the parent shell)
+//   3. ~/.bashrc `export HF_TOKEN=hf_…`  (legacy fallback; not preferred)
 //
 // Once found, we EXPORT it back to process.env so the childEnv spread below
 // picks it up — `npx tauri build` and the cargo subprocesses will see it.
@@ -214,18 +216,22 @@ if (bumpKind && !dryRun) {
 // --allow-missing-hf-token ONLY for the rare case of re-releasing an existing
 // version whose first-run path is already cached for all users.
 const findHfToken = () => {
+  // 1. keys/hf.key (preferred — keeps all release secrets in one gitignored dir)
+  const keyFilePath = join(__dirname, '..', 'keys', 'hf.key');
+  if (existsSync(keyFilePath)) {
+    const raw = readFileSync(keyFilePath, 'utf8').trim();
+    // Accept either a bare token (preferred) or `export HF_TOKEN=hf_…` (legacy)
+    const m = raw.match(/(hf_[A-Za-z0-9]+)/);
+    if (m) return m[1];
+  }
+  // 2. process.env.HF_TOKEN (explicit shell export)
   if (process.env.HF_TOKEN) return process.env.HF_TOKEN;
-  // ~/.bashrc fallback. Read the file, look for `export HF_TOKEN=hf_…`.
+  // 3. ~/.bashrc fallback (legacy — we prefer keys/hf.key now)
   const bashrcPath = join(homedir(), '.bashrc');
   if (existsSync(bashrcPath)) {
     const bashrc = readFileSync(bashrcPath, 'utf8');
     const m = bashrc.match(/^\s*export\s+HF_TOKEN\s*=\s*(hf_[A-Za-z0-9]+)/m);
     if (m) return m[1];
-  }
-  // keys/.hf_token fallback
-  const tokenFilePath = join(__dirname, '..', 'keys', '.hf_token');
-  if (existsSync(tokenFilePath)) {
-    return readFileSync(tokenFilePath, 'utf8').trim();
   }
   return null;
 };
@@ -239,13 +245,12 @@ if (hfToken) {
   console.warn('              The compiled binary will have HF_TOKEN="" — fresh installs will');
   console.warn('              403 on the first-run GGUF download.');
 } else {
-  console.error('[release] !! HF_TOKEN not found in env, ~/.bashrc, or keys/.hf_token.');
+  console.error('[release] !! HF_TOKEN not found in keys/hf.key, env, or ~/.bashrc.');
   console.error('              The compiled binary would have HF_TOKEN="" → every fresh install');
   console.error('              403s on first-run GGUF download. REFUSING to ship a broken build.');
   console.error('');
-  console.error('              Fix ONE of:');
-  console.error('                echo \'export HF_TOKEN=hf_<fine-grained-read-only>\' >> ~/.bashrc');
-  console.error('                echo hf_<token> > keys/.hf_token   (gitignored)');
+  console.error('              Fix: put a fine-grained read-only HF token in keys/hf.key:');
+  console.error('                echo hf_<token> > keys/hf.key   (gitignored, bare token only)');
   console.error('              Then re-run. To override (NOT recommended):');
   console.error('                npm run release -- --allow-missing-hf-token');
   process.exit(1);
