@@ -1,10 +1,10 @@
 {
   "version": "0.2.2",
   "notes": "WUPI v0.2.2\n\nAuto-built + signed release from local machine.",
-  "pub_date": "2026-07-20T03:50:06.903Z",
+  "pub_date": "2026-07-20T03:58:18.140Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTZ1FIb1g4S0JubG9UOXhNSUZkanhoK1ZqNjc3RDV0bjhNeWFFZjNSOEJ5MVZuRjgxdElTd29Tay9XdXpKTG5pb083ZDhmbjBVTk94TWx4VVFLWWowUm5naVl6VGtvdFF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0NTE5Mzk5CWZpbGU6V1VQSV8wLjIuMl94NjQtc2V0dXAuZXhlCmJhKzhodzFueFRwRGJEekI5ekNOR0N2SU1qRUdYWDVEbHBxZzczZ2hSS2lCUUVZNkVSUHM1cU5uL0Vuc3lPTnRXUGV2UDdOUkZrenlUaDE5TFRKREFnPT0K",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTZ1FIb1g4S0JubHB0NWk2N1JDUDZETVZ2UHBDOVgzM3ljcjZXZTQrLy80UWNwbVdzOHQ4bmpYaFRqNlo3RjR1RVRsSHljbkFxUWJyYVcyb0tacGVsQkJiM2VtV2JXbUF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0NTE5ODkxCWZpbGU6V1VQSV8wLjIuMl94NjQtc2V0dXAuZXhlCktYaXVXVVBRUEZDUys0eVppNGkxUno5bFdlKzA5Wm5UM2ZSK3lPK3JUd3Naem4xK0hUUjFHL0ZXZzJFWlc3dGk4KzhvQzkyN0ZYOEM5V0RERFgydENRPT0K",
       "url": "https://github.com/ChloeNeko/WUPI/releases/download/v0.2.2/WUPI_0.2.2-setup.exe"
     }
   }
