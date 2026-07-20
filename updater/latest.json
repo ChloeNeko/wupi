@@ -1,11 +1,10 @@
 {
-  "version": "0.2.2",
-  "notes": "WUPI v0.2.2\n\nAuto-built + signed release from local machine.",
-  "pub_date": "2026-07-20T04:11:42.194Z",
+  "version": "0.2.4",
+  "notes": "WUPI v0.2.4 (portable)\n\nExtract anywhere and run wupi.exe. Everything stays in the folder.",
+  "pub_date": "2026-07-20T05:56:42.999Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTZ1FIb1g4S0JubHFTRFhQcHFQQmxsbHdDS1czUGRlaGRxMXR3d0ZnWXBBUUc1YUhjaXovTVAvK2ovOWJvckZ0M3lQVVVudit1bSs5bGVib3A4T1k2Ni80K0xBMktld3c4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0NTIwNjkyCWZpbGU6V1VQSV8wLjIuMl94NjQtc2V0dXAuZXhlCm1YbERSTy8wTy8rZ3dNMnRWWlpLUGRwdnlsbjBEN1ZMa1NXK1pWcENkMnpPOWV4SWhhNFpZQlk2U29mRm81U3BDWkRBVjFHb200T0hsZHVURWl0ekNnPT0K",
-      "url": "https://github.com/ChloeNeko/WUPI/releases/download/v0.2.2/WUPI_0.2.2-setup.exe"
+      "url": "https://github.com/ChloeNeko/WUPI/releases/download/v0.2.4/WUPI_0.2.4_portable.zip"
     }
   }
 }
