@@ -329,11 +329,11 @@ if (!dryRun) {
   console.log(`[release] zipping → ${zipName}…`);
   try {
     const zip = new AdmZip();
-    // addLocalFolder takes the contents of the staged WUPI/ dir and places
-    // them at the zip root (so the extract lands as a flat WUPI/ folder,
-    // not WUPI/WUPI/). Empty dirs are included for structure (wupi_knowledge/,
-    // game_cards/ if empty).
-    zip.addLocalFolder(stageWupiDir);
+    // addLocalFolder's 2nd arg is the IN-ZIP destination path. Passing 'WUPI'
+    // places the staged tree at WUPI/ in the zip, so extracting produces a
+    // single WUPI/ folder (not a flat dump of wupi.exe into wherever the user
+    // extracts). Matches the "single self-contained folder" portable promise.
+    zip.addLocalFolder(stageWupiDir, 'WUPI');
     zip.writeZip(zipPath);
   } catch (e) {
     console.error(`[release] adm-zip failed: ${e.message}`);
@@ -511,5 +511,5 @@ console.log('[release] ========================================');
 console.log(`[release]  Release:   https://github.com/${repo}/releases/tag/${tag}`);
 console.log(`[release]  Manifest:  https://chloeneko.github.io/WUPI/updater/latest.json`);
 console.log(`[release]  Asset URL: ${assetUrl}`);
-console.log('[release]  Next tester launch → updater_check fires (DARK, devtools-only).');
+console.log('[release]  Next tester launch → updater polls latest.json (paw-menu panel).');
 console.log('[release] ========================================');
