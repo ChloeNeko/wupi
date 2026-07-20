@@ -133,6 +133,24 @@ if (bumpKind && !dryRun) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
+// Step 2.5: HF_TOKEN gate. The compiled binary bakes HF_TOKEN in at COMPILE
+// TIME via `option_env!("HF_TOKEN")` in src-tauri/src/model_downloader.rs —
+// first-run GGUF download uses it as a Bearer against the PRIVATE
+// ChloeNeko/WUPI HF repo. If unset here, the constant compiles to "" and
+// every fresh install 403s on the download overlay. Warn loudly; don't
+// refuse (you may legitimately be re-releasing an existing version whose
+// first-run path is already cached for all users).
+// ──────────────────────────────────────────────────────────────────────────
+if (!process.env.HF_TOKEN) {
+  console.warn('[release] !! HF_TOKEN not set in environment.');
+  console.warn('              The first-run GGUF download (model_downloader.rs) bakes this');
+  console.warn('              token into the binary at compile time. Without it, fresh');
+  console.warn('              installs will get 403 from HuggingFace on the download overlay.');
+  console.warn('              To fix: export HF_TOKEN=hf_<fine-grained-read-only> before');
+  console.warn('              running this script. See docs/UPDATER_SETUP.md.');
+}
+
+// ──────────────────────────────────────────────────────────────────────────
 // Step 3: Run `npx tauri build` with the signing env. Inherits stdio so
 // build progress streams live to the console (CUDA recompile is the long
 // part — needs visible output to know it's not hung).
@@ -145,6 +163,10 @@ const childEnv = {
   // still expect TAURI_KEY_PASSWORD keep working.
   TAURI_SIGNING_PRIVATE_KEY_PASSWORD: password,
   TAURI_KEY_PASSWORD: password,
+  // HF_TOKEN forwarded explicitly (process.env spread above already includes
+  // it, but listing it here makes the compile-time dependency visible at
+  // the call site — see model_downloader.rs:88).
+  HF_TOKEN: process.env.HF_TOKEN || '',
   CMAKE_BUILD_PARALLEL_LEVEL: process.env.CMAKE_BUILD_PARALLEL_LEVEL || '8',
 };
 
@@ -335,11 +357,12 @@ const manifest = {
 };
 const manifestJson = JSON.stringify(manifest, null, 2);
 
-// The GitHub Contents API requires `content` as base64. Encode it here.
-// (gh api's -F @path reads the file as a raw string — it does NOT base64.)
+// The GitHub Contents API requires `content` as base64. We pass the base64
+// string DIRECTLY as a gh api arg value (NOT via `-f content=@<file>` — the
+// `@path` expansion is unreliable on Git Bash for Windows, where it sent the
+// path string itself instead of the file contents → "content is not valid
+// Base64" 422. Inline string args bypass path resolution entirely).
 const manifestB64 = Buffer.from(manifestJson, 'utf8').toString('base64');
-const tmpManifest = join(require('os').tmpdir(), 'wupi-latest.b64');
-require('fs').writeFileSync(tmpManifest, manifestB64);
 
 // Look up the existing file's SHA (so we can update rather than create).
 // 404 = file doesn't exist yet (first release); any other error = real problem.
@@ -353,12 +376,13 @@ if (existingSha.status === 0 && existingSha.stdout.trim()) {
 }
 
 // PUT the new content via the Contents API. The `content` field is the
-// base64 we just wrote to tmpManifest; gh's -F @path reads it as a string.
+// base64 string, passed as a direct arg value (no @file indirection).
+// -f = raw string (no type conversion — keeps the base64 verbatim).
 const putManifest = spawnSync('gh', [
   'api', `-XPUT`, `repos/${repo}/contents/updater/latest.json`,
   '-F', `message=release manifest: ${tag} [skip ci]`,
   '-F', `branch=gh-pages`,
-  '-f', `content=@${tmpManifest}`,  // -f = raw string (no type conversion)
+  '-f', `content=${manifestB64}`,  // direct value: no @path resolution
   ...shaArg,
 ], { cwd: repoRoot, stdio: 'inherit' });
 

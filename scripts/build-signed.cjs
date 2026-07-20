@@ -121,6 +121,21 @@ if (passwordFromArg) {
   console.warn('                 If the key was generated WITH a password, this will hang.');
 }
 
+// ── HF_TOKEN check (compile-time dependency, see release.cjs for full rationale). ──
+//    The compiled binary bakes HF_TOKEN in via `option_env!` in
+//    src-tauri/src/model_downloader.rs. If it's not in the env at build
+//    time, the constant is "" and first-run GGUF downloads 403 against the
+//    private ChloeNeko/WUPI HF repo. Warn loudly so this never silently
+//    ships broken.
+if (!process.env.HF_TOKEN) {
+  console.warn('[build-signed] !! HF_TOKEN not set in environment.');
+  console.warn('                 The first-run GGUF download (model_downloader.rs) bakes this');
+  console.warn('                 token into the binary at compile time. Without it, fresh');
+  console.warn('                 installs will get 403 from HuggingFace on the download overlay.');
+  console.warn('                 To fix: export HF_TOKEN=hf_<fine-grained-read-only> before');
+  console.warn('                 running this script. See docs/UPDATER_SETUP.md.');
+}
+
 // ── Build the child env: parent env + the two signing vars. ──
 //    The vars are scoped to this.spawn call — they do NOT leak into the
 //    parent shell (Node never mutates process.env here). Both Tauri-era
@@ -130,6 +145,10 @@ const childEnv = {
   TAURI_SIGNING_PRIVATE_KEY: privateKey,
   TAURI_SIGNING_PRIVATE_KEY_PASSWORD: password,
   TAURI_KEY_PASSWORD: password,
+  // HF_TOKEN forwarded explicitly (process.env spread above already includes
+  // it, but listing it here makes the compile-time dependency visible at
+  // the call site — see model_downloader.rs:88).
+  HF_TOKEN: process.env.HF_TOKEN || '',
   // Preserve the CUDA build parallelism used by the regular build path.
   CMAKE_BUILD_PARALLEL_LEVEL: process.env.CMAKE_BUILD_PARALLEL_LEVEL || '8',
 };

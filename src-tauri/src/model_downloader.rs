@@ -63,21 +63,29 @@ const HF_REVISION: &str = "main";
 /// Read-only fine-grained HF token scoped to ONLY `ChloeNeko/WUPI`.
 ///
 /// Injected at BUILD TIME from the `HF_TOKEN` environment variable via
-/// `option_env!` — the token value is NEVER committed to source. CI
-/// (`.github/workflows/release.yml`) sets this from the `HF_TOKEN` GitHub
-/// Secret during the build step, so the compiled binary has the real token
-/// baked in. Local dev builds without the env var produce an empty string
-/// here → HF returns 401 → the downloader reports a clear error. Local
-/// devs don't need it: they already have the GGUFs on disk so the download
-/// overlay never fires.
+/// `option_env!` — the token value is NEVER committed to source.
+///
+/// WUPI builds LOCALLY (not in CI): `llama-cpp-2` needs the CUDA Toolkit,
+/// which GitHub's `windows-latest` runners lack (see docs/UPDATER_SETUP.md).
+/// The release path is `npm run release` (scripts/release.cjs), which
+/// forwards `HF_TOKEN` from the parent shell to the `npx tauri build` child
+/// process (scripts/release.cjs + scripts/build-signed.cjs both warn loudly
+/// if it's missing). So: export `HF_TOKEN` in the shell that runs the
+/// release, and the compiled binary gets the real token baked in.
+///
+/// If `HF_TOKEN` is unset at build time, the constant compiles to `""` and
+/// HF returns 401/403 to anonymous requests against the private
+/// `ChloeNeko/WUPI` repo → the downloader surfaces a clear error string on
+/// the first-run overlay. Local devs don't need it: they have the GGUFs on
+/// disk so the overlay never fires.
 ///
 /// Bearer auth is sent on the `/resolve/` hop ONLY — the 302 redirect's
 /// signed CDN URL carries its own short-lived signature, so the token never
 /// leaves HF's own domain.
 ///
 /// Rotation: revoke at https://huggingface.co/settings/tokens, mint a new
-/// fine-grained read-only token scoped to ChloeNeko/WUPI, update the
-/// `HF_TOKEN` GitHub Secret, push a fresh build. No source change needed.
+/// fine-grained read-only token scoped to ChloeNeko/WUPI, `export HF_TOKEN=…`
+/// in the shell, run `npm run release`. No source change needed.
 ///
 /// NOTE: an earlier hardcoded version of this token (hf_GdgPcd…) was
 /// committed then rewritten out of git history on 2026-07-19. That token
