@@ -639,6 +639,9 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 if window.app_handle().webview_windows().len() <= 1 {
+                    // Destroy the tray BEFORE exit so Windows receives NIM_DELETE
+                    // while we're still alive (prevents ghost-icon caching).
+                    system_menu::destroy_tray(&window.app_handle());
                     window.app_handle().exit(0);
                 }
             }
@@ -705,8 +708,24 @@ pub fn run() {
             hardware::bluetooth::bluetooth_discover,
             hardware::bluetooth::bluetooth_pair,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        // Build the app, then run the event loop with a callback. Splitting
+        // .build() + App::run(callback) — instead of Builder::run(context)
+        // which takes no callback — gives us the RunEvent hook for
+        // belt-and-suspenders tray cleanup. Builder::run exists too but
+        // internally calls App::run with `|_, _| {}` (see tauri app.rs:2449).
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Belt-and-suspenders tray cleanup. The dominant exit paths
+            // (power_shutdown → std::process::exit, on_window_event close)
+            // already destroy the tray explicitly. This catches any other
+            // RunEvent::ExitRequested path (e.g. programmatic app.exit from
+            // a future code path) so a ghost icon can never accumulate from
+            // a graceful-exit route we didn't anticipate.
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                system_menu::destroy_tray(&app_handle);
+            }
+        });
     tracing::info!("=== WUPI OS event loop exited ===");
 }
 

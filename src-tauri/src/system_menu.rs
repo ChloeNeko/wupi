@@ -63,6 +63,26 @@ pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 }
 
 
+/// Best-effort teardown of the system-tray icon. MUST be called before any
+/// `std::process::exit` path so the Windows shell receives `NIM_DELETE` while
+/// the process is still alive to service it. Without this, `std::process::exit`
+/// skips Tauri's `Drop` for the tray, Windows is never notified, and Explorer
+/// leaves a "ghost" icon cached in the hidden-icons popover until the user
+/// hovers over it (the well-known Windows shell caching quirk).
+///
+/// `remove_tray_by_id` is the correct Tauri 2 API: it takes the icon out of
+/// Tauri's internal state AND calls `icon.close()` (the platform-level
+/// teardown — `Shell_NotifyIcon(NIM_DELETE)` on Windows). The returned icon
+/// drops at the end of this fn, finalizing the cleanup. Idempotent + non-fatal:
+/// a missing icon (None return) is the normal case on a second call, just
+/// swallowed silently.
+pub fn destroy_tray<R: Runtime>(app: &AppHandle<R>) {
+    // Returns Option<TrayIcon>; dropping it finalizes the platform cleanup.
+    // No error path — `remove_tray_by_id` returns None if the icon doesn't
+    // exist (already destroyed, never built), which is fine for cleanup.
+    drop(app.remove_tray_by_id("wupi-tray"));
+}
+
 /// Full shutdown: terminate the process unconditionally. We use
 /// `std::process::exit(0)`: an immediate OS-level process kill that bypasses
 /// Tauri's exit flow entirely. `app.exit(0)` runs the graceful window/webview
@@ -71,10 +91,17 @@ pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 /// affiliated with the process in one shot, no waiting. (The terminal window
 /// that originally surfaced this has been removed, but the hard-kill remains
 /// the right call for a power-off action.)
+///
+/// BEFORE the hard exit we explicitly `destroy_tray`: `std::process::exit`
+/// skips Rust destructors, so Tauri's tray `Drop` would never run and Windows
+/// would leave a ghost icon cached. Destroying first sends `NIM_DELETE` while
+/// we're still alive to service it.
 pub fn power_shutdown<R: Runtime>(app: &AppHandle<R>) {
     let _ = app.emit(EVT_CANVAS_PAUSE, ());
-    // Flush the emit above before the hard kill so the frontend gets it.
-    // (The emit is best-effort; if it doesn't land, the kill still happens.)
+    destroy_tray(app);
+    // Flush the emit + destroy above before the hard kill so the frontend gets
+    // the pause event and the shell gets NIM_DELETE. (Both best-effort; if
+    // they don't land, the kill still happens.)
     std::process::exit(0);
 }
 
