@@ -715,6 +715,7 @@ pub fn run() {
             hardware::bluetooth::bluetooth_pair,
             updater_check,
             updater_apply,
+            updater_restart,
         ])
         // Build the app, then run the event loop with a callback. Splitting
         // .build() + App::run(callback) — instead of Builder::run(context)
@@ -1084,6 +1085,17 @@ async fn updater_apply(
     update: updater::UpdateInfo,
 ) -> Result<(), String> {
     updater::perform_update(&app, update).await
+}
+
+/// Relaunch the app after a successful update. Uses Tauri core's
+/// `AppHandle::restart()` — no plugin needed (the JS-side `relaunch()` lives
+/// in `@tauri-apps/plugin-process`, which we removed when we dropped the
+/// installer-only Tauri updater; the Rust side is core API). The swap has
+/// already placed the new `wupi.exe` on disk; restart loads it + drops the
+/// .old on the next boot's `cleanup_old_exe`.
+#[tauri::command]
+fn updater_restart(app: tauri::AppHandle) {
+    app.restart();
 }
 
 /// Resolve the default Simulation Card (`cards/Wupi.sim`) by walking the same

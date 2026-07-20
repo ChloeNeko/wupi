@@ -1,11 +1,6 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getVersion } from '@tauri-apps/api/app';
-// Updater plugin: signed-update distribution. JS drives the whole flow
-// (check() + downloadAndInstall() + relaunch()); Rust just registers the
-// plugin. See paw-menu "Check for Updates" handler for the user-facing path.
-import { check } from '@tauri-apps/plugin-updater';
-import { relaunch } from '@tauri-apps/plugin-process';
 
 const canvas = document.getElementById('aurora-canvas');
 const ctx = canvas.getContext('2d');
@@ -1042,20 +1037,20 @@ function setTitleState(state) {
   // Boot-time update check helper. Idempotent + null-safe: by the time the
   // promise resolves the boot overlay may already be torn down, so every
   // terminal append is guarded by `bootTerminal` still being in the DOM.
-  // Shared with the paw-menu handler below via `performUpdateCheck`.
+  // Uses the custom portable updater (updater_check IPC); silent on failure.
   async function checkForUpdateDuringBoot() {
     try {
-      const update = await check();
-      if (update?.available) {
+      const update = await invoke('updater_check');
+      if (update) {
         appendTerminalLine(`› update available — v${update.version}`, false);
-        appendTerminalLine('› installing on next restart', false);
+        appendTerminalLine('› use the paw menu to install', false);
       } else {
         appendTerminalLine('› WUPI is up to date', false);
       }
     } catch (err) {
       // Silent on the boot path. Most common cause is the gh-pages manifest
-      // not yet published (no release has shipped) or running a dev build
-      // with no signing key. The paw-menu button surfaces real failures.
+      // not yet published or a dev run with no network. The paw-menu button
+      // surfaces real failures.
       console.warn('[Wupi] boot update check failed (non-fatal)', err);
     }
   }
@@ -1377,15 +1372,15 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     }
   }
 
-  // Run check(). Caches the Update object in `pendingUpdate` for the install
-  // path. Errors → error state (no alert()).
+  // Run the portable updater's check IPC. Caches the result in
+  // `pendingUpdate` for the install path. Errors → error state (no alert()).
   async function runUpdateCheck() {
     setUpdateState('checking');
     try {
-      const update = await check();
-      pendingUpdate = update?.available ? update : null;
-      if (update?.available) {
-        setUpdateState('available', { version: update.version, notes: update.body || '' });
+      const update = await invoke('updater_check');
+      pendingUpdate = update || null;
+      if (update) {
+        setUpdateState('available', { version: update.version, notes: update.notes || '' });
       } else {
         setUpdateState('up-to-date');
       }
@@ -1394,9 +1389,9 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     }
   }
 
-  // Install the cached pendingUpdate + relaunch. Progress streams into the
-  // installing-state progress bar; downloadAndInstall calls onProgress
-  // repeatedly with cumulative chunkLength + total contentLength.
+  // Install the cached pendingUpdate via the portable updater's apply IPC,
+  // then restart. Progress streams from the `update-progress` event into the
+  // installing-state progress bar (set up once in setupUpdateProgressListener).
   async function runUpdateInstall() {
     if (!pendingUpdate) {
       setUpdateState('error', { message: 'No pending update — check again.' });
@@ -1404,20 +1399,29 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     }
     setUpdateState('installing', { percent: 0 });
     try {
-      await pendingUpdate.downloadAndInstall(
-        (chunkLength, contentLength) => {
-          if (contentLength) {
-            const pct = (chunkLength / contentLength) * 100;
-            setUpdateState('installing', { percent: pct });
-          }
-        },
-        () => { setUpdateState('installing', { percent: 100 }); }
-      );
-      await relaunch();
+      await invoke('updater_apply', { update: pendingUpdate });
+      setUpdateState('installing', { percent: 100 });
+      // Swap is complete + the new exe is on disk. Restart into it.
+      invoke('updater_restart').catch((e) => {
+        setUpdateState('error', { message: 'Install OK, restart failed: ' + String(e?.message || e) });
+      });
     } catch (e) {
       setUpdateState('error', { message: String(e?.message || e) });
     }
   }
+
+  // Subscribe to the `update-progress` event (emitted by updater_apply's
+  // download phase) and route percent into the installing-state progress bar.
+  // Fires only while the state is 'installing' — at other times the events
+  // are ignored (defensive: a late event after a state change shouldn't
+  // overwrite an error or up-to-date message).
+  listen('update-progress', (e) => {
+    if (updateStatusEl?.dataset.state !== 'installing') return;
+    const pct = e?.payload?.percent;
+    if (typeof pct === 'number') {
+      setUpdateState('installing', { percent: pct });
+    }
+  }).catch((e) => console.warn('[Wupi] update-progress listen failed', e));
 
   // Initialize the panel once: idle state. Subsequent opens preserve the
   // last state so a user who already saw "v0.2.0 available" doesn't lose it
@@ -2898,29 +2902,3 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     windowOpenHooks.set('chat', loadIntro);
     loadIntro();
   })();
-
-// ─── Portable self-updater (ships DARK) ─────────────────────────────────────
-//
-// WUPI is now a portable app; updates are file-level (src-tauri/src/updater.rs)
-// instead of the Tauri NSIS-installer updater. This bootstrap is SHIPPED DARK:
-// it checks for updates silently on boot and logs to devtools only. No toast,
-// no button — the apply path needs hands-on Windows verification (the locked-
-// exe rename-and-relaunch dance) before beta testers get a button to click.
-//
-// To flip it live: surface a toast in `onUpdateAvailable` and a "Restart now"
-// button that calls `invoke('updater_apply', { update })` then `relaunch()`.
-// The IPC surface is complete; only the visible UI is missing by design.
-(function updaterBootstrap() {
-  const CHECK_DELAY_MS = 4000;  // post-boot, after the splash settles
-  function check() {
-    invoke('updater_check')
-      .then((update) => {
-        if (!update) return;  // on latest
-        // DARK: just log. Flip this to a toast + apply button when ready.
-        console.info('[Wupi] update available:', update.version, '→', update.url);
-        window.__wupiUpdatePending = update;  // exposed for devtools testing
-      })
-      .catch((e) => console.warn('[Wupi] updater_check failed', e));
-  }
-  setTimeout(check, CHECK_DELAY_MS);
-})();
