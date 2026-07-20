@@ -1,5 +1,6 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { getVersion } from '@tauri-apps/api/app';
 // Updater plugin: signed-update distribution. JS drives the whole flow
 // (check() + downloadAndInstall() + relaunch()); Rust just registers the
 // plugin. See paw-menu "Check for Updates" handler for the user-facing path.
@@ -1088,7 +1089,7 @@ function setTitleState(state) {
   //    is special: it's only emitted when the real model-status:ready event
   //    fires (listened below). Other lines are fake but flavored to look real.
   const TERMINAL_LINES = [
-    '› wupi v0.1.0 (gemma-4 12B)',
+    '› wupi v0.1.0 — WUPI.gguf',
     '› initializing kernel...',
     '› mounting shared_backend()...',
     '› allocating LlamaContext: chat (n_ctx=4000)',
@@ -1257,8 +1258,15 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   audioBtn.addEventListener('click', (e) => toggleDropdown(audioDropdownMenu, e));
 
   // The three power commands exposed by system_menu.rs. Each closes the
-  // dropdown first so it doesn't flash on the next launch.
-  const closePawMenu = () => dropdownMenu.classList.remove('show');
+  // dropdown first so it doesn't flash on the next launch. Also closes any
+  // open cascade extension (theme/color/update) — those are visually
+  // children of the paw menu, so they should never outlive it.
+  const closePawMenu = () => {
+    dropdownMenu.classList.remove('show');
+    document.getElementById('themePanel')?.classList.remove('show');
+    document.getElementById('colorCodePanel')?.classList.remove('show');
+    document.getElementById('updatePanel')?.classList.remove('show');
+  };
 
   document.getElementById('shutdownBtn')?.addEventListener('click', () => {
     closePawMenu();
@@ -1274,48 +1282,160 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   });
 
   // ── Check for Updates. Drives the tauri-plugin-updater flow from the JS
-  //    side: check() → if available, confirm() → downloadAndInstall() →
-  //    relaunch(). Uses browser-native confirm()/alert() to match the rest
-  //    of the app's dialog UX (no tauri-plugin-dialog dependency). Errors
-  //    at any stage surface via alert() so the user always knows what
-  //    happened. Endpoint + pubkey live in tauri.conf.json (plugins.updater).
-  document.getElementById('checkForUpdatesBtn')?.addEventListener('click', async () => {
-    closePawMenu();
-    let update;
+  //    side, surfaced as an inline cascade panel (#updatePanel) — NO browser
+  //    alert()/confirm(). The paw-menu item toggles the panel open (mirroring
+  //    the Theme cascade pattern): the paw menu stays open + the update panel
+  //    slides out to its right. Opening the panel auto-fires a check.
+  //
+  //    States are driven by setUpdateState(): idle → checking → (up-to-date |
+  //    available → installing → relaunch) | error. The available state shows
+  //    a magenta "Install & Restart" button that calls downloadAndInstall()
+  //    with a streaming progress bar.
+  const updateStatusEl = document.getElementById('updateStatus');
+  const updateVersionEl = document.getElementById('updateCurrentVersion');
+  let pendingUpdate = null;   // cached Update from last check() — drives install
+
+  // Populate the running version once (best-effort; failure leaves the dash).
+  getVersion().then((v) => { if (updateVersionEl) updateVersionEl.textContent = v; })
+    .catch((e) => console.warn('[Wupi] getVersion failed', e));
+
+  // Swap the status zone's innerHTML + data-state for one of:
+  //   'idle' | 'checking' | 'up-to-date' | 'available' | 'installing' | 'error'
+  // payload carries version/notes/percent/message as relevant to the state.
+  function setUpdateState(state, payload = {}) {
+    if (!updateStatusEl) return;
+    updateStatusEl.dataset.state = state;
+    const escape = (s) => String(s).replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+    if (state === 'idle') {
+      updateStatusEl.innerHTML = `
+        <div class="update-hint">Click to check for updates</div>
+        <button class="dropdown-item update-action-btn" id="updateCheckBtn">
+          <svg class="menu-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          Check Now
+        </button>`;
+      document.getElementById('updateCheckBtn')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        runUpdateCheck();
+      });
+    } else if (state === 'checking') {
+      updateStatusEl.innerHTML = `
+        <div class="update-status-row">
+          <svg class="menu-svg update-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <span>Checking…</span>
+        </div>`;
+    } else if (state === 'up-to-date') {
+      updateStatusEl.innerHTML = `
+        <div class="update-status-row">
+          <span class="status-dot connected"></span>
+          <span>WUPI is up to date</span>
+        </div>`;
+    } else if (state === 'available') {
+      const notesHtml = payload.notes
+        ? `<div class="update-notes">${escape(payload.notes)}</div>`
+        : '';
+      updateStatusEl.innerHTML = `
+        <div class="update-status-row">
+          <span class="status-dot update-available-dot"></span>
+          <span>v${escape(payload.version)} available</span>
+        </div>
+        ${notesHtml}
+        <button class="dropdown-item update-install-btn" id="updateInstallBtn">
+          Install &amp; Restart
+        </button>`;
+      document.getElementById('updateInstallBtn')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        runUpdateInstall();
+      });
+    } else if (state === 'installing') {
+      const pct = payload.percent != null ? Math.min(100, Math.max(0, payload.percent)) : 0;
+      updateStatusEl.innerHTML = `
+        <div class="update-status-row">
+          <span>Installing… ${pct.toFixed(0)}%</span>
+        </div>
+        <div class="update-progress-track">
+          <div class="update-progress-bar" style="width:${pct}%"></div>
+        </div>`;
+    } else if (state === 'error') {
+      updateStatusEl.innerHTML = `
+        <div class="update-status-row">
+          <span class="status-dot update-error-dot"></span>
+          <span class="update-error-text">${escape(payload.message || 'Update failed')}</span>
+        </div>
+        <button class="dropdown-item update-action-btn" id="updateRetryBtn">
+          Retry
+        </button>`;
+      document.getElementById('updateRetryBtn')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        runUpdateCheck();
+      });
+    }
+  }
+
+  // Run check(). Caches the Update object in `pendingUpdate` for the install
+  // path. Errors → error state (no alert()).
+  async function runUpdateCheck() {
+    setUpdateState('checking');
     try {
-      update = await check();
+      const update = await check();
+      pendingUpdate = update?.available ? update : null;
+      if (update?.available) {
+        setUpdateState('available', { version: update.version, notes: update.body || '' });
+      } else {
+        setUpdateState('up-to-date');
+      }
     } catch (e) {
-      alert(`Update check failed:\n${e}`);
+      setUpdateState('error', { message: String(e?.message || e) });
+    }
+  }
+
+  // Install the cached pendingUpdate + relaunch. Progress streams into the
+  // installing-state progress bar; downloadAndInstall calls onProgress
+  // repeatedly with cumulative chunkLength + total contentLength.
+  async function runUpdateInstall() {
+    if (!pendingUpdate) {
+      setUpdateState('error', { message: 'No pending update — check again.' });
       return;
     }
-    if (!update?.available) {
-      alert('WUPI is up to date.');
-      return;
-    }
-    // Update available — confirm before install. Per spec: "describe the
-    // current version saying its up to date or say there's an update
-    // available and ask if you'd like to install it."
-    const notes = update.body ? `\n\n${update.body}\n` : '\n';
-    const ok = confirm(
-      `WUPI v${update.version} is available.${notes}\nInstall now? The app will restart.`
-    );
-    if (!ok) return;
+    setUpdateState('installing', { percent: 0 });
     try {
-      // Silent download + install. The two callbacks stream progress +
-      // completion; we log to console for now (a future polish pass can
-      // surface this as a progress toast). On completion, relaunch.
-      await update.downloadAndInstall(
+      await pendingUpdate.downloadAndInstall(
         (chunkLength, contentLength) => {
           if (contentLength) {
-            const pct = ((chunkLength / contentLength) * 100).toFixed(1);
-            console.log(`update download: ${pct}%`);
+            const pct = (chunkLength / contentLength) * 100;
+            setUpdateState('installing', { percent: pct });
           }
         },
-        () => { console.log('update download finished'); }
+        () => { setUpdateState('installing', { percent: 100 }); }
       );
       await relaunch();
     } catch (e) {
-      alert(`Update install failed:\n${e}`);
+      setUpdateState('error', { message: String(e?.message || e) });
+    }
+  }
+
+  // Initialize the panel once: idle state. Subsequent opens preserve the
+  // last state so a user who already saw "v0.2.0 available" doesn't lose it
+  // by closing + reopening the panel.
+  setUpdateState('idle');
+
+  // Paw-menu trigger: toggle the cascade panel. Mutual-excludes the theme
+  // cascade (only one open at a time matches the existing UX). stopPropagation
+  // prevents the document-click dismiss handler from immediately closing it.
+  document.getElementById('checkForUpdatesBtn')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    themePanel?.classList.remove('show');
+    colorCodePanel?.classList.remove('show');
+    const open = updatePanel?.classList.toggle('show');
+    if (open && updateStatusEl?.dataset.state === 'idle') {
+      // First-open auto-fire: save the user one click. Subsequent opens keep
+      // the last state visible.
+      runUpdateCheck();
     }
   });
 
@@ -1324,6 +1444,9 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   // document-click dismiss handler (below) closes all three on outside click.
   const themePanel = document.getElementById('themePanel');
   const colorCodePanel = document.getElementById('colorCodePanel');
+  // updatePanel is declared once here so the click handler above and the
+  // dismiss handler below both see it (const is not hoisted).
+  const updatePanel = document.getElementById('updatePanel');
 
   // Apply a theme + color code to the running canvas. Unknown color codes
   // silently fall back to Vibrant so a stale theme.json can't break the loop.
@@ -1346,7 +1469,9 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   document.getElementById('themeBtn')?.addEventListener('click', (e) => {
     e.stopPropagation();
     // Toggle the theme panel; keep the paw menu open so the cascade reads as
-    // an extension of it.
+    // an extension of it. Close the update cascade if open (mutual exclusion:
+    // only one cascade extension of the paw menu at a time).
+    updatePanel?.classList.remove('show');
     const open = themePanel.classList.toggle('show');
     if (!open) colorCodePanel.classList.remove('show');
   });
@@ -1382,6 +1507,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     audioDropdownMenu.classList.remove('show');
     themePanel?.classList.remove('show');
     colorCodePanel?.classList.remove('show');
+    updatePanel?.classList.remove('show');
   });
 
   const wifiToggle = document.querySelector('.wifi-toggle-row');
