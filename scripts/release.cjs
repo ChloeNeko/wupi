@@ -193,13 +193,62 @@ if (bumpKind && !dryRun) {
 // refuse (you may legitimately be re-releasing an existing version whose
 // first-run path is already cached for all users).
 // ──────────────────────────────────────────────────────────────────────────
-if (!process.env.HF_TOKEN) {
-  console.warn('[release] !! HF_TOKEN not set in environment.');
-  console.warn('              The first-run GGUF download (model_downloader.rs) bakes this');
-  console.warn('              token into the binary at compile time. Without it, fresh');
-  console.warn('              installs will get 403 from HuggingFace on the download overlay.');
-  console.warn('              To fix: export HF_TOKEN=hf_<fine-grained-read-only> before');
-  console.warn('              running this script. See docs/UPDATER_SETUP.md.');
+// HF_TOKEN discovery. The compiled binary bakes HF_TOKEN in via
+// `option_env!("HF_TOKEN")` in model_downloader.rs at COMPILE TIME — first-run
+// GGUF download uses it as a Bearer against the PRIVATE ChloeNeko/WUPI HF
+// repo. If it's "" at compile time, every fresh install 403s on the download
+// overlay.
+//
+// Discovery order (process env is unreliable on Windows: Git Bash background
+// tasks / CI runners don't always source ~/.bashrc before spawning node, so
+// process.env.HF_TOKEN can be empty even when the user "set it"):
+//   1. process.env.HF_TOKEN              (explicit export in the parent shell)
+//   2. ~/.bashrc `export HF_TOKEN=hf_…`  (persistent user setting)
+//   3. keys/.hf_token                    (file fallback; gitignored)
+//
+// Once found, we EXPORT it back to process.env so the childEnv spread below
+// picks it up — `npx tauri build` and the cargo subprocesses will see it.
+//
+// HARD FAIL by default if not found: shipping a binary with no token is a
+// silent footgun (looks fine, breaks every fresh install). Override with
+// --allow-missing-hf-token ONLY for the rare case of re-releasing an existing
+// version whose first-run path is already cached for all users.
+const findHfToken = () => {
+  if (process.env.HF_TOKEN) return process.env.HF_TOKEN;
+  // ~/.bashrc fallback. Read the file, look for `export HF_TOKEN=hf_…`.
+  const bashrcPath = join(homedir(), '.bashrc');
+  if (existsSync(bashrcPath)) {
+    const bashrc = readFileSync(bashrcPath, 'utf8');
+    const m = bashrc.match(/^\s*export\s+HF_TOKEN\s*=\s*(hf_[A-Za-z0-9]+)/m);
+    if (m) return m[1];
+  }
+  // keys/.hf_token fallback
+  const tokenFilePath = join(__dirname, '..', 'keys', '.hf_token');
+  if (existsSync(tokenFilePath)) {
+    return readFileSync(tokenFilePath, 'utf8').trim();
+  }
+  return null;
+};
+const hfToken = findHfToken();
+const allowMissing = argv.includes('--allow-missing-hf-token');
+if (hfToken) {
+  process.env.HF_TOKEN = hfToken;  // re-export so childEnv spread sees it
+  console.log(`[release] HF_TOKEN resolved (len=${hfToken.length}, prefix=${hfToken.slice(0, 7)}…).`);
+} else if (allowMissing) {
+  console.warn('[release] !! HF_TOKEN not found and --allow-missing-hf-token passed.');
+  console.warn('              The compiled binary will have HF_TOKEN="" — fresh installs will');
+  console.warn('              403 on the first-run GGUF download.');
+} else {
+  console.error('[release] !! HF_TOKEN not found in env, ~/.bashrc, or keys/.hf_token.');
+  console.error('              The compiled binary would have HF_TOKEN="" → every fresh install');
+  console.error('              403s on first-run GGUF download. REFUSING to ship a broken build.');
+  console.error('');
+  console.error('              Fix ONE of:');
+  console.error('                echo \'export HF_TOKEN=hf_<fine-grained-read-only>\' >> ~/.bashrc');
+  console.error('                echo hf_<token> > keys/.hf_token   (gitignored)');
+  console.error('              Then re-run. To override (NOT recommended):');
+  console.error('                npm run release -- --allow-missing-hf-token');
+  process.exit(1);
 }
 
 // ──────────────────────────────────────────────────────────────────────────
