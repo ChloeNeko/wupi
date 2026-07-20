@@ -1,3 +1,11 @@
-{"version":"0.2.2","notes":"WUPI v0.2.2
-
-Auto-built + signed release from local machine.","pub_date":"2026-07-20T03:22:12Z","platforms":{"windows-x86_64":{"signature":"dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTZ1FIb1g4S0JubGpabjRkbk5aY2F6NXVTTUlVbVZ5ZC9hUjBkOEFPN1Vyc2c2dUFuWitxKzlCb011eHYxbnFmODVHWW5FNUlITHlOQVhNT1M1NjZiZWtSM1diYnlpU3dFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0NTE3Mjk2CWZpbGU6V1VQSV8wLjIuMl94NjQtc2V0dXAuZXhlClJWbEtLLzZ1TGpReWt4SzZRcUo0d2Vwc3p3c0NIck85K2NlRm5yRFpyY0QxVG1kTTNCSFNzRWJNMGdtZzBZNkRyWjBUQTBEeFg2UnI5a2FuWHRlM0FnPT0K","url":"https://github.com/ChloeNeko/WUPI/releases/download/v0.2.2/WUPI_0.2.2-setup.exe"}}}
+{
+  "version": "0.2.2",
+  "notes": "WUPI v0.2.2\n\nAuto-built + signed release from local machine.",
+  "pub_date": "2026-07-20T03:50:06.903Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTZ1FIb1g4S0JubG9UOXhNSUZkanhoK1ZqNjc3RDV0bjhNeWFFZjNSOEJ5MVZuRjgxdElTd29Tay9XdXpKTG5pb083ZDhmbjBVTk94TWx4VVFLWWowUm5naVl6VGtvdFF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0NTE5Mzk5CWZpbGU6V1VQSV8wLjIuMl94NjQtc2V0dXAuZXhlCmJhKzhodzFueFRwRGJEekI5ekNOR0N2SU1qRUdYWDVEbHBxZzczZ2hSS2lCUUVZNkVSUHM1cU5uL0Vuc3lPTnRXUGV2UDdOUkZrenlUaDE5TFRKREFnPT0K",
+      "url": "https://github.com/ChloeNeko/WUPI/releases/download/v0.2.2/WUPI_0.2.2-setup.exe"
+    }
+  }
+}
