@@ -3,24 +3,33 @@
 //! Replaces the Tauri updater plugin (which is installer-only and can't update
 //! a portable exe). WUPI ships as a portable zip; this module downloads a new
 //! zip from the GitHub release, extracts it in place, and replaces engine
-//! files while preserving everything under `data/` (memory, models, sessions,
-//! schemas, theme, api_config, user Operator.xml, user docs/).
+//! files while preserving all four user-data top-level dirs (§8C):
+//!   - `data/`   (user.xml, theme.json, api_config.json, docs/, _update/)
+//!   - `memory/` (memory.sqlite)
+//!   - `models/` (WUPI.gguf, Embed.gguf)
+//!   - `apps/`   (per-card sessions, schemas, scenario cards, profiles)
 //!
-//! ## The preserve rule (simple because the portable layout is clean)
+//! ## The preserve rule
 //!
-//! Everything user-writable lives under `<exe_dir>/data/`. The portable zip
-//! never contains a `data/` dir (release.cjs excludes it — fresh extracts have
-//! no state). So the rule is:
+//! The portable zip ships engine content + the empty `data/` seed (wupi.sim +
+//! user.xml only). It never ships `memory/`, `models/`, or `apps/` (release.cjs
+//! excludes them — fresh extracts have no runtime state). So the rule is:
 //!
 //! ```text
 //! for each file in the zip:
-//!     if its path starts with "data/": skip (defensive; zip shouldn't have it)
+//!     // Preserved user data (the four top-level dirs). Within data/, only
+//!     // wupi.sim is engine content and gets overwritten on update; user.xml
+//!     // is preserved so the user's identity survives.
+//!     if rel starts with "data/" AND rel != "data/wupi.sim": skip
+//!     if rel starts with "memory/": skip (defensive; zip shouldn't have it)
+//!     if rel starts with "models/": skip (defensive; zip shouldn't have it)
+//!     if rel starts with "apps/":   skip (defensive; zip shouldn't have it)
 //!     else if the file is wupi.exe: apply the rename-and-relaunch dance
 //!     else: overwrite the destination in place
 //! ```
 //!
-//! No file classification list, no per-file rule list. The single `data/`
-//! carve-out is the entire preservation contract.
+//! The four-dir carve-out is the entire preservation contract. No per-file
+//! classification list.
 //!
 //! ## The Windows locked-exe dance
 //!
@@ -345,8 +354,13 @@ fn extract_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Walk `extracted/` and copy files into `exe_dir` with the preserve rule.
-/// - Anything under `data/` is skipped (user state).
+/// Walk `extracted/` and copy files into `exe_dir` with the preserve rule
+/// (§8C). Carve-outs:
+/// - `data/` is preserved EXCEPT `data/wupi.sim` (engine content; persona
+///   updates ship in the zip and overwrite the local copy on update — Chloe's
+///   call on the §8C internal contradiction).
+/// - `memory/`, `models/`, `apps/` are fully preserved (defensive — the zip
+///   shouldn't ship these, but the rule is total).
 /// - `wupi.exe` is swapped via the rename-and-relaunch dance.
 /// - Everything else is overwritten in place.
 fn apply_extracted(extracted: &Path, exe_dir: &Path) -> Result<(), String> {
@@ -358,9 +372,12 @@ fn apply_extracted(extracted: &Path, exe_dir: &Path) -> Result<(), String> {
             Ok(r) => r,
             Err(_) => continue,
         };
-        // The preserve rule: one carve-out, the entire data/ tree.
-        if rel.starts_with("data") {
-            tracing::info!(?rel, "preserve: data/ entry skipped");
+        // The preserve rule (§8C): the four user-data top-level dirs are
+        // preserved. Within data/, wupi.sim is engine content and gets
+        // overwritten; everything else in data/ (user.xml, theme.json,
+        // api_config.json, docs/) is preserved.
+        if is_preserved(rel) {
+            tracing::info!(?rel, "preserve: user-data entry skipped");
             continue;
         }
         let dst = exe_dir.join(rel);
@@ -370,7 +387,7 @@ fn apply_extracted(extracted: &Path, exe_dir: &Path) -> Result<(), String> {
             swap_running_exe(&src, &dst)?;
             continue;
         }
-        // Plain file overwrite. Create parent dirs (e.g. cards/game_cards/).
+        // Plain file overwrite. Create parent dirs (e.g. data/, assets/).
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("mkdir parent: {e}"))?;
         }
@@ -379,6 +396,21 @@ fn apply_extracted(extracted: &Path, exe_dir: &Path) -> Result<(), String> {
         tracing::info!(?rel, "updated");
     }
     Ok(())
+}
+
+/// The §8C preserve rule as a predicate. Returns true for paths that must NOT
+/// be overwritten by an update (user data). `data/wupi.sim` is the single
+/// exception: it's engine content shipped in the zip and replaced on update.
+///
+/// `rel` is the file's path relative to the extract root (e.g. `data/user.xml`,
+/// `memory/memory.sqlite`, `wupi.exe`).
+fn is_preserved(rel: &Path) -> bool {
+    // data/: preserved EXCEPT data/wupi.sim (engine content).
+    if rel.starts_with("data") {
+        return rel != Path::new("data/wupi.sim");
+    }
+    // memory/, models/, apps/: fully preserved.
+    rel.starts_with("memory") || rel.starts_with("models") || rel.starts_with("apps")
 }
 
 /// The exe basename on this platform (`wupi.exe` on Windows). Stubbed for
