@@ -163,6 +163,15 @@ pub struct AppState {
     /// `cancel_download`; read at the top of each chunk in the download loop
     /// (same `Ordering::Relaxed` invariant as the engine decode loop, §3).
     pub download_cancel: Arc<std::sync::Mutex<Option<model_downloader::CancelToken>>>,
+    /// The resolved chat-model path, stashed by `setup()` for the deferred
+    /// `boot_load_model` IPC. The boot UX defers the actual model spawn until
+    /// AFTER the JS-side update check completes: if an update is found, the
+    /// JS calls `updater_apply` + `updater_restart` (model never loads); if
+    /// up-to-date, the JS calls `boot_load_model` which reads this stashed
+    /// path + spawns the engine. `None` until `setup()` resolves the path;
+    /// stays `None` if no GGUF was found (the frontend's first-run download
+    /// overlay takes over and never calls `boot_load_model`).
+    pub pending_model_path: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
 }
 
 impl AppState {
@@ -197,6 +206,7 @@ impl AppState {
                 model_downloader::DownloadProgress::default(),
             )),
             download_cancel: Arc::new(std::sync::Mutex::new(None)),
+            pending_model_path: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -354,163 +364,38 @@ pub fn run() {
             }
             let _ = state.operator_path.set(user);
 
+            // Resolve the chat-model path and STASH it on AppState. The
+            // actual spawn is deferred to the `boot_load_model` IPC (called
+            // from JS after the boot update-check gate). If an update is
+            // found, JS calls `updater_apply` + `updater_restart` instead
+            // and the model never loads (no wasted CPU/VRAM on a doomed
+            // process). If no GGUF is here at all (fresh install), emit
+            // "missing" so the frontend's download overlay takes over —
+            // `boot_load_model` is never called in that path.
             let model_path = resolve_model_path(app.handle());
-            if let Some(path) = model_path {
-                tracing::info!("spawning model load: {}", path.display());
-                let app_handle = app.handle().clone();
-                // context_size fixes the persistent context's n_ctx for the
-                // session. Changing it requires re-spawning the engine (a
-                // future P concern). Default comes from WupiSettings.
-                let context_size = {
-                    let s = state.settings.lock().expect("settings mutex");
-                    s.context_size
-                };
-                let backend = llm::LlamaCppBackend::spawn_load(path.clone(), 99, context_size, Box::new(move |result| {
-                    match &result {
-                        Ok(name) => {
-                            let _ = app_handle.emit(
-                                "model-status",
-                                serde_json::json!({ "status": "ready", "model": name }),
-                            );
-
-                            // The schema engine loads its OWN model now (no
-                            // shared_model() coupling). In Local mode it reuses
-                            // the same WUPI.gguf path the chat engine just
-                            // loaded. Spawned here (after chat model ready) so
-                            // the two loads don't compete for VRAM during boot;
-                            // runs on the loader thread, blocking recv is fine.
-                            let app_state = app_handle.state::<AppState>();
-                            let already = app_state
-                                .schema_engine
-                                .lock()
-                                .map(|g| g.is_some())
-                                .unwrap_or(false);
-                            if !already {
-                                let (engine, init_rx) = schema_engine::SchemaEngine::spawn_load(
-                                    path.clone(),
-                                    99,
-                                );
-                                match init_rx.recv() {
-                                    Ok(Ok(())) => {
-                                        tracing::info!(
-                                            "schema engine ready (eager spawn at model-ready)"
-                                        );
-                                        if let Ok(mut slot) = app_state.schema_engine.lock() {
-                                            *slot = Some(Arc::new(engine));
-                                        }
-
-                                        // If the user was on an API profile at last
-                                        // shutdown, boot brought the 12B up as a safe
-                                        // default. Now that both engines are ready,
-                                        // re-perform the API swap so Wupi comes back
-                                        // up on the same connection the user last had.
-                                        // The schema engine stays on WUPI.gguf either
-                                        // way (no Agent.gguf dependency). On any error
-                                        // we stay on local 12B: boot must never fail.
-                                        let restore = {
-                                            let cfg = app_state
-                                                .api_config
-                                                .lock()
-                                                .expect("api_config mutex");
-                                            (
-                                                cfg.model_source,
-                                                cfg.active_profile_id.clone(),
-                                            )
-                                        };
-                                        if matches!(restore.0, api::ModelSource::Api) {
-                                            if let Some(profile_id) = restore.1 {
-                                                tracing::info!(
-                                                    profile_id = %profile_id,
-                                                    "boot: restoring last-used API connection"
-                                                );
-                                                // Tear down the freshly-loaded 12B
-                                                // chat backend (schema stays put).
-                                                let taken = app_state
-                                                    .backend
-                                                    .lock()
-                                                    .expect("backend mutex")
-                                                    .take();
-                                                if let Some(b) = taken {
-                                                    b.shutdown();
-                                                }
-                                                *app_state
-                                                    .model_source
-                                                    .lock()
-                                                    .expect("model_source mutex") =
-                                                    api::ModelSource::Api;
-                                                let _ = app_handle.emit(
-                                                    "model-status",
-                                                    serde_json::json!({
-                                                        "status": "ready",
-                                                        "model": "api (restored)",
-                                                    }),
-                                                );
-                                                tracing::info!(
-                                                    "boot: API connection restored"
-                                                );
-                                            } else {
-                                                // model_source was Api but no active
-                                                // profile: downgrade to Local so
-                                                // chat_send doesn't route to a
-                                                // non-existent API path.
-                                                tracing::warn!(
-                                                    "boot: model_source was Api but no \
-                                                     active profile; downgrading to Local"
-                                                );
-                                                *app_state
-                                                    .model_source
-                                                    .lock()
-                                                    .expect("model_source mutex") =
-                                                    api::ModelSource::Local;
-                                                let mut cfg = app_state
-                                                    .api_config
-                                                    .lock()
-                                                    .expect("api_config mutex");
-                                                cfg.model_source =
-                                                    api::ModelSource::Local;
-                                            }
-                                        }
-                                    }
-                                    Ok(Err(msg)) => {
-                                        tracing::warn!(
-                                            error = %msg,
-                                            "schema engine init failed; schema updates disabled"
-                                        );
-                                    }
-                                    Err(_) => {
-                                        tracing::warn!(
-                                            "schema engine init channel closed; \
-                                             schema updates disabled"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Err(msg) => {
-                            let _ = app_handle.emit(
-                                "model-status",
-                                serde_json::json!({ "status": "error", "message": msg }),
-                            );
-                        }
-                    }
-                }));
-                *state.backend.lock().expect("backend mutex") = Some(backend);
-            } else {
-                // No GGUF found. On a fresh install (the beta-tester path),
-                // this means the first-run downloader hasn't run yet — emit
-                // "missing" so the frontend shows the download overlay instead
-                // of silently booting into echo mode. The frontend's overlay
-                // then drives `download_models`; on completion it triggers a
-                // reload that re-enters setup with the now-present WUPI.gguf.
-                // If the user explicitly dismissed the download (or it failed
-                // unrecoverably), `download_models` leaves the state as-is
-                // and the title indicator falls back to "offline".
-                tracing::info!("no model file found; emitting 'missing' for first-run downloader");
-                let app_handle = app.handle().clone();
-                let _ = app_handle.emit(
-                    "model-status",
-                    serde_json::json!({ "status": "missing" }),
-                );
+            match model_path {
+                Some(path) => {
+                    tracing::info!(path = %path.display(), "model resolved; spawn deferred to boot_load_model IPC");
+                    *state
+                        .pending_model_path
+                        .lock()
+                        .expect("pending_model_path mutex") = Some(path);
+                }
+                None => {
+                    // No GGUF found. On a fresh install (the beta-tester
+                    // path), this means the first-run downloader hasn't run
+                    // yet — emit "missing" so the frontend shows the
+                    // download overlay instead of silently booting into
+                    // echo mode. The frontend's overlay then drives
+                    // `download_models`; on completion it reloads so setup
+                    // re-enters with the now-present WUPI.gguf.
+                    tracing::info!("no model file found; emitting 'missing' for first-run downloader");
+                    let app_handle = app.handle().clone();
+                    let _ = app_handle.emit(
+                        "model-status",
+                        serde_json::json!({ "status": "missing" }),
+                    );
+                }
             }
 
             // Build the MemoryEngine with the real BERT embedder if
@@ -714,6 +599,8 @@ pub fn run() {
             updater_check,
             updater_apply,
             updater_restart,
+            boot_load_model,
+            system_menu::set_always_on_top,
         ])
         // Build the app, then run the event loop with a callback. Splitting
         // .build() + App::run(callback) — instead of Builder::run(context)
@@ -1296,6 +1183,182 @@ async fn updater_apply(
 #[tauri::command]
 fn updater_restart(app: tauri::AppHandle) {
     app.restart();
+}
+
+/// Deferred chat-model spawn. The boot UX (script.js) calls this AFTER the
+/// boot update-check gate resolves with "up-to-date" — so an update-found
+/// path that calls `updater_apply` + `updater_restart` skips this entirely
+/// (no wasted CPU/VRAM loading a model the process is about to abandon).
+///
+/// Reads the path stashed by `setup()` from
+/// `AppState::pending_model_path`. If `None` (no GGUF resolved at setup),
+/// emits `model-status: missing` so the frontend can take over with the
+/// download overlay (defensive — the JS first-run gate should have already
+/// routed to the overlay before calling this, but the IPC stays total).
+///
+/// The spawn closure is the original setup()-inline block, unchanged:
+/// `LlamaCppBackend::spawn_load` → on ready, emit `model-status: ready` +
+/// eagerly spawn the schema engine + re-perform the API-restore swap if the
+/// user was on API mode at last shutdown. On error emit `model-status:
+/// error`. The schema-engine + API-restore logic stays INSIDE the closure
+/// because it must run on the chat-loader thread once the chat model is
+/// ready (not on the IPC caller's thread).
+#[tauri::command]
+async fn boot_load_model(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let path = {
+        let mut g = state.pending_model_path.lock().expect("pending_model_path mutex");
+        g.take()
+    };
+    let Some(path) = path else {
+        // Defensive: setup() couldn't resolve a GGUF. Surface as missing so
+        // the frontend can prompt for the first-run download (which the JS
+        // gate normally handles BEFORE calling boot_load_model).
+        let _ = app.emit(
+            "model-status",
+            serde_json::json!({ "status": "missing" }),
+        );
+        return Ok(());
+    };
+    tracing::info!(path = %path.display(), "boot_load_model: spawning chat model");
+
+    let app_handle = app.clone();
+    // context_size fixes the persistent context's n_ctx for the session.
+    // Changing it requires re-spawning the engine (a future P concern).
+    let context_size = {
+        let s = state.settings.lock().expect("settings mutex");
+        s.context_size
+    };
+    let backend = llm::LlamaCppBackend::spawn_load(path.clone(), 99, context_size, Box::new(move |result| {
+        match &result {
+            Ok(name) => {
+                let _ = app_handle.emit(
+                    "model-status",
+                    serde_json::json!({ "status": "ready", "model": name }),
+                );
+
+                // The schema engine loads its OWN model now (no
+                // shared_model() coupling). In Local mode it reuses
+                // the same WUPI.gguf path the chat engine just
+                // loaded. Spawned here (after chat model ready) so
+                // the two loads don't compete for VRAM during boot;
+                // runs on the loader thread, blocking recv is fine.
+                let app_state = app_handle.state::<AppState>();
+                let already = app_state
+                    .schema_engine
+                    .lock()
+                    .map(|g| g.is_some())
+                    .unwrap_or(false);
+                if !already {
+                    let (engine, init_rx) = schema_engine::SchemaEngine::spawn_load(
+                        path.clone(),
+                        99,
+                    );
+                    match init_rx.recv() {
+                        Ok(Ok(())) => {
+                            tracing::info!(
+                                "schema engine ready (eager spawn at model-ready)"
+                            );
+                            if let Ok(mut slot) = app_state.schema_engine.lock() {
+                                *slot = Some(Arc::new(engine));
+                            }
+
+                            // If the user was on an API profile at last
+                            // shutdown, boot brought the 12B up as a safe
+                            // default. Now that both engines are ready,
+                            // re-perform the API swap so Wupi comes back
+                            // up on the same connection the user last had.
+                            // The schema engine stays on WUPI.gguf either
+                            // way (no Agent.gguf dependency). On any error
+                            // we stay on local 12B: boot must never fail.
+                            let restore = {
+                                let cfg = app_state
+                                    .api_config
+                                    .lock()
+                                    .expect("api_config mutex");
+                                (
+                                    cfg.model_source,
+                                    cfg.active_profile_id.clone(),
+                                )
+                            };
+                            if matches!(restore.0, api::ModelSource::Api) {
+                                if let Some(profile_id) = restore.1 {
+                                    tracing::info!(
+                                        profile_id = %profile_id,
+                                        "boot: restoring last-used API connection"
+                                    );
+                                    // Tear down the freshly-loaded 12B
+                                    // chat backend (schema stays put).
+                                    let taken = app_state
+                                        .backend
+                                        .lock()
+                                        .expect("backend mutex")
+                                        .take();
+                                    if let Some(b) = taken {
+                                        b.shutdown();
+                                    }
+                                    *app_state
+                                        .model_source
+                                        .lock()
+                                        .expect("model_source mutex") =
+                                        api::ModelSource::Api;
+                                    let _ = app_handle.emit(
+                                        "model-status",
+                                        serde_json::json!({
+                                            "status": "ready",
+                                            "model": "api (restored)",
+                                        }),
+                                    );
+                                    tracing::info!(
+                                        "boot: API connection restored"
+                                    );
+                                } else {
+                                    // model_source was Api but no active
+                                    // profile: downgrade to Local so
+                                    // chat_send doesn't route to a
+                                    // non-existent API path.
+                                    tracing::warn!(
+                                        "boot: model_source was Api but no \
+                                         active profile; downgrading to Local"
+                                    );
+                                    *app_state
+                                        .model_source
+                                        .lock()
+                                        .expect("model_source mutex") =
+                                        api::ModelSource::Local;
+                                    let mut cfg = app_state
+                                        .api_config
+                                        .lock()
+                                        .expect("api_config mutex");
+                                    cfg.model_source =
+                                        api::ModelSource::Local;
+                                }
+                            }
+                        }
+                        Ok(Err(msg)) => {
+                            tracing::warn!(
+                                error = %msg,
+                                "schema engine init failed; schema updates disabled"
+                            );
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "schema engine init channel closed; \
+                                 schema updates disabled"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(msg) => {
+                let _ = app_handle.emit(
+                    "model-status",
+                    serde_json::json!({ "status": "error", "message": msg }),
+                );
+            }
+        }
+    }));
+    *state.backend.lock().expect("backend mutex") = Some(backend);
+    Ok(())
 }
 
 /// Resolve Wupi's active persona card. Per §8C the active persona is a single

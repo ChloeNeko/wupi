@@ -172,3 +172,21 @@ pub fn power_sleep_cmd<R: Runtime>(app: tauri::AppHandle<R>) -> Result<(), Strin
     power_sleep(&app);
     Ok(())
 }
+
+/// Toggle the main window's always-on-top state at runtime. The window boots
+/// with `alwaysOnTop: true` (tauri.conf.json) — the OS UX needs that so WUPI
+/// floats above other windows during normal use. The first-run download
+/// overlay turns it OFF so the user can alt-tab away while the ~10GB GGUF
+/// pull runs (several minutes). Restored to ON once the download completes
+/// + the user clicks LAUNCH.
+///
+/// Custom `#[tauri::command]` (not the Tauri built-in window plugin command):
+/// `core:default` in capabilities/default.json auto-allows custom commands,
+/// so no capability change needed. Mirrors `power_sleep_cmd` above.
+#[tauri::command]
+pub fn set_always_on_top<R: Runtime>(app: tauri::AppHandle<R>, on: bool) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window(MAIN_WINDOW) {
+        win.set_always_on_top(on).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
