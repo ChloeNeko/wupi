@@ -373,8 +373,8 @@ if (existsSync(msiDir)) {
 
 if (!primaryName || !sigContent) {
   console.error('[release] could not find NSIS setup exe or its .sig in build output.');
-  console.error('[release] was the build actually signed? Check ~/.tauri/wupi.key exists,');
-  console.error('           ~/.tauri/wupi.key.pw has the password, and');
+  console.error('[release] was the build actually signed? Check keys/wupi.key exists,');
+  console.error('           keys/wupi.key.pw has the password, and');
   console.error('           createUpdaterArtifacts is true in tauri.conf.json.');
   process.exit(1);
 }
@@ -408,6 +408,23 @@ console.log(`[release] creating GitHub Release ${tag}…`);
 // "no matches found". gh accepts absolute paths directly; we pass them as
 // explicit argv to bypass shell interpretation entirely.
 const stagedFiles = readdirSync(stageDir).map(f => join(stageDir, f));
+
+// If the release for this tag already exists (common with --no-bump
+// re-releases, or a retry of a partially-successful previous run), delete
+// it UP FRONT so the first gh-release-create attempt succeeds. Without
+// this, attempt 1 always fails on "tag already exists" and we waste a
+// 15s backoff cycle before the retry loop cleans it up.
+const existingRelease = spawnSync('gh',
+  ['release', 'view', tag, '--repo', repo, '--json', 'tagName'],
+  { cwd: repoRoot, stdio: 'pipe', encoding: 'utf8' });
+if (existingRelease.status === 0) {
+  console.log(`[release] existing ${tag} release found; replacing it…`);
+  spawnSync('gh', ['release', 'delete', tag, '--repo', repo, '--yes'],
+            { stdio: 'ignore', cwd: repoRoot });
+  spawnSync('git', ['push', 'origin', `:refs/tags/${tag}`],
+            { stdio: 'ignore', cwd: repoRoot });
+  spawnSync('git', ['tag', '-d', tag], { stdio: 'ignore', cwd: repoRoot });
+}
 
 let ghRelease = null;
 let releaseOk = false;
