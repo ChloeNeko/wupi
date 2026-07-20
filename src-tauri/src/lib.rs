@@ -82,18 +82,19 @@ pub struct AppState {
     /// loader sets this. Read on every chat turn (search + 2× archive).
     pub active_card_id: Arc<std::sync::Mutex<String>>,
     /// The active Simulation Card (the parsed persona artifact). Filled once
-    /// in `setup()` from `cards/Wupi.sim`; reads after init are lock-free.
+    /// in `setup()` from `data/wupi.sim` (§8C); reads after init are lock-free.
     /// `chat_send` renders it into the system-prompt persona section;
     /// `get_intro` reads its randomized introduction list. Always `Some`
     /// after `setup()` (the loader falls back to a stub, never `None`).
     pub active_card: Arc<std::sync::OnceLock<sim_card::SimCard>>,
-    /// The resolved path to the operator's LIVE profile
-    /// (`<exe_dir>/data/Operator.xml`), filled once in `setup()`. The
-    /// shipped `cards/Operator.xml` is a template — on first run `setup()`
-    /// seeds the live copy from it; thereafter the live copy is the user's
-    /// own and is preserved across updates. `None` when no profile resolved
-    /// (no data file AND no template). The PATH is stable; the CONTENT is
-    /// re-read fresh each `chat_send` (hot-reload: see `user_profile`).
+    /// The resolved path to the user's profile
+    /// (`<exe_dir>/data/user.xml`, §8C-renamed from Operator.xml), filled
+    /// once in `setup()`. Single copy (no template/live split per §8C):
+    /// the shipped zip contains the empty template; the user authors their
+    /// identity via the Profile Editor and that file is preserved across
+    /// updates. `None` when no profile resolved. The PATH is stable; the
+    /// CONTENT is re-read fresh each `chat_send` (hot-reload: see
+    /// `user_profile`).
     /// Lock-free reads after `setup`. Held as `Option<PathBuf>` so a missing
     /// profile is `None`, distinct from "not yet resolved."
     pub operator_path: Arc<std::sync::OnceLock<Option<std::path::PathBuf>>>,
@@ -308,7 +309,7 @@ pub fn run() {
             // for that future use (marked #[allow(dead_code)] until then).
             tracing::info!("fresh session + empty schema (ephemeral mode)");
 
-            // Load the default card (`cards/Wupi.sim`) before anything else -
+            // Load the default card (`data/wupi.sim`, §8C) before anything else -
             // it's a single cheap file read + parse, independent of model
             // loading, and `get_intro` (called from the frontend's boot) may
             // race the model load. `load_or_fallback` degrades gracefully to
@@ -1622,7 +1623,8 @@ async fn chat_send(
         .map(|c| c.render_for_prompt());
     // Operator profile: re-read FRESH from disk each turn (hot-reload). The
     // path is cached (stable); only the content refreshes: so a live edit to
-    // Operator.xml takes effect on the very next message. `load` returns None
+    // user.xml (§8C-renamed from Operator.xml) takes effect on the very next
+    // message. `load` returns None
     // on missing/malformed → section silently suppressed (graceful). Like the
     // persona, the rendered text is byte-identical across turns until the file
     // is edited → no cold-reset (cache-friendly, Prime Directive).
@@ -2115,8 +2117,8 @@ async fn codex_delete(
 // wiring. `UserProfile` is Serialize/Deserialize so it crosses IPC directly.
 
 /// Read the operator profile fresh from disk. Returns `None` when no
-/// Operator.xml resolved at startup (the Profile Editor renders empty fields
-/// and a Create prompt in that case).
+/// user.xml (§8C) resolved at startup (the Profile Editor renders empty
+/// fields and a Create prompt in that case).
 #[tauri::command]
 async fn operator_profile_get(
     state: tauri::State<'_, AppState>,
@@ -2138,8 +2140,9 @@ async fn operator_profile_get(
         .map_err(|e| format!("profile get join: {e}"))
 }
 
-/// Write the operator profile atomically to the resolved `Operator.xml` path.
-/// Creates the file (and its parent dir) if missing. Returns an error string
+/// Write the operator profile atomically to the resolved `user.xml` path
+/// (§8C; was Operator.xml). Creates the file (and its parent dir) if missing.
+/// Returns an error string
 /// if no path resolved at startup (shouldn't happen: `setup` always resolves
 /// the candidates; `None` means none existed, in which case we can't write).
 #[tauri::command]
@@ -2598,10 +2601,10 @@ struct GameCardMeta {
     tone: Option<String>,
 }
 
-/// Enumerate every `.sim` file in `cards/game_cards/` and return parsed
-/// metadata. The card-picker UI's data source. Returns an empty Vec when no
-/// game_cards/ dir exists (the common case until cards are authored or
-/// imported): graceful, not an error.
+/// Enumerate every `.sim` file in `apps/games/cards/` (§8C; was
+/// `cards/game_cards/`) and return parsed metadata. The card-picker UI's data
+/// source. Returns an empty Vec when no cards dir exists (the common case
+/// until cards are authored or imported): graceful, not an error.
 #[tauri::command]
 fn game_cards_list(app: tauri::AppHandle) -> Result<Vec<GameCardMeta>, String> {
     let dir = resolve_game_cards_dir(&app);
@@ -2623,7 +2626,7 @@ fn game_cards_list(app: tauri::AppHandle) -> Result<Vec<GameCardMeta>, String> {
             continue;
         }
         // Only list roleplay cards in this registry: the system card
-        // (Wupi.sim) lives in `cards/`, not `cards/game_cards/`, so this is
+        // (wupi.sim) lives in `data/`, not `apps/games/cards/`, so this is
         // belt-and-suspenders against a misplaced file.
         if card.card_type != "roleplay" {
             continue;
@@ -2671,7 +2674,7 @@ async fn game_start(
     //    `game_cards_list`, so it must exist in the registry.
     let card = {
         let dir = resolve_game_cards_dir(&app)
-            .ok_or_else(|| "no cards/game_cards/ dir resolved".to_string())?;
+            .ok_or_else(|| "no apps/games/cards/ dir resolved".to_string())?;
         find_card_by_id(&dir, &card_id)?
     };
 
@@ -3011,8 +3014,8 @@ fn resolve_game_cards_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> 
     None
 }
 
-/// Find a roleplay card by id within `cards/game_cards/`. Returns an error
-/// string (not a panic) if no card with that id exists.
+/// Find a roleplay card by id within `apps/games/cards/` (§8C). Returns an
+/// error string (not a panic) if no card with that id exists.
 fn find_card_by_id(dir: &std::path::Path, target_id: &str) -> Result<sim_card::SimCard, String> {
     let entries = std::fs::read_dir(dir).map_err(|e| format!("read game_cards/: {e}"))?;
     for entry in entries.flatten() {

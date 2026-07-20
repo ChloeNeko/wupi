@@ -1095,9 +1095,9 @@ function setTitleState(state) {
     '› calibrating bge-small-en-v1.5 embedder...',
     '› embedder self-test: cosine check...',
     '› mounting memory.sqlite (WAL, FTS5, vec0)...',
-    '› seeding codex from docs/...',
-    '› loading Operator.xml (user profile)...',
-    '› loading Wupi.sim (persona card)...',
+    '› seeding codex from data/docs/...',
+    '› loading data/user.xml (user profile)...',
+    '› loading data/wupi.sim (persona card)...',
     '› arming schema-delta engine...',
     '› arming narrator engine...',
     '› KV cache: Q8_0 type-k/type-v',
@@ -2075,7 +2075,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     }
 
     // Load fresh every time the window opens: cheap, and guarantees the editor
-    // reflects disk state (someone could have hand-edited Operator.xml).
+    // reflects disk state (someone could have hand-edited user.xml).
     windowOpenHooks.set('profile', () => {
       setStatus('Loading…');
       invoke('operator_profile_get')

@@ -142,16 +142,18 @@ pub const WUPI_CARD_ID: &str = "__wupi__";
 
 /// Reserved partition for Wupi's non-editable, user-invisible system knowledge
 /// (the OS docs: critical-wall, os-directives-vs-persona, sim-card-format,
-/// user-profile-format). Seeded at boot from `cards/wupi_knowledge/*.md` via
-/// the parallel `seed_wupi_knowledge` loader.
+/// user-profile-format). Historically seeded at boot from
+/// `cards/wupi_knowledge/*.md`; that seed path was REMOVED in §8C (the source
+/// files were deleted pre-session). The sentinel constant stays: it's
+/// load-bearing for `search_wupi_visible` (the firewall's read side), and a
+/// future system-knowledge injection path would reuse it.
 ///
-/// **The firewall (Phase 2):** no user IPC (`codex_save`, `codex_delete`,
-/// `chat_send` archival, `game_send` archival) writes here. The only writer is
-/// the boot seed. The only reader is [`MemoryEngine::search_wupi_visible`],
-/// which lets Wupi-as-OS retrieve her system knowledge regardless of which
-/// card is active (Wupi always knows her own OS docs). Roleplay cards never
-/// see this partition; cross-card reads exist only for this one reserved
-/// sentinel, by design (AGENTS.md §2AA).
+/// **The firewall:** no user IPC (`codex_save`, `codex_delete`,
+/// `chat_send` archival, `game_send` archival) writes here. The only reader
+/// is [`MemoryEngine::search_wupi_visible`], which lets Wupi retrieve her
+/// system knowledge regardless of which card is active (Wupi always knows her
+/// own OS docs). Roleplay cards never see this partition; cross-card reads
+/// exist only for this one reserved sentinel, by design (AGENTS.md §2AA).
 pub const WUPI_SYSTEM_CARD_ID: &str = "__wupi_system__";
 
 /// Reserved partition for user-authored Codex reference lore (the `.md` files
@@ -592,8 +594,8 @@ impl<E: Embedder> MemoryEngine<E> {
     /// be a strong sparse match and deserve promotion.
     ///
     /// `card_id` scopes retrieval to one simulation card: cards never see
-    /// each other's memory (AGENTS.md §2M). Cross-card reads by Wupi-as-OS
-    /// use a separate path (not built yet).
+    /// each other's memory (AGENTS.md §2M). Cross-card reads use a separate
+    /// path (see [`Self::search_wupi_visible`]).
     ///
     /// `dense_floor` overrides the [`crate::memory_rrf::DENSE_COSINE_FLOOR`]
     /// const for live calibration via the 🧠 panel. `None` → use the const.
@@ -669,14 +671,14 @@ impl<E: Embedder> MemoryEngine<E> {
         .map_err(|e| anyhow::anyhow!("search join: {e}"))??)
     }
 
-    /// Cross-card retrieval: the Wupi-as-OS path (Phase 2 firewall).
+    /// Cross-card retrieval: the firewall's read side.
     ///
     /// Like [`Self::search`], but retrieves from BOTH `active_card_id` AND the
     /// reserved [`WUPI_SYSTEM_CARD_ID`] partition, fusing results across both.
     /// This is how Wupi always has access to her own non-editable system
-    /// knowledge (the OS docs seeded from `cards/wupi_knowledge/`) regardless
-    /// of which roleplay card is active: the firewall is one-way: system
-    /// knowledge leaks OUT to Wupi, roleplay cards never see each other.
+    /// knowledge (the OS docs) regardless of which roleplay card is active:
+    /// the firewall is one-way: system knowledge leaks OUT to Wupi, roleplay
+    /// cards never see each other.
     ///
     /// **Efficiency:** embeds the query ONCE (the expensive GPU step), then
     /// runs 2 FTS5 + 2 vec0 queries (one per partition) in a single blocking

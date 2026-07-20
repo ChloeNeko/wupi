@@ -11,12 +11,14 @@
 //!    it once.
 //! 2. **The persona**: rendered from the active Simulation Card
 //!    (`sim_card.rs`) and passed in as `Option<&str>`. Wupi gets NOTHING from
-//!    this file: her entire identity comes from `cards/Wupi.sim`. A dungeon
-//!    card would supply its own persona; the directives above are unchanged.
+//!    this file: her entire identity comes from `data/wupi.sim` (§8C). A
+//!    dungeon card would supply its own persona; the directives above are
+//!    unchanged.
 //! 3. **The user profile**: rendered from the operator's profile
-//!    (`user_profile.rs`, `cards/Operator.xml`) and passed in as `Option<&str>`.
-//!    The static "who am I talking to" counterpart to the persona. Re-read
-//!    fresh each turn (hot-reload) so live edits take effect immediately.
+//!    (`user_profile.rs`, `data/user.xml` per §8C) and passed in as
+//!    `Option<&str>`. The static "who am I talking to" counterpart to the
+//!    persona. Re-read fresh each turn (hot-reload) so live edits take effect
+//!    immediately.
 //!
 //! Ordering in the assembled prompt: `<os_directives>` → `<persona>` →
 //! `<user_profile>` → `<current_context>`. The operator's identity comes AFTER
@@ -48,10 +50,11 @@ conversation disagree, the live conversation always wins.";
 /// - `<persona>`: present only when a real card loaded; `None` or empty
 ///   suppresses the section (e.g. the fallback stub persona).
 /// - `<user_profile>`: present only when an operator profile loaded; `None`
-///   or empty suppresses the section (e.g. no `Operator.xml` resolved). Re-read
-///   fresh each turn by the caller so live edits take effect immediately
-///   (hot-reload). Byte-identical across turns until edited → does NOT trigger
-///   the §2F cold-reset guard (same cache-friendliness as the persona).
+///   or empty suppresses the section (e.g. no `user.xml` resolved, §8C).
+///   Re-read fresh each turn by the caller so live edits take effect
+///   immediately (hot-reload). Byte-identical across turns until edited → does
+///   NOT trigger the §2F cold-reset guard (same cache-friendliness as the
+///   persona).
 /// - `<current_context>`: the live `WupiSettings` readout.
 pub fn build_system_content(
     settings: &WupiSettings,

@@ -81,10 +81,10 @@ struct ParsedEntry {
 /// distinguish user-authored codex (`"codex"`) from Wupi's non-editable system
 /// knowledge (`"wupi_system"`). Both reuse the `kind=codex` discriminator
 /// downstream (so the per-class floor + render frame apply automatically); the
-/// `namespace` field is for future filtering and the audit log. The two seed
-/// paths (user codex from `docs/`, Wupi-system from `cards/wupi_knowledge/`)
-/// write to disjoint `card_id` partitions: see `CODEX_CARD_ID` and
-/// `WUPI_SYSTEM_CARD_ID` in `memory.rs`.
+/// `namespace` field is for future filtering and the audit log. Today only the
+/// user codex seed path is live (§8C removed the `cards/wupi_knowledge/`
+/// system-knowledge seed); a future system-knowledge injection path would
+/// write to `WUPI_SYSTEM_CARD_ID` and reuse the `"wupi_system"` namespace.
 pub async fn seed_codex(
     engine: &MemoryEngine<impl Embedder>,
     codex_dir: &Path,

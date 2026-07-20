@@ -1,10 +1,11 @@
-//! User Profile (`Operator.xml`) loader, parser, and renderer.
+//! User Profile (`data/user.xml`) loader, parser, and renderer.
 //!
 //! The User Profile is the operator's static identity artifact: the "who am I
-//! talking to" counterpart to the Simulation Card's "who am I." It lives at
-//! `cards/Operator.xml` next to `Wupi.sim`, uses the same strict-XML +
-//! CDATA-wrapped prose format, and parses with the same `roxmltree` DOM parser
-//! (CDATA auto-merged into text nodes: zero escape handling).
+//! talking to" counterpart to the Simulation Card's "who am I." Per §8C it
+//! lives at `data/user.xml` (renamed from `cards/Operator.xml`), uses the
+//! same strict-XML + CDATA-wrapped prose format, and parses with the same
+//! `roxmltree` DOM parser (CDATA auto-merged into text nodes: zero escape
+//! handling).
 //!
 //! Unlike the Simulation Card, the profile is **re-read fresh on every chat
 //! turn** rather than cached. This is the hot-reload mechanism: because the
