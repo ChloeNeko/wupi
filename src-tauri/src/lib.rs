@@ -23,6 +23,7 @@ pub mod sim_card;
 pub mod stream_filter;
 pub mod system_menu;
 pub mod theme;
+pub mod updater;
 pub mod user_profile;
 
 use std::sync::Arc;
@@ -86,10 +87,13 @@ pub struct AppState {
     /// `get_intro` reads its randomized introduction list. Always `Some`
     /// after `setup()` (the loader falls back to a stub, never `None`).
     pub active_card: Arc<std::sync::OnceLock<sim_card::SimCard>>,
-    /// The resolved path to the operator's profile (`cards/Operator.xml`),
-    /// filled once in `setup()`. `None` when no profile resolved (the common
-    /// case until the operator authors one). The PATH is stable; the CONTENT
-    /// is re-read fresh each `chat_send` (hot-reload: see `user_profile`).
+    /// The resolved path to the operator's LIVE profile
+    /// (`<exe_dir>/data/Operator.xml`), filled once in `setup()`. The
+    /// shipped `cards/Operator.xml` is a template — on first run `setup()`
+    /// seeds the live copy from it; thereafter the live copy is the user's
+    /// own and is preserved across updates. `None` when no profile resolved
+    /// (no data file AND no template). The PATH is stable; the CONTENT is
+    /// re-read fresh each `chat_send` (hot-reload: see `user_profile`).
     /// Lock-free reads after `setup`. Held as `Option<PathBuf>` so a missing
     /// profile is `None`, distinct from "not yet resolved."
     pub operator_path: Arc<std::sync::OnceLock<Option<std::path::PathBuf>>>,
@@ -102,17 +106,18 @@ pub struct AppState {
     /// frontend to paint the cascade panels; written by `theme_set`. Held
     /// under a std Mutex: never awaited across.
     pub theme: Arc<std::sync::Mutex<theme::ThemeSettings>>,
-    /// The resolved path to `theme.json` in app data. Filled once in setup;
-    /// `theme_set` saves to it. OnceLock because it needs the Tauri app handle
-    /// to resolve app_data_dir (not available in AppState::new()).
+    /// The resolved path to `theme.json` in `<exe_dir>/data`. Filled once in
+    /// setup; `theme_set` saves to it. OnceLock because it needs the Tauri
+    /// app handle to resolve the portable data dir (not available in
+    /// AppState::new()).
     pub theme_path: Arc<std::sync::OnceLock<std::path::PathBuf>>,
     /// The API connection config (saved profiles + active source). Read by
     /// the `api_*` IPC commands; written by `api_profile_save`/`api_connect`/
     /// `api_disconnect`. Held under a std Mutex: short critical sections.
     pub api_config: Arc<std::sync::Mutex<api::ApiConfig>>,
-    /// The resolved path to `api_config.json` in app data. Filled once in
-    /// setup; the `api_*` IPC saves to it. OnceLock for the same reason as
-    /// `theme_path`: needs the Tauri app handle to resolve app_data_dir.
+    /// The resolved path to `api_config.json` in `<exe_dir>/data`. Filled
+    /// once in setup; the `api_*` IPC saves to it. OnceLock for the same
+    /// reason as `theme_path`: needs the Tauri app handle.
     pub api_config_path: Arc<std::sync::OnceLock<std::path::PathBuf>>,
     /// The active chat source (`Local` = WUPI.gguf 12B, `Api` = HTTP endpoint).
     /// Mirrors `api_config.model_source` but held separately so `chat_send`
@@ -217,27 +222,28 @@ pub fn run() {
 
     tracing::info!("=== WUPI OS starting ===");
     tauri::Builder::default()
-        // Updater: signed-update distribution. The JS side drives check() +
-        // downloadAndInstall(); process plugin provides relaunch() after
-        // install. Both plugins MUST be registered before .setup() so the
-        // IPC surface is ready when the frontend loads.
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init())
         .manage(AppState::new())
         .manage(hardware::AudioRegistry)
         .setup(|app| {
             tracing::info!("setup hook entered");
-            let data_dir = app
-                .path()
-                .app_data_dir()
-                .expect("app data dir is available");
+            // Best-effort cleanup of `wupi.exe.old` from a prior self-update.
+            // By the time the new exe runs, the old one's lock is gone.
+            updater::cleanup_old_exe(app.handle());
+            // Portable layout: all state lives in `<exe_dir>/data`, never in
+            // the OS app-data dir. Nothing leaves the install folder.
+            let data_dir = resolve_portable_data_dir(app.handle());
             std::fs::create_dir_all(&data_dir).ok();
             // Phase 3 per-card persistence: the sessions/ and schemas/ subdirs
             // hold `<card_id>.json` files for each roleplay card that's been
             // played. Created once at boot; cheap no-op if they already exist.
             std::fs::create_dir_all(data_dir.join("sessions")).ok();
             std::fs::create_dir_all(data_dir.join("schemas")).ok();
-            tracing::info!("app data dir: {}", data_dir.display());
+            // The downloader writes GGUFs into data/models. Pre-create so the
+            // first-run download overlay doesn't depend on create_dir_all in
+            // the download path firing correctly (defensive; downloader also
+            // creates it).
+            std::fs::create_dir_all(data_dir.join("models")).ok();
+            tracing::info!("portable data dir: {}", data_dir.display());
 
             let state: tauri::State<AppState> = app.state();
 
@@ -707,6 +713,8 @@ pub fn run() {
             hardware::bluetooth::bluetooth_list_devices,
             hardware::bluetooth::bluetooth_discover,
             hardware::bluetooth::bluetooth_pair,
+            updater_check,
+            updater_apply,
         ])
         // Build the app, then run the event loop with a callback. Splitting
         // .build() + App::run(callback) — instead of Builder::run(context)
@@ -807,6 +815,31 @@ fn resolve_model_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     None
 }
 
+/// The portable data directory: `<exe_dir>/data`. WUPI is a portable app —
+/// nothing leaves the install folder. All user-writable state (memory.sqlite,
+/// sessions/, schemas/, models/, theme.json, api_config.json, user docs/) lives
+/// in this single sibling dir next to `wupi.exe`. The dir is created lazily by
+/// callers (`create_dir_all`); this fn just resolves the path.
+///
+/// Falls back to `app_data_dir()` only if `current_exe()` fails (defensive —
+/// shouldn't happen on Windows; keeps the resolver total so callers can
+/// `.expect` it). The fallback preserves dev-mode behavior in the unlikely
+/// event the exe path is unobtainable.
+fn resolve_portable_data_dir(app: &tauri::AppHandle) -> std::path::PathBuf {
+    use tauri::Manager;
+    if let Some(exe) = std::env::current_exe().ok() {
+        if let Some(parent) = exe.parent() {
+            return parent.join("data");
+        }
+    }
+    // Defensive fallback: keeps the function total. In practice never taken
+    // on Windows; logged so a future platform regression surfaces.
+    tracing::warn!("current_exe() unresolved; falling back to app_data_dir");
+    app.path()
+        .app_data_dir()
+        .expect("neither current_exe nor app_data_dir resolved")
+}
+
 /// The candidate `models/` directories, in search order. Shared by the chat
 /// model resolver, the embedder resolver, and the schema-engine model
 /// resolver (so they all agree on where `.gguf` files live). Extracted from
@@ -829,9 +862,11 @@ fn model_search_dirs(app: &tauri::AppHandle) -> Vec<std::path::PathBuf> {
             }
         }
     }
-    if let Some(data) = app.path().app_data_dir().ok() {
-        v.push(data.join("models"));
-    }
+    // Portable layout: GGUFs live inside the install folder at
+    // `<exe_dir>/data/models`. Searched LAST so a dev-mode `src-tauri/models/`
+    // is preferred when present (lets local devs keep models where they
+    // already are), but the portable install always finds its GGUFs.
+    v.push(resolve_portable_data_dir(app).join("models"));
     v
 }
 
@@ -880,9 +915,9 @@ fn resolve_embed_model_dirs(app: &tauri::AppHandle) -> Option<std::path::PathBuf
             }
         }
     }
-    if let Some(data) = app.path().app_data_dir().ok() {
-        dirs.push(data.join("models"));
-    }
+    // Portable layout: see `model_search_dirs` for rationale. Same LAST
+    // candidate so the portable install's downloaded `Embed.gguf` is found.
+    dirs.push(resolve_portable_data_dir(app).join("models"));
     memory_embedder_llama::resolve_embed_model(&dirs)
 }
 
@@ -890,7 +925,7 @@ fn resolve_embed_model_dirs(app: &tauri::AppHandle) -> Option<std::path::PathBuf
 //
 // Four commands power the boot download overlay:
 //   - check_models            : are WUPI.gguf / Embed.gguf present?
-//   - download_models         : stream both from HF into app_data_dir/models
+//   - download_models         : stream both from HF into <exe_dir>/data/models
 //   - get_download_progress   : polled snapshot of the in-flight download
 //   - cancel_download         : signal an in-flight download to stop
 //
@@ -918,17 +953,16 @@ fn check_models(app: tauri::AppHandle) -> serde_json::Value {
     })
 }
 
-/// The target `models/` dir for downloads. Always `app_data_dir/models` —
-/// the 5th candidate in `model_search_dirs`, the only one that's reliably
-/// user-writable on a fresh install (resource_dir is read-only after
-/// install, exe-parent may be Program Files). Resolving it here keeps the
-/// downloader module free of Tauri path APIs (testable in isolation).
+/// The target `models/` dir for downloads: `<exe_dir>/data/models`. Portable
+/// layout — GGUFs live inside the install folder, never in the OS app-data
+/// dir. This matches the candidate list in `model_search_dirs` (which now
+/// includes `<exe_dir>/data/models`), so a freshly-downloaded GGUF is picked
+/// up on the next boot scan with zero resolver changes.
 fn download_target_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
-    use tauri::Manager;
-    app.path().app_data_dir().ok().map(|d| d.join("models"))
+    Some(resolve_portable_data_dir(app).join("models"))
 }
 
-/// Stream both GGUFs from HF into `app_data_dir/models`. Long-running; the
+/// Stream both GGUFs into `<exe_dir>/data/models`. Long-running; the
 /// frontend subscribes to `download-progress` events (throttled to 2/sec)
 /// and polls `get_download_progress` for the authoritative snapshot between
 /// emits. Returns `Ok(())` when both files land; `Err(msg)` on any failure
@@ -943,7 +977,7 @@ async fn download_models(
     // scoped into its own block so the MutexGuard drops before we await
     // (the `!Send` guard invariant, same as api_connect at lib.rs:2092).
     let dest_dir = download_target_dir(&app)
-        .ok_or_else(|| "could not resolve app_data_dir/models".to_owned())?;
+        .ok_or_else(|| "could not resolve <exe_dir>/data/models".to_owned())?;
     let cancel = {
         let fresh = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut slot = state
@@ -1029,6 +1063,29 @@ fn cancel_download(state: tauri::State<'_, AppState>) {
     }
 }
 
+// ── Portable self-updater IPC ──────────────────────────────────────────────
+//
+// Two commands drive the file-level updater (src/updater.rs). The frontend
+// calls `updater_check` on boot; if a new version is available it surfaces a
+// toast + "Update & restart" button. `updater_apply` downloads + applies the
+// update (preserving everything under data/), then the frontend prompts the
+// user to restart. Updates never touch user data — see src/updater.rs for the
+// preserve rule.
+
+#[tauri::command]
+async fn updater_check(app: tauri::AppHandle) -> Option<updater::UpdateInfo> {
+    let current = app.package_info().version.to_string();
+    updater::check_for_updates(&current).await
+}
+
+#[tauri::command]
+async fn updater_apply(
+    app: tauri::AppHandle,
+    update: updater::UpdateInfo,
+) -> Result<(), String> {
+    updater::perform_update(&app, update).await
+}
+
 /// Resolve the default Simulation Card (`cards/Wupi.sim`) by walking the same
 /// candidate-dir list as [`resolve_model_path`], but joining `"cards"` instead
 /// of `"models"` and exact-matching `Wupi.sim` (case-insensitive). Locked-name
@@ -1044,6 +1101,7 @@ fn resolve_card_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     }
     if let Some(exe) = std::env::current_exe().ok() {
         if let Some(parent) = exe.parent() {
+            // Portable layout: cards ship next to wupi.exe at `<exe_dir>/cards`.
             candidates.push(parent.join("cards"));
             if let Some(grand) = parent.parent().and_then(|g| g.parent()) {
                 candidates.push(grand.join("cards"));
@@ -1053,17 +1111,14 @@ fn resolve_card_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
             }
         }
     }
-    if let Some(data) = app.path().app_data_dir().ok() {
-        candidates.push(data.join("cards"));
-    }
 
     for dir in &candidates {
         if !dir.exists() {
             continue;
         }
         // Exact name match (case-insensitive). The dev path resolves to the
-        // repo's `cards/` dir; the exe-sibling + resource paths resolve to
-        // wherever cards ship alongside a packaged build.
+        // repo's `cards/` dir; the exe-sibling path resolves to the portable
+        // install's `<exe_dir>/cards`.
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 if entry.file_name().to_string_lossy().to_lowercase() == "wupi.sim" {
@@ -1077,24 +1132,52 @@ fn resolve_card_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Resolve the operator's profile (`cards/Operator.xml`) by walking the same
-/// candidate-dir list as [`resolve_card_path`], joining `"cards"`, and exact-
-/// matching `Operator.xml` (case-insensitive). Sibling to Wupi.sim in the same
-/// dir. Returns `None` when no profile is found: the common case until the
-/// operator authors one; the caller runs without a `<user_profile>` section
-/// (graceful, not a crash).
+/// Resolve the operator's profile (`Operator.xml`). The LIVE profile lives
+/// at `<exe_dir>/data/Operator.xml` (user-owned, preserved across updates).
+/// On first run, `setup()` copies the shipped template from
+/// `<exe_dir>/cards/Operator.xml` into the data dir so the user starts from
+/// the default identity; once the data copy exists, it is never overwritten
+/// by updates (the cards/ template is the always-replaceable source).
+///
+/// Returns the path to `data/Operator.xml` if either (a) the file already
+/// exists, or (b) a template at `cards/Operator.xml` was successfully copied
+/// in. Returns `None` if no data file exists AND no template was found:
+/// Wupi then runs without a `<user_profile>` section (graceful).
 ///
 /// Only the PATH is resolved here (once, in setup). The CONTENT is re-read
 /// fresh each `chat_send` via `user_profile::load`: that's the hot-reload
 /// mechanism (live edits take effect on the next message, no reboot, no
 /// watcher thread).
 fn resolve_operator_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
-    use tauri::Manager;
-
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(d) = app.path().resource_dir().ok() {
-        candidates.push(d.join("cards"));
+    let data_dir = resolve_portable_data_dir(app);
+    let live_path = data_dir.join("Operator.xml");
+    if live_path.exists() {
+        return Some(live_path);
     }
+    // No live profile yet. Try to seed from the shipped template.
+    if let Some(template) = find_operator_template(app) {
+        // Best-effort copy. If it fails (disk full, perms), return None so
+        // Wupi boots without a profile rather than crashing.
+        if std::fs::create_dir_all(&data_dir).is_ok() {
+            if std::fs::copy(&template, &live_path).is_ok() {
+                tracing::info!(
+                    "seeded Operator.xml from template: {} -> {}",
+                    template.display(),
+                    live_path.display()
+                );
+                return Some(live_path);
+            }
+        }
+    }
+    None
+}
+
+/// Find the shipped `Operator.xml` template (the always-replaceable default
+/// identity). Walks the exe-relative `cards/` candidates — portable layout
+/// first (`<exe_dir>/cards/Operator.xml`), dev-repo paths as fallback. Used
+/// only by [`resolve_operator_path`] to seed the live profile on first run.
+fn find_operator_template(_app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Some(exe) = std::env::current_exe().ok() {
         if let Some(parent) = exe.parent() {
             candidates.push(parent.join("cards"));
@@ -1106,10 +1189,6 @@ fn resolve_operator_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
             }
         }
     }
-    if let Some(data) = app.path().app_data_dir().ok() {
-        candidates.push(data.join("cards"));
-    }
-
     for dir in &candidates {
         if !dir.exists() {
             continue;
@@ -1125,20 +1204,23 @@ fn resolve_operator_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Resolve the `docs/` directory: the Codex lore source (renamed from
-/// `codex/` 2026-07-17, after the `.md` files moved there). Mirrors
-/// [`resolve_card_path`]: same 5-candidate walk - but joins `"docs"` and
-/// returns the *directory* (not a single file), since it holds a set of
-/// `*.md` files. Returns `None` if no `docs/` dir exists in any candidate
-/// location (graceful: the Codex is optional; the seed loader treats a
-/// missing dir as "nothing to seed").
+/// Resolve the `docs/` directory: the Codex lore source. Portable layout
+/// puts user-authored `.md` files at `<exe_dir>/data/docs/` (user data,
+/// preserved across updates). The dev-repo `docs/` is a fallback candidate
+/// for local development. Returns the *directory* (not a single file),
+/// since it holds a set of `*.md` files. Returns `None` if no `docs/` dir
+/// exists in any candidate location (graceful: the Codex is optional; the
+/// seed loader treats a missing dir as "nothing to seed").
 fn resolve_codex_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(d) = app.path().resource_dir().ok() {
-        candidates.push(d.join("docs"));
-    }
+    // Portable layout FIRST: codex is user data, lives in `<exe_dir>/data/docs/`.
+    // The user authors `.md` files here via the Codex UI (codex.rs writes the
+    // files directly). This MUST be the primary candidate so user edits are
+    // found; the dev-repo `docs/` below is only for local development.
+    candidates.push(resolve_portable_data_dir(app).join("docs"));
     if let Some(exe) = std::env::current_exe().ok() {
         if let Some(parent) = exe.parent() {
+            // Dev-repo layout: `<repo>/docs/` (exe lives in target/release).
             candidates.push(parent.join("docs"));
             if let Some(grand) = parent.parent().and_then(|g| g.parent()) {
                 candidates.push(grand.join("docs"));
@@ -1147,9 +1229,6 @@ fn resolve_codex_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
                 candidates.push(gg.join("docs"));
             }
         }
-    }
-    if let Some(data) = app.path().app_data_dir().ok() {
-        candidates.push(data.join("docs"));
     }
 
     for dir in &candidates {
@@ -1164,20 +1243,17 @@ fn resolve_codex_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
 /// Resolve the `cards/wupi_knowledge/` directory: the home of Wupi's non-
 /// editable system knowledge (the Phase 2 firewall's read-only seed source).
 ///
-/// Mirrors [`resolve_codex_dir`]: same 5-candidate walk (resource_dir, exe
-/// parent/grandparent/great-grandparent, app_data_dir), but joins
-/// `cards/wupi_knowledge`. Returns `None` if no such dir exists (graceful -
-/// the system knowledge is optional; the seed loader treats a missing dir as
-/// "nothing to seed"). The path sits alongside `cards/Wupi.sim` and
-/// `cards/game_cards/`: all three are bundled tracked text assets, not
-/// user-writable state.
-fn resolve_wupi_knowledge_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+/// Walks the exe-relative candidate list (portable layout: `<exe_dir>/cards/
+/// wupi_knowledge` first; dev-repo paths as fallback). Returns `None` if no
+/// such dir exists (graceful - the system knowledge is optional; the seed
+/// loader treats a missing dir as "nothing to seed"). The path sits alongside
+/// `cards/Wupi.sim` and `cards/game_cards/`: all three are bundled tracked
+/// text assets, not user-writable state.
+fn resolve_wupi_knowledge_dir(_app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Some(d) = app.path().resource_dir().ok() {
-        candidates.push(d.join("cards").join("wupi_knowledge"));
-    }
     if let Some(exe) = std::env::current_exe().ok() {
         if let Some(parent) = exe.parent() {
+            // Portable layout: `<exe_dir>/cards/wupi_knowledge`.
             candidates.push(parent.join("cards").join("wupi_knowledge"));
             if let Some(grand) = parent.parent().and_then(|g| g.parent()) {
                 candidates.push(grand.join("cards").join("wupi_knowledge"));
@@ -1186,9 +1262,6 @@ fn resolve_wupi_knowledge_dir(app: &tauri::AppHandle) -> Option<std::path::PathB
                 candidates.push(gg.join("cards").join("wupi_knowledge"));
             }
         }
-    }
-    if let Some(data) = app.path().app_data_dir().ok() {
-        candidates.push(data.join("cards").join("wupi_knowledge"));
     }
 
     for dir in &candidates {
@@ -2921,9 +2994,6 @@ fn resolve_game_cards_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> 
             }
         }
     }
-    if let Some(data) = app.path().app_data_dir().ok() {
-        candidates.push(data.join("cards").join("game_cards"));
-    }
 
     for dir in &candidates {
         if dir.is_dir() {
@@ -2976,10 +3046,7 @@ async fn save_session(
     card_id: &str,
     conv: &session::Conversation,
 ) {
-    use tauri::Manager;
-    let Some(data_dir) = app.path().app_data_dir().ok() else {
-        return;
-    };
+    let data_dir = resolve_portable_data_dir(app);
     let path = resolve_session_path(&data_dir, card_id);
     // Clone so the closure owns its data (spawn_blocking needs 'static). The
     // Conversation is a Vec of small messages: cheap to clone relative to a
@@ -3000,8 +3067,7 @@ async fn load_session(
     app: &tauri::AppHandle,
     card_id: &str,
 ) -> Option<session::Conversation> {
-    use tauri::Manager;
-    let data_dir = app.path().app_data_dir().ok()?;
+    let data_dir = resolve_portable_data_dir(app);
     let path = resolve_session_path(&data_dir, card_id);
     let path_cloned = path.clone();
     tokio::task::spawn_blocking(move || session::Conversation::load(&path_cloned))
@@ -3021,10 +3087,7 @@ async fn save_schema(
     card_id: &str,
     schema: &schema::WorldSchema,
 ) {
-    use tauri::Manager;
-    let Some(data_dir) = app.path().app_data_dir().ok() else {
-        return;
-    };
+    let data_dir = resolve_portable_data_dir(app);
     let path = resolve_schema_path(&data_dir, card_id);
     let schema = schema.clone();
     let _ = tokio::task::spawn_blocking(move || {
@@ -3042,8 +3105,7 @@ async fn load_schema(
     app: &tauri::AppHandle,
     card_id: &str,
 ) -> Option<schema::WorldSchema> {
-    use tauri::Manager;
-    let data_dir = app.path().app_data_dir().ok()?;
+    let data_dir = resolve_portable_data_dir(app);
     let path = resolve_schema_path(&data_dir, card_id);
     let path_cloned = path.clone();
     tokio::task::spawn_blocking(move || schema::WorldSchema::load(&path_cloned))

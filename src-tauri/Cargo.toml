@@ -12,11 +12,11 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
-# Tauri updater: signed-update distribution + the process plugin it needs
-# for relaunch-on-install. Both driven from the JS side (check() +
-# downloadAndInstall() + relaunch()); Rust just registers them.
-tauri-plugin-updater = "2"
-tauri-plugin-process = "2"
+# NOTE: tauri-plugin-updater + tauri-plugin-process were removed when WUPI
+# switched to portable distribution. Tauri's updater is installer-only and
+# can't update a portable exe; a custom file-level updater (src/updater.rs)
+# replaces it. Relaunch-on-update uses Tauri's built-in `app.restart()`
+# (core API, no plugin needed).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Async runtime for the agent loop + streaming.
@@ -58,6 +58,10 @@ roxmltree = "0.10"
 # Randomized startup introduction selection (one pick per boot from the active
 # card's <introductions> list). The canonical RNG; not otherwise in the tree.
 rand = "0.9"
+# Zip extraction for the portable self-updater. Pure-Rust, no system deps.
+# The updater downloads a portable.zip from the GitHub release and extracts it
+# in place, skipping the `data/` dir (user state). See src/updater.rs.
+zip = "2"
 # Windows API bindings — official Microsoft crate (Win32 + WinRT). Used for
 # the hardware integrations: Core Audio (volume + output switching), WLAN
 # (Wi-Fi scan/connect), and Bluetooth (radio + device enumeration). Feature

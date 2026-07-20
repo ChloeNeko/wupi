@@ -1,6 +1,8 @@
 node_modules/
+keys/
 dist/
 dist-ssr/
+target/
 src-tauri/target/
 src-tauri/**/*.log
 src-tauri/**/debug/

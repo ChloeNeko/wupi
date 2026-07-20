@@ -2721,106 +2721,6 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     windowOpenHooks.set('codex', () => { loadAll(); showEmptyReader(); });
   })();
 
-  // Ink reveal: paces streamed text to a smooth 10 chars/sec on the DOM,
-  // independent of how fast the backend generates. The backend finishes in
-  // ~1-2s for a typical turn but the user reads at ~10 cps, so the UI drips
-  // the text out of a buffer on a timer. The blinking caret (`.streaming`
-  // class on the bubble) stays on until the reveal catches up to the full
-  // target. Shared by the chat path now and the game/narrator path when it
-  // ships; the helper is agnostic to the source of the text.
-  const REVEAL_TICK_MS = 100;       // 10 ticks/sec
-  const REVEAL_CHARS_PER_TICK = 1;  // 10 chars/sec total
-
-  // The currently-active reveal, if any. Module-level so a new send() can
-  // flush a still-draining previous reveal before starting its own.
-  let activeReveal = null;
-
-  // Start an ink reveal on `bubble`. Returns a handle with push/flush/destroy.
-  // The caller pushes the full accumulated text on every chunk; the helper
-  // advances a visible cursor on a timer and writes `target.slice(0, shown)`
-  // to `bubble.textContent`.
-  //
-  // `onTick` (optional) fires after every visible write (e.g. to scroll).
-  // `onComplete` (optional) fires once when the caller signals the target is
-  // final (push with isFinal=true) AND the reveal has shown all of it. This
-  // is the hook for finalizing the bubble (removing the caret, showing the
-  // reasoning panel). If the reveal already caught up when the final push
-  // arrives, onComplete fires synchronously; otherwise it fires from the
-  // tick loop when shown reaches target.length.
-  function startInkReveal(bubble, onTick, onComplete) {
-    let target = '';
-    let shown = 0;
-    let timer = null;
-    let finalArmed = false;   // caller pushed isFinal=true
-    let completed = false;    // onComplete has fired
-    const clearActive = () => {
-      if (activeReveal === api) activeReveal = null;
-    };
-    const stop = () => {
-      if (timer !== null) { clearInterval(timer); timer = null; }
-    };
-    const write = () => {
-      bubble.textContent = target.slice(0, shown);
-      if (typeof onTick === 'function') onTick();
-    };
-    const maybeComplete = () => {
-      if (finalArmed && !completed && shown >= target.length) {
-        completed = true;
-        stop();
-        clearActive();
-        if (typeof onComplete === 'function') onComplete();
-      }
-    };
-    const tick = () => {
-      if (shown < target.length) {
-        shown = Math.min(shown + REVEAL_CHARS_PER_TICK, target.length);
-        write();
-      } else {
-        // Nothing left to drip. Stop the timer; restart on next push.
-        stop();
-      }
-      maybeComplete();
-    };
-    const api = {
-      // Set the full target text. isFinal=true marks it as the last push
-      // (backend sent `done`): onComplete fires when the reveal catches up.
-      // A new push always re-arms completion (a previously-completed reveal
-      // can fire onComplete again if more final text arrives, e.g. the user
-      // clicked stop mid-reveal, the reveal flushed, then `done` arrived).
-      push(fullText, isFinal) {
-        target = fullText;
-        if (isFinal) {
-          finalArmed = true;
-          completed = false;
-        }
-        if (shown < target.length && timer === null) {
-          timer = setInterval(tick, REVEAL_TICK_MS);
-        }
-        maybeComplete();
-      },
-      // Reveal everything immediately and stop. Used when the caller wants
-      // to skip ahead (user clicked stop, or a new send preempts this one).
-      flush(fullText) {
-        if (fullText != null) target = fullText;
-        shown = target.length;
-        stop();
-        write();
-        maybeComplete();
-        // flush is not necessarily "final" — if the caller wants onComplete
-        // to fire, push(finalText, true) before flushing, or the caller's
-        // own done-handling runs after flush returns.
-      },
-      // Tear down without a final write or completion fire (used on error:
-      // the bubble is removed anyway).
-      destroy() {
-        stop();
-        clearActive();
-      },
-    };
-    activeReveal = api;
-    return api;
-  }
-
   // WUPI CHAT: full streaming chat surface
   (function wupiChat() {
     const msgsEl = document.getElementById('chatMessages');
@@ -2921,10 +2821,6 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       const text = inputEl.value.trim();
       if (!text) return;
 
-      // If a previous reveal is still dripping, flush it to completion so the
-      // user sees the full previous reply before the new one starts.
-      if (activeReveal) activeReveal.flush();
-
       inputEl.value = '';
       addUserBubble(text);
 
@@ -2932,49 +2828,34 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       let streamed = '';
       setGenerating(true);
 
-      // The reveal's onComplete finalizes the bubble: removes the caret,
-      // sets the final text, appends the reasoning panel. Fires when the
-      // backend has sent `done` AND the 10 cps timer has shown all the text.
-      let pendingFinalize = null;  // {finalText, reasoning}
-      const reveal = startInkReveal(
-        bubble,
-        () => scrollBottom(),
-        () => {
-          if (pendingFinalize) {
-            const { finalText, reasoning } = pendingFinalize;
-            pendingFinalize = null;
-            finalizeWupiBubble(bubble, finalText, reasoning);
-          }
-        },
-      );
-
+      // No client-side pacing: chunks write straight to the bubble at the
+      // backend's natural ~30 tok/s speed. The backend's StreamFilter
+      // (stream_filter.rs) already strips protocol markers (<|channel|>,
+      // <audio|>, etc.) before they reach the DOM, so the visible text is
+      // clean prose live. The .streaming class on the bubble drives the
+      // blinking caret CSS until `done` finalizes it.
       const channel = new Channel();
       channel.onmessage = (e) => {
         if (!e) return;
         if (e.type === 'chunk') {
           streamed += e.text || '';
-          reveal.push(streamed);
+          bubble.textContent = streamed;
+          scrollBottom();
         } else if (e.type === 'error') {
-          reveal.destroy();
           setGenerating(false);
           // Replace the partial bubble with an error notice.
           bubble.remove();
           addErrorBubble(e.message || 'Generation failed.');
         } else if (e.type === 'done') {
-          // Backend finished. Arm the finalize; the reveal fires onComplete
-          // either synchronously (short reply, already drained) or when the
-          // timer catches up to the final text.
           setGenerating(false);
           const finalText = e.final_text != null ? e.final_text : streamed;
-          pendingFinalize = { finalText, reasoning: e.reasoning || '' };
-          reveal.push(finalText, true);
+          finalizeWupiBubble(bubble, finalText, e.reasoning || '');
         }
       };
 
       invoke('chat_send', { text, onEvent: channel })
         .catch((err) => {
           if (generating) {
-            reveal.destroy();
             setGenerating(false);
             bubble.remove();
             addErrorBubble('Failed to send: ' + err);
@@ -2984,10 +2865,6 @@ const dropdownMenu = document.getElementById('dropdownMenu');
 
     sendBtn?.addEventListener('click', send);
     stopBtn?.addEventListener('click', () => {
-      // If a reveal is still dripping, flush it so the user sees the full
-      // text immediately on stop. The backend will then send done/error
-      // which finalizes the bubble.
-      if (activeReveal) activeReveal.flush();
       invoke('chat_stop').catch((e) => console.warn('[Wupi] chat_stop failed', e));
     });
 
@@ -3019,10 +2896,31 @@ const dropdownMenu = document.getElementById('dropdownMenu');
         });
     }
     windowOpenHooks.set('chat', loadIntro);
-    // Tear down an active ink-reveal timer when the chat window closes so it
-    // doesn't keep ticking against a detached bubble node.
-    windowCloseHooks.set('chat', () => {
-      if (activeReveal) activeReveal.destroy();
-    });
     loadIntro();
   })();
+
+// ─── Portable self-updater (ships DARK) ─────────────────────────────────────
+//
+// WUPI is now a portable app; updates are file-level (src-tauri/src/updater.rs)
+// instead of the Tauri NSIS-installer updater. This bootstrap is SHIPPED DARK:
+// it checks for updates silently on boot and logs to devtools only. No toast,
+// no button — the apply path needs hands-on Windows verification (the locked-
+// exe rename-and-relaunch dance) before beta testers get a button to click.
+//
+// To flip it live: surface a toast in `onUpdateAvailable` and a "Restart now"
+// button that calls `invoke('updater_apply', { update })` then `relaunch()`.
+// The IPC surface is complete; only the visible UI is missing by design.
+(function updaterBootstrap() {
+  const CHECK_DELAY_MS = 4000;  // post-boot, after the splash settles
+  function check() {
+    invoke('updater_check')
+      .then((update) => {
+        if (!update) return;  // on latest
+        // DARK: just log. Flip this to a toast + apply button when ready.
+        console.info('[Wupi] update available:', update.version, '→', update.url);
+        window.__wupiUpdatePending = update;  // exposed for devtools testing
+      })
+      .catch((e) => console.warn('[Wupi] updater_check failed', e));
+  }
+  setTimeout(check, CHECK_DELAY_MS);
+})();

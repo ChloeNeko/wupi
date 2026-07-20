@@ -1,16 +1,4 @@
 <user_profile>
-  <!--
-    The Operator's identity profile. Wupi reads this every turn (hot-reloaded,
-    NOT episodic memory) to know who she is talking to.
-
-    Edit via the in-app Profile Editor, or fill in the two CDATA fields below.
-    Only <name> and <description> are read; everything else is ignored.
-
-    Format (strict XML, CDATA-wrapped prose — same parser as .sim cards):
-      <name>         A short identifier (name, handle, or alias).
-      <description>  Free-form prose: who you are, how you want to be treated,
-                     any context Wupi should always carry about you.
-  -->
   <name><![CDATA[]]></name>
   <description><![CDATA[]]></description>
 </user_profile>
