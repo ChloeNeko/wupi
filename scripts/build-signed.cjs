@@ -61,14 +61,21 @@ for (let i = 0; i < argv.length; i++) {
 }
 
 // ── Resolve the private key path. ──
+// Repo-relative `keys/wupi.key` wins (matches the project's gitignored
+// `keys/` convention); falls back to `~/.tauri/wupi.key` for legacy setups.
+// Override with --key-path or WUPI_SIGNING_KEY_PATH.
+const repoRoot = join(__dirname, '..');
+const repoRootKeyPath = join(repoRoot, 'keys', 'wupi.key');
+const homeKeyPath = join(homedir(), '.tauri', 'wupi.key');
 const keyPath = keyPathOverride
   || process.env.WUPI_SIGNING_KEY_PATH
-  || join(homedir(), '.tauri', 'wupi.key');
+  || (existsSync(repoRootKeyPath) ? repoRootKeyPath : homeKeyPath);
 
 if (!existsSync(keyPath)) {
   console.error(`[build-signed] private key not found at: ${keyPath}`);
   console.error('[build-signed] generate one with:');
-  console.error('  npx @tauri-apps/cli signer generate -w ~/.tauri/wupi.key');
+  console.error('  npx @tauri-apps/cli signer generate -w keys/wupi.key');
+  console.error('  (or set WUPI_SIGNING_KEY_PATH to point elsewhere)');
   process.exit(1);
 }
 
@@ -99,7 +106,9 @@ if (!privateKey) {
 //    env vars as INPUT here, but pass only the correct one to the child
 //    process below.
 // ──
-const pwFilePath = join(homedir(), '.tauri', 'wupi.key.pw');
+const pwFilePath = existsSync(join(repoRoot, 'keys', 'wupi.key.pw'))
+  ? join(repoRoot, 'keys', 'wupi.key.pw')
+  : join(homedir(), '.tauri', 'wupi.key.pw');
 let password = '';
 if (passwordFromArg) {
   password = passwordFromArg;
@@ -110,7 +119,7 @@ if (passwordFromArg) {
 } else if (existsSync(pwFilePath)) {
   try {
     password = readFileSync(pwFilePath, 'utf8').replace(/\r?\n$/, '');
-    console.log('[build-signed] password loaded from ~/.tauri/wupi.key.pw');
+    console.log(`[build-signed] password loaded from ${pwFilePath}`);
   } catch (e) {
     console.error(`[build-signed] failed to read password file: ${e.message}`);
     process.exit(1);

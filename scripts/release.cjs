@@ -36,6 +36,32 @@ const { join } = require('path');
 const { homedir } = require('os');
 const { spawn, spawnSync } = require('child_process');
 
+// Windows-tolerant recursive delete. Node's `fs.rmSync` returns EPERM when
+// Defender (MsMpEng.exe) or Search Indexer (SearchIndexer.exe) briefly holds
+// a handle on a freshly-written .exe or its containing dir — even an EMPTY
+// dir can be "busy" for several seconds after the build. `force:true` only
+// swallows ENOENT, not EPERM. Retry with exponential backoff so a transient
+// OS lock doesn't crash the release AFTER the build already succeeded.
+//
+// Returns true on success, false if it gave up (caller decides whether to
+// fall back to a fresh versioned stage dir).
+const rmSyncRetry = (target, { retries = 6, baseDelayMs = 500 } = {}) => {
+  for (let i = 0; i < retries; i++) {
+    try {
+      rmSync(target, { recursive: true, force: true });
+      return true;
+    } catch (e) {
+      if (e.code === 'ENOENT') return true;  // already gone — fine
+      // EPERM/EBUSY: wait and retry. Anything else (e.g. ENOTDIR): throw.
+      if (e.code !== 'EPERM' && e.code !== 'EBUSY') throw e;
+      const delay = baseDelayMs * Math.pow(2, i);
+      console.warn(`[release] rmSync ${e.code} on ${target}; retry ${i + 1}/${retries} in ${delay}ms…`);
+      spawnSync('sleep', [String(Math.ceil(delay / 1000))]);
+    }
+  }
+  return false;
+};
+
 // ── Parse args ──
 const argv = process.argv.slice(2);
 let bumpKind = 'patch';   // 'patch' | 'minor' | 'major' | null
@@ -49,12 +75,23 @@ for (const a of argv) {
 
 // ──────────────────────────────────────────────────────────────────────────
 // Step 0: Resolve the signing key + password (mirrors build-signed.cjs).
+//
+// Key location: repo-relative `keys/` (gitignored — see .gitignore:2). The
+// historical default of `~/.tauri/wupi.key` is kept as a fallback so we
+// don't break anyone who set things up the old way, but `keys/` wins.
+// Override with WUPI_SIGNING_KEY_PATH if you want to point elsewhere.
 // ──────────────────────────────────────────────────────────────────────────
-const keyPath = join(homedir(), '.tauri', 'wupi.key');
+// __dirname is available immediately in CJS; `repoRoot` (defined in Step 1
+// below) isn't yet. Use __dirname to compute the key path here.
+const repoRootKeyPath = join(__dirname, '..', 'keys', 'wupi.key');
+const homeKeyPath = join(homedir(), '.tauri', 'wupi.key');
+const keyPath = process.env.WUPI_SIGNING_KEY_PATH
+  || (existsSync(repoRootKeyPath) ? repoRootKeyPath : homeKeyPath);
 if (!existsSync(keyPath)) {
   console.error(`[release] private key not found at: ${keyPath}`);
   console.error('[release] generate one with:');
-  console.error('  npx @tauri-apps/cli signer generate -w ~/.tauri/wupi.key');
+  console.error('  npx @tauri-apps/cli signer generate -w keys/wupi.key');
+  console.error('  (or set WUPI_SIGNING_KEY_PATH to point elsewhere)');
   process.exit(1);
 }
 let privateKey;
@@ -66,20 +103,23 @@ try {
 }
 
 // Password resolution (priority: TAURI_SIGNING_PRIVATE_KEY_PASSWORD env >
-// ~/.tauri/wupi.key.pw > empty).
+// keys/wupi.key.pw > empty). Looks in the repo-relative `keys/` dir first
+// (same convention as the private key above), falls back to ~/.tauri/.
 //
 // IMPORTANT: Tauri's signer reads `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
 // (NOT `TAURI_KEY_PASSWORD` — that's an older name the signer no longer
 // recognizes; setting it silently falls through to the interactive rpassword
 // prompt and hangs the build). Verified against `tauri signer sign --help`.
-const pwFilePath = join(homedir(), '.tauri', 'wupi.key.pw');
+const repoRootPwPath = join(__dirname, '..', 'keys', 'wupi.key.pw');
+const homePwPath = join(homedir(), '.tauri', 'wupi.key.pw');
+const pwFilePath = existsSync(repoRootPwPath) ? repoRootPwPath : homePwPath;
 let password = '';
 if (process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
   password = process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD;
 } else if (existsSync(pwFilePath)) {
   try {
     password = readFileSync(pwFilePath, 'utf8').replace(/\r?\n$/, '');
-    console.log('[release] password loaded from ~/.tauri/wupi.key.pw');
+    console.log(`[release] password loaded from ${pwFilePath}`);
   } catch (e) {
     console.error(`[release] failed to read password file: ${e.message}`);
     process.exit(1);
@@ -130,6 +170,18 @@ if (bumpKind && !dryRun) {
   if (commit.status !== 0) { console.error('[release] git add failed'); process.exit(1); }
   const cm = spawnSync('git', ['commit', '-m', `release: ${tag}`], { stdio: 'inherit' });
   if (cm.status !== 0) { console.error('[release] git commit failed'); process.exit(1); }
+  // Push the bump commit IMMEDIATELY so the tag `gh release create` later
+  // attaches actually exists on the remote. Without this, if `--target
+  // ui-shell` resolves to the unpushed local HEAD, GitHub stores a dangling
+  // tag pointing at a commit nobody can fetch. (Bite we hit on v0.2.1/v0.2.2.)
+  console.log(`[release] pushing ui-shell to origin…`);
+  const push = spawnSync('git', ['push', 'origin', 'ui-shell'], { stdio: 'inherit', cwd: repoRoot });
+  if (push.status !== 0) {
+    console.error('[release] git push failed. The version-bump commit is local-only; aborting');
+    console.error('           before tagging a remote-pointing release. Push manually and re-run');
+    console.error('           with `--no-bump`.');
+    process.exit(1);
+  }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -188,11 +240,21 @@ if (dryRun) {
 
 // ──────────────────────────────────────────────────────────────────────────
 // Step 4: Collect the artifacts (signed installer + signature + zips).
+//
+// Staging dir is `target/release/` — one folder, overwritten each release.
+// We don't keep historical stage dirs lying around; the GitHub Release is
+// the persistent artifact store. The retry-on-rmSync handles Defender /
+// Search Indexer briefly locking freshly-written .exe files.
 // ──────────────────────────────────────────────────────────────────────────
 const nsisDir = join(repoRoot, 'src-tauri', 'target', 'release', 'bundle', 'nsis');
 const msiDir = join(repoRoot, 'src-tauri', 'target', 'release', 'bundle', 'msi');
-const stageDir = join(repoRoot, 'target', 'release-stage');
-rmSync(stageDir, { recursive: true, force: true });
+const stageDir = join(repoRoot, 'target', 'release');
+if (!rmSyncRetry(stageDir)) {
+  console.error(`[release] could not clear ${stageDir} after retries (OS lock).`);
+  console.error('[release] Aborting rather than staging into a half-cleaned dir.');
+  console.error('[release] Reboot clears the OS handle, then re-run with --no-bump.');
+  process.exit(1);
+}
 mkdirSync(stageDir, { recursive: true });
 
 const copyIf = (srcFile) => {
