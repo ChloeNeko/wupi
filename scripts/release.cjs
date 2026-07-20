@@ -236,19 +236,25 @@ if (dryRun) {
 // ──────────────────────────────────────────────────────────────────────────
 // Step 4: Stage the portable-zip layout (AGENTS.md §8C).
 //
-// The zip mirrors what a tester extracts to their Desktop:
-//   WUPI/
-//   ├── wupi.exe                      (from target/release/)
-//   ├── wupi.html, paw.png, assets/   (from dist/ — Vite emits wupi.html as
-//   │                                  the entry per §8C; tauri.conf.json's
-//   │                                  window `url: wupi.html` loads it)
-//   ├── data/                         (engine-shipped identity content)
-//   │   ├── wupi.sim                  (Wupi's ACTIVE persona, lowercase w,
-//   │   │                              single copy — Chloe's personal content)
-//   │   └── user.xml                  (EMPTY template — user authors via the
-//   │                                  Profile Editor; preserved on update)
-//   └── (no memory/, models/, apps/ — those are USER DATA, created on first
-//        run by setup() and preserved across updates per §8C)
+// The IN-ZIP layout is FLAT (files at the zip root, no WUPI/ wrapper).
+// The zip FILENAME `WUPI.zip` is what creates the outer WUPI/ folder on
+// extract: Windows Explorer's "Extract All…" derives the destination
+// folder from the zip's basename, so extracting WUPI.zip yields
+// `<dest>/WUPI/{wupi.exe, wupi.html, data/, assets/}`. Putting WUPI/
+// INSIDE the zip too produced the WUPI/WUPI/ double-folder bug.
+//
+// Flat in-zip layout (what Windows Explorer shows inside WUPI.zip):
+//   wupi.exe                      (from target/release/)
+//   wupi.html, paw.png, assets/   (from dist/ — Vite emits wupi.html as
+//                                  the entry per §8C; tauri.conf.json's
+//                                  window `url: wupi.html` loads it)
+//   data/                         (engine-shipped identity content)
+//   ├── wupi.sim                  (Wupi's ACTIVE persona, lowercase w,
+//   │                              single copy — Chloe's personal content)
+//   └── user.xml                  (EMPTY template — user authors via the
+//                                  Profile Editor; preserved on update)
+//   (no memory/, models/, apps/ — those are USER DATA, created on first
+//    run by setup() and preserved across updates per §8C)
 //
 // The shipped `data/` contains ONLY the engine-supplied identity content
 // (persona + empty profile template). All runtime user state (memory.sqlite,
@@ -259,6 +265,12 @@ if (dryRun) {
 // codex library), created lazily when the user authors their first codex
 // entry. The engine-only dev docs (UPDATER_SETUP.md) have no place in a
 // user install.
+//
+// UPDATER COMPATIBILITY: src-tauri/src/updater.rs `apply_extracted` uses
+// `src.strip_prefix(extracted)` and writes to `exe_dir.join(rel)`. That
+// assumes a FLAT in-zip layout — if the zip wrapped files in WUPI/, the
+// updater would write `<exe_dir>/WUPI/wupi.exe` (wrong). So this flat
+// layout is load-bearing for the updater too, not just for human extracts.
 // ──────────────────────────────────────────────────────────────────────────
 const builtExe = join(repoRoot, 'src-tauri', 'target', 'release', 'wupi.exe');
 if (!existsSync(builtExe)) {
@@ -349,11 +361,13 @@ if (!dryRun) {
   console.log(`[release] zipping → ${zipName}…`);
   try {
     const zip = new AdmZip();
-    // addLocalFolder's 2nd arg is the IN-ZIP destination path. Passing 'WUPI'
-    // places the staged tree at WUPI/ in the zip, so extracting produces a
-    // single WUPI/ folder (not a flat dump of wupi.exe into wherever the user
-    // extracts). Matches the "single self-contained folder" portable promise.
-    zip.addLocalFolder(stageWupiDir, 'WUPI');
+    // addLocalFolder's 2nd arg is the IN-ZIP destination path. Empty string =
+    // zip root: the files (wupi.exe, wupi.html, data/, assets/) sit at the
+    // TOP of the zip, NOT under a WUPI/ subdir. The filename `WUPI.zip`
+    // itself creates the outer WUPI/ folder when Windows Explorer extracts
+    // (double-zip-prevention: WUPI/WUPI/ would be the bug). The updater's
+    // apply_extracted uses strip_prefix(extracted) → expects flat layout.
+    zip.addLocalFolder(stageWupiDir, '');
     zip.writeZip(zipPath);
   } catch (e) {
     console.error(`[release] adm-zip failed: ${e.message}`);
