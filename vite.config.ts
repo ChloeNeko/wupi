@@ -14,5 +14,13 @@ export default defineConfig({
   build: {
     outDir: "../dist",
     emptyOutDir: true,
+    // The entry HTML is `wupi.html` (renamed from the Vite-default
+    // index.html per AGENTS.md §8C). Vite picks up the entry via
+    // rollupOptions.input; without this it would look for index.html in
+    // the `src` root and emit nothing. The Tauri window's `url: "wupi.html"`
+    // (tauri.conf.json) loads this emitted file at runtime.
+    rollupOptions: {
+      input: "src/wupi.html",
+    },
   },
 });
