@@ -181,33 +181,56 @@ const copyIf = (srcFile) => {
   return false;
 };
 
+// Renames a Tauri-bundled filename to a cleaner public-facing name.
+// Tauri's defaults bake in `_x64` (the only arch WUPI ships — Windows 64-bit
+// only, there will never be an x86 build) and `_en-US` (the only locale —
+// WUPI is English-only for the beta). Both add visual noise without info.
+//   WUPI_0.1.0_x64-setup.exe           → WUPI_0.1.0-setup.exe
+//   WUPI_0.1.0_x64_en-US.msi           → WUPI_0.1.0.msi
+const cleanName = (f) => f.replace(/_x64/, '').replace(/_en-US/, '');
+
+// Only stage files for the CURRENT version. Tauri doesn't clean the nsis/msi
+// bundle dirs between builds, so older version builds (e.g. WUPI_0.1.0-*
+// lingering when releasing 0.1.1) would otherwise get staged too. Filtering
+// by version prefix guarantees a clean stage dir with only this release's
+// artifacts.
+const versionPrefix = `WUPI_${newVersion}_`;
+const isCurrentVersion = (f) => f.startsWith(versionPrefix);
+
+const copyClean = (srcFile) => {
+  if (!existsSync(srcFile)) return null;
+  const original = require('path').basename(srcFile);
+  if (!isCurrentVersion(original)) return null;
+  const cleaned = cleanName(original);
+  copyFileSync(srcFile, join(stageDir, cleaned));
+  return cleaned;
+};
+
 // Primary: NSIS installer + its .sig (Tauri signs the installer directly;
 // the .nsis.zip wrapper form is no longer produced by default in Tauri 2).
 // Secondary: MSI for users who prefer it (not used by the updater).
-let primaryName = null;       // the file the updater downloads + installs
+let primaryName = null;       // CLEANED name of the file the updater downloads
 let sigContent = null;        // contents of the matching .sig file
 if (existsSync(nsisDir)) {
   for (const f of readdirSync(nsisDir)) {
-    const copied = copyIf(join(nsisDir, f));
-    if (!copied) continue;
-    // Pick the NSIS setup exe as the updater payload.
-    if (!primaryName && f.endsWith('-setup.exe')) primaryName = f;
-    // Read the signature content from the .sig sitting next to the setup exe.
-    if (f === `${primaryName}.sig`) {
+    if (!isCurrentVersion(f)) continue;
+    const cleaned = copyClean(join(nsisDir, f));
+    if (!cleaned) continue;
+    // Pick the NSIS setup exe as the updater payload (by CLEANED name).
+    if (!primaryName && cleaned.endsWith('-setup.exe')) primaryName = cleaned;
+    // Signature content goes into the manifest's `signature` field. The
+    // minisig bytes are what Tauri's updater verifies; the original filename
+    // baked into the minisig comment doesn't matter for verification.
+    if (f.endsWith('-setup.exe.sig')) {
       sigContent = readFileSync(join(nsisDir, f), 'utf8').trim();
-    }
-  }
-  // The loop above captures primaryName before seeing its .sig in some
-  // readdir orderings; re-read the .sig now that we know the name.
-  if (primaryName && !sigContent) {
-    const sigPath = join(nsisDir, `${primaryName}.sig`);
-    if (existsSync(sigPath)) {
-      sigContent = readFileSync(sigPath, 'utf8').trim();
     }
   }
 }
 if (existsSync(msiDir)) {
-  for (const f of readdirSync(msiDir)) copyIf(join(msiDir, f));
+  for (const f of readdirSync(msiDir)) {
+    if (!isCurrentVersion(f)) continue;
+    copyClean(join(msiDir, f));
+  }
 }
 
 if (!primaryName || !sigContent) {
@@ -230,9 +253,12 @@ if (dryRun) {
 
 // ──────────────────────────────────────────────────────────────────────────
 // Step 5: Create the GitHub Release + upload artifacts.
-// Uses `gh release create` (gh CLI must be authenticated). If the release
-// already exists (re-releasing same version), --target gh-pages-draft flag
-// is unnecessary; gh handles overwrite via `gh release upload --clobber`.
+//
+// GitHub's upload endpoint (uploads.github.com) intermittently returns
+// 502/503 under load — empirically one of the flakier parts of their API.
+// We retry up to 3 times with a 15s backoff. If a partial-failure left a
+// draft release behind, we delete it before retrying (otherwise the second
+// attempt fails on "tag already exists").
 // ──────────────────────────────────────────────────────────────────────────
 const repo = 'ChloeNeko/WUPI';
 const assetUrl = `https://github.com/${repo}/releases/download/${tag}/${primaryName}`;
@@ -244,31 +270,57 @@ console.log(`[release] creating GitHub Release ${tag}…`);
 // "no matches found". gh accepts absolute paths directly; we pass them as
 // explicit argv to bypass shell interpretation entirely.
 const stagedFiles = readdirSync(stageDir).map(f => join(stageDir, f));
-const ghRelease = spawnSync('gh', [
-  'release', 'create', tag,
-  '--repo', repo,
-  '--title', `WUPI ${tag}`,
-  '--notes', notes,
-  '--target', 'ui-shell',
-  ...stagedFiles,
-], { stdio: 'inherit', cwd: repoRoot });
 
-if (ghRelease.status !== 0) {
-  console.error(`[release] gh release create failed (exit ${ghRelease.status}).`);
-  console.error('[release] if the release already exists, delete it first:');
+let ghRelease = null;
+let releaseOk = false;
+for (let attempt = 1; attempt <= 3; attempt++) {
+  if (attempt > 1) {
+    // Clean up any partial-release leftover from the previous attempt so
+    // `gh release create` doesn't fail on "tag already exists."
+    console.log(`[release] retry ${attempt}/3: cleaning up partial release…`);
+    spawnSync('gh', ['release', 'delete', tag, '--repo', repo, '--yes'],
+              { stdio: 'ignore', cwd: repoRoot });
+    spawnSync('git', ['push', 'origin', `:refs/tags/${tag}`],
+              { stdio: 'ignore', cwd: repoRoot });
+    spawnSync('git', ['tag', '-d', tag], { stdio: 'ignore', cwd: repoRoot });
+    console.log('[release] waiting 15s before retry (GitHub upload 50X backoff)…');
+    spawnSync('sleep', ['15']);
+  }
+  ghRelease = spawnSync('gh', [
+    'release', 'create', tag,
+    '--repo', repo,
+    '--title', `WUPI ${tag}`,
+    '--notes', notes,
+    '--target', 'ui-shell',
+    ...stagedFiles,
+  ], { stdio: 'inherit', cwd: repoRoot });
+  if (ghRelease.status === 0) { releaseOk = true; break; }
+  console.warn(`[release] attempt ${attempt} failed (exit ${ghRelease.status}).`);
+}
+
+if (!releaseOk) {
+  console.error(`[release] gh release create failed after 3 attempts.`);
+  console.error('[release] Last resort — delete + retry manually:');
   console.error(`           gh release delete ${tag} --repo ${repo} --yes`);
+  console.error(`           git push origin :refs/tags/${tag}`);
+  console.error(`           npm run release -- --no-bump`);
   process.exit(ghRelease.status ?? 1);
 }
 console.log(`[release] GitHub Release ${tag} published.`);
 
 // ──────────────────────────────────────────────────────────────────────────
-// Step 6: Write latest.json to the gh-pages branch.
-// Tauri's updater polls this URL:
-//   https://chloeneko.github.io/WUPI/updater/latest.json
-// The manifest format (Tauri v2): version + notes + pub_date + per-platform
-// { signature, url }.
+// Step 6: Write latest.json to the gh-pages branch via the GitHub API.
+//
+// Why API (not `git checkout gh-pages`): the working tree has untracked
+// build outputs (target/, dist/) and source files that conflict with a
+// branch switch — `git checkout gh-pages` fails with "Please commit your
+// changes or stash them" and the manifest then accidentally lands on
+// ui-shell. Using the GitHub Contents API writes the file atomically with
+// no working-tree interaction at all. gh CLI handles the auth + base64.
+//
+// Tauri's updater polls: https://chloeneko.github.io/WUPI/updater/latest.json
 // ──────────────────────────────────────────────────────────────────────────
-console.log('[release] publishing latest.json to gh-pages…');
+console.log('[release] publishing latest.json to gh-pages via GitHub API…');
 const pubDate = new Date().toISOString();
 const manifest = {
   version: newVersion,
@@ -283,56 +335,45 @@ const manifest = {
 };
 const manifestJson = JSON.stringify(manifest, null, 2);
 
-// Write the manifest to a temp file, then push it to gh-pages via a sparse
-// checkout (so we don't pull the whole gh-pages history every release).
-const tmpManifest = join(require('os').tmpdir(), 'wupi-latest.json');
-require('fs').writeFileSync(tmpManifest, manifestJson);
+// The GitHub Contents API requires `content` as base64. Encode it here.
+// (gh api's -F @path reads the file as a raw string — it does NOT base64.)
+const manifestB64 = Buffer.from(manifestJson, 'utf8').toString('base64');
+const tmpManifest = join(require('os').tmpdir(), 'wupi-latest.b64');
+require('fs').writeFileSync(tmpManifest, manifestB64);
 
-const ghPagesOps = [
-  // Branch off fresh if gh-pages doesn't exist; otherwise check it out.
-  ['git', ['fetch', 'origin', 'gh-pages:gh-pages'], { okIfNonZero: true }],
-  ['git', ['checkout', 'gh-pages'], { okIfNonZero: false }],  // success: existing
-  // If checkout failed, create the branch orphan from main
-  ['git', ['checkout', '--orphan', 'gh-pages'], { okIfNonZero: true, onlyIfPrevFailed: true }],
-];
-// Run them as a sequence; simpler than encoding conditional logic into ops.
-const gitRes = {};
-gitRes.fetch = spawnSync('git', ['fetch', 'origin', 'gh-pages:gh-pages'], {
-  cwd: repoRoot, stdio: 'pipe',
-});
-const hadGhPages = gitRes.fetch.status === 0;
-if (hadGhPages) {
-  spawnSync('git', ['checkout', 'gh-pages'], { cwd: repoRoot, stdio: 'inherit' });
-} else {
-  console.log('[release] gh-pages does not exist yet; creating orphan branch…');
-  spawnSync('git', ['checkout', '--orphan', 'gh-pages'], { cwd: repoRoot, stdio: 'inherit' });
-  // Wipe the index (orphan branch starts with everything staged from HEAD)
-  spawnSync('git', ['rm', '-rf', '--cached', '.'], { cwd: repoRoot, stdio: 'ignore' });
+// Look up the existing file's SHA (so we can update rather than create).
+// 404 = file doesn't exist yet (first release); any other error = real problem.
+const existingSha = spawnSync('gh', [
+  'api', `repos/${repo}/contents/updater/latest.json?ref=gh-pages`,
+  '--jq', '.sha',
+], { cwd: repoRoot, stdio: 'pipe', encoding: 'utf8' });
+let shaArg = [];
+if (existingSha.status === 0 && existingSha.stdout.trim()) {
+  shaArg = ['-F', `sha=${existingSha.stdout.trim()}`];
 }
 
-// Copy the manifest into place + commit + push.
-mkdirSync(join(repoRoot, 'updater'), { recursive: true });
-copyFileSync(tmpManifest, join(repoRoot, 'updater', 'latest.json'));
-
-spawnSync('git', ['add', 'updater/latest.json'], { cwd: repoRoot, stdio: 'inherit' });
-const commitManifest = spawnSync('git', [
-  'commit', '-m', `release manifest: ${tag} [skip ci]`,
+// PUT the new content via the Contents API. The `content` field is the
+// base64 we just wrote to tmpManifest; gh's -F @path reads it as a string.
+const putManifest = spawnSync('gh', [
+  'api', `-XPUT`, `repos/${repo}/contents/updater/latest.json`,
+  '-F', `message=release manifest: ${tag} [skip ci]`,
+  '-F', `branch=gh-pages`,
+  '-f', `content=@${tmpManifest}`,  // -f = raw string (no type conversion)
+  ...shaArg,
 ], { cwd: repoRoot, stdio: 'inherit' });
-if (commitManifest.status !== 0) {
-  console.warn('[release] no manifest changes to commit (already up to date?)');
-}
-const pushManifest = spawnSync('git', ['push', 'origin', 'gh-pages'], {
-  cwd: repoRoot, stdio: 'inherit',
-});
-if (pushManifest.status !== 0) {
-  console.error(`[release] failed to push gh-pages (exit ${pushManifest.status}).`);
-  console.error('[release] manifest written locally; manual push needed.');
+
+if (putManifest.status !== 0) {
+  console.error(`[release] gh api PUT to gh-pages failed (exit ${putManifest.status}).`);
+  console.error('[release] The manifest may need a manual push. The release itself');
+  console.error('           is already published; only the updater manifest is at risk.');
+  // Don't exit fatally — the Release is up; testers can still manually download.
+  // The next successful release will fix the manifest.
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Step 7: Switch back to ui-shell so the user's working tree is restored.
+// Step 7: working tree is untouched (we never checked out gh-pages). Nothing
+// to restore. Done.
 // ──────────────────────────────────────────────────────────────────────────
-spawnSync('git', ['checkout', 'ui-shell'], { cwd: repoRoot, stdio: 'inherit' });
 
 console.log('\n[release] ========================================');
 console.log(`[release]  RELEASE ${tag} PUBLISHED`);
