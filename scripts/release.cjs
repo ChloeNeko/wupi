@@ -9,17 +9,17 @@
 // PORTABLE MODEL: WUPI ships as a portable zip — no installer, no uninstaller,
 // nothing installs outside the folder the user extracts to. Updates are
 // file-level (src-tauri/src/updater.rs): the app downloads a new portable
-// zip, extracts it in place, and replaces engine files while preserving
-// everything under `data/` (memory, models, sessions, schemas, theme, api
-// config, user Operator.xml, user docs). The Tauri updater plugin (installer-
-// only) was removed; this script publishes the manifest the custom updater
-// polls.
+// zip, extracts it in place, and replaces engine files while preserving all
+// four user-data top-level dirs (data/, memory/, models/, apps/) per §8C
+// (theme, api config, memory.sqlite, GGUFs, per-card sessions/schemas/cards,
+// user docs, user.xml). The Tauri updater plugin (installer-only) was
+// removed; this script publishes the manifest the custom updater polls.
 //
 // WHAT IT DOES (one command, end-to-end):
 //   1. Auto-bumps the version (patch by default; --minor / --major)
 //   2. Runs `npx tauri build` (produces target/release/wupi.exe)
-//   3. Stages wupi.exe + dist/ + cards/ into a portable-zip layout
-//   4. Zips the staged tree → WUPI_<version>_portable.zip
+//   3. Stages wupi.exe + dist/ + data/ into a portable-zip layout (§8C)
+//   4. Zips the staged tree → WUPI.zip (no version, no "portable")
 //   5. Creates a GitHub Release + uploads the zip
 //   6. Writes latest.json to the gh-pages branch (the manifest the custom
 //      updater polls at https://chloeneko.github.io/WUPI/updater/latest.json)
@@ -234,25 +234,31 @@ if (dryRun) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Step 4: Stage the portable-zip layout.
+// Step 4: Stage the portable-zip layout (AGENTS.md §8C).
 //
 // The zip mirrors what a tester extracts to their Desktop:
 //   WUPI/
 //   ├── wupi.exe                      (from target/release/)
-//   ├── index.html, script.js, …      (from dist/)
-//   ├── cards/
-//   │   ├── Wupi.sim                  (shipped engine file)
-//   │   ├── Operator.xml              (shipped TEMPLATE — copied to data/ on
-//   │   │                               first run; the user's live copy is
-//   │   │                               never overwritten by updates)
-//   │   ├── wupi_knowledge/           (shipped, may be empty)
-//   │   └── game_cards/               (shipped scenario .sim files)
-//   └── (no data/ — created on first run, preserved on update)
+//   ├── wupi.html, paw.png, assets/   (from dist/ — Vite emits wupi.html as
+//   │                                  the entry per §8C; tauri.conf.json's
+//   │                                  window `url: wupi.html` loads it)
+//   ├── data/                         (engine-shipped identity content)
+//   │   ├── wupi.sim                  (Wupi's ACTIVE persona, lowercase w,
+//   │   │                              single copy — Chloe's personal content)
+//   │   └── user.xml                  (EMPTY template — user authors via the
+//   │                                  Profile Editor; preserved on update)
+//   └── (no memory/, models/, apps/ — those are USER DATA, created on first
+//        run by setup() and preserved across updates per §8C)
 //
-// We deliberately do NOT ship a docs/ dir: docs/ is user-owned (their codex
-// library), and the engine-only dev docs (UPDATER_SETUP.md) have no place in
-// a user install. The app creates data/docs/ lazily when the user authors
-// their first codex entry.
+// The shipped `data/` contains ONLY the engine-supplied identity content
+// (persona + empty profile template). All runtime user state (memory.sqlite,
+// GGUFs, roleplay sessions/schemas/cards) is created on first run into the
+// appropriate top-level dir and preserved untouched by updates.
+//
+// We deliberately do NOT ship a docs/ dir: data/docs/ is user-owned (their
+// codex library), created lazily when the user authors their first codex
+// entry. The engine-only dev docs (UPDATER_SETUP.md) have no place in a
+// user install.
 // ──────────────────────────────────────────────────────────────────────────
 const builtExe = join(repoRoot, 'src-tauri', 'target', 'release', 'wupi.exe');
 if (!existsSync(builtExe)) {
@@ -267,11 +273,23 @@ if (!existsSync(distDir)) {
   console.error('[release] the build should have run vite → dist/. Check beforeBuildCommand.');
   process.exit(1);
 }
-const cardsDir = join(repoRoot, 'cards');
-if (!existsSync(join(cardsDir, 'Wupi.sim'))) {
-  console.error(`[release] cards/Wupi.sim not found at: ${cardsDir}`);
-  console.error('[release] Wupi.sim MUST ship in the portable zip — without it the persona');
+if (!existsSync(join(distDir, 'wupi.html'))) {
+  console.error(`[release] dist/wupi.html not found at: ${distDir}`);
+  console.error('[release] the build should have emitted wupi.html (Vite rollupOptions.input).');
+  console.error('           Check vite.config.ts — the §8C rename requires');
+  console.error('           rollupOptions.input = "src/wupi.html".');
+  process.exit(1);
+}
+const srcDataDir = join(repoRoot, 'data');
+if (!existsSync(join(srcDataDir, 'wupi.sim'))) {
+  console.error(`[release] data/wupi.sim not found at: ${srcDataDir}`);
+  console.error('[release] wupi.sim MUST ship in the portable zip — without it the persona');
   console.error('           loader falls back to a stub and the whole app is wrong.');
+  process.exit(1);
+}
+if (!existsSync(join(srcDataDir, 'user.xml'))) {
+  console.error(`[release] data/user.xml not found at: ${srcDataDir}`);
+  console.error('[release] user.xml (the empty profile template) MUST ship in the portable zip.');
   process.exit(1);
 }
 
@@ -291,9 +309,9 @@ mkdirSync(stageWupiDir, { recursive: true });
 
 // wupi.exe at the zip root.
 copyFileSync(builtExe, join(stageWupiDir, 'wupi.exe'));
-// dist/ contents (index.html, script.js, styles.css, paw.png, assets/) at the
-// zip root — flat, NOT under a dist/ subdir. This matches the resolve_*_path
-// walkers which expect assets next to wupi.exe.
+// dist/ contents (wupi.html, paw.png, assets/) at the zip root — flat, NOT
+// under a dist/ subdir. This matches the resolve_*_path walkers which expect
+// assets next to wupi.exe.
 for (const f of readdirSync(distDir)) {
   const src = join(distDir, f);
   const dst = join(stageWupiDir, f);
@@ -304,9 +322,10 @@ for (const f of readdirSync(distDir)) {
     copyFileSync(src, dst);
   }
 }
-// cards/ as a subdir (preserves the cards/game_cards/ and cards/wupi_knowledge/
-// structure the resolvers walk).
-cpSync(cardsDir, join(stageWupiDir, 'cards'), { recursive: true });
+// data/ subdir: engine-shipped identity content only. The user's runtime
+// data/ additions (theme.json, api_config.json, docs/) are created on first
+// run and preserved across updates by the updater's preserve rule (§8C).
+cpSync(srcDataDir, join(stageWupiDir, 'data'), { recursive: true });
 
 console.log(`[release] staged portable layout at ${stageWupiDir}`);
 
@@ -320,10 +339,11 @@ console.log(`[release] staged portable layout at ${stageWupiDir}`);
 // (zero cross-process surface). The Rust `zip` crate already handles the
 // extraction side in the updater; this is the symmetric publish side.
 //
-// Named WUPI_<version>_portable.zip so it's unambiguous in the Release list.
+// Per AGENTS.md §8C the asset name is `WUPI.zip` (no version, no "portable").
+// The latest.json manifest URL points at this stable name.
 // ──────────────────────────────────────────────────────────────────────────
 const AdmZip = require('adm-zip');
-const zipName = `WUPI_${newVersion}_portable.zip`;
+const zipName = `WUPI.zip`;
 const zipPath = join(stageRoot, zipName);
 if (!dryRun) {
   console.log(`[release] zipping → ${zipName}…`);
