@@ -249,6 +249,16 @@ pub fn run() {
             std::fs::create_dir_all(games_dir.join("schemas")).ok();
             std::fs::create_dir_all(games_dir.join("cards")).ok();
             std::fs::create_dir_all(games_dir.join("profiles")).ok();
+            // §8C v0.2.4 → v0.3.0 one-shot boot migration: a v0.2.4 install
+            // has its user state scattered under data/ (memory.sqlite, models/,
+            // sessions/, schemas/, Operator.xml). v0.3.0 promotes those to
+            // top-level dirs (memory/, models/, apps/games/{sessions,schemas}/,
+            // data/user.xml). The updater preserves data/ verbatim, so without
+            // this migration the user's memory + GGUFs (would force a 10GB
+            // re-download!) + roleplay state would be orphaned at their old
+            // paths. Idempotent: only moves when source exists AND target
+            // doesn't, so a v0.3.0+ boot is a complete no-op.
+            migrate_v0_2_4_to_v0_3_0(&data_dir, &memory_dir, &models_dir, &games_dir);
             tracing::info!("portable data dir: {}", data_dir.display());
 
             let state: tauri::State<AppState> = app.state();
@@ -858,6 +868,175 @@ fn resolve_models_dir(app: &tauri::AppHandle) -> std::path::PathBuf {
 /// updates.
 fn resolve_apps_dir(app: &tauri::AppHandle) -> std::path::PathBuf {
     resolve_install_root(app).join("apps")
+}
+
+/// §8C v0.2.4 → v0.3.0 one-shot boot migration. The §8C reorg promoted
+/// memory/, models/, apps/ to top-level siblings of data/. A v0.2.4 install
+/// has its user state scattered under data/ (the old monolithic data dir):
+///   - `data/memory.sqlite` (+ `.wal`, `.shm` sidecars)
+///   - `data/models/*.gguf`
+///   - `data/sessions/<card_id>.json`
+///   - `data/schemas/<card_id>.json`
+///   - `data/Operator.xml`
+/// The updater preserves data/ verbatim, so without this migration those
+/// files would be orphaned at their old paths after a v0.3.0 update (the
+/// resolvers look at the new top-level locations). Result: the user's
+/// chat memory + GGUFs (would force a 10GB re-download!) + roleplay state
+/// would silently disappear.
+///
+/// **Idempotent:** a file moves ONLY when (source exists AND target doesn't
+/// exist). So a v0.3.0+ boot is a complete no-op (sources are already at
+/// their new locations or absent entirely). Safe to run on every boot.
+///
+/// **Best-effort:** errors are logged-and-continued (mirrors the rest of
+/// setup). A partial migration is bad, but a boot-killing migration is worse;
+/// the user can manually finish the move if a single file fails.
+///
+/// `data/{theme.json, api_config.json, docs/*}` stay under data/ in BOTH
+/// layouts — not migrated. The `data/Operator.xml → data/user.xml` rename
+/// is also handled by `resolve_user_path`'s legacy-adoption path; we do it
+/// here too so the rename is unconditional on boot (cleaner state).
+fn migrate_v0_2_4_to_v0_3_0(
+    data_dir: &std::path::Path,
+    memory_dir: &std::path::Path,
+    models_dir: &std::path::Path,
+    games_dir: &std::path::Path,
+) {
+    // Helper: move a single file from src to dst if src exists AND dst is
+    // absent. Idempotent. Returns true iff a move actually happened (for
+    // logging). Errors are logged-and-swallowed by the caller pattern.
+    let move_if = |src: &std::path::Path, dst: &std::path::Path| -> bool {
+        if !src.is_file() || dst.exists() {
+            return false;
+        }
+        match std::fs::rename(src, dst) {
+            Ok(()) => {
+                tracing::info!(
+                    "§8C migration: {} → {}",
+                    src.display(),
+                    dst.display()
+                );
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    ?e,
+                    src = %src.display(),
+                    dst = %dst.display(),
+                    "§8C migration: rename failed; trying copy+delete"
+                );
+                // Cross-volume renames can fail (EXDEV). Fall back to
+                // copy + delete so a volume boundary doesn't strand state.
+                if std::fs::copy(src, dst).is_ok() {
+                    if std::fs::remove_file(src).is_ok() {
+                        tracing::info!(
+                            "§8C migration (copy): {} → {}",
+                            src.display(),
+                            dst.display()
+                        );
+                        return true;
+                    }
+                }
+                tracing::warn!(
+                    src = %src.display(),
+                    "§8C migration: gave up on this file (manual move needed)"
+                );
+                false
+            }
+        }
+    };
+
+    let mut moved = 0usize;
+
+    // 1. memory.sqlite (+ WAL sidecars) → memory/
+    moved += move_if(
+        &data_dir.join("memory.sqlite"),
+        &memory_dir.join("memory.sqlite"),
+    ) as usize;
+    // SQLite WAL mode writes -wal + -shm sidecars next to the main DB. Move
+    // them too if present (a clean shutdown leaves none; a mid-write crash
+    // leaves them). Skipping them on a live DB would corrupt the WAL state.
+    for ext in &["-wal", "-shm"] {
+        let src = data_dir.join(format!("memory.sqlite{ext}"));
+        let dst = memory_dir.join(format!("memory.sqlite{ext}"));
+        move_if(&src, &dst);
+    }
+
+    // 2. models/*.gguf → models/ (the multi-GB weights; the load-bearing one).
+    // Walk data/models/ and move each file into models/. Best-effort: an
+    // unreadable/in-use GGUF is logged-and-skipped (the downloader will
+    // re-fetch on the next boot if missing).
+    let legacy_models = data_dir.join("models");
+    if legacy_models.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&legacy_models) {
+            for entry in entries.flatten() {
+                let src = entry.path();
+                if !src.is_file() {
+                    continue;
+                }
+                let name = match src.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n.to_owned(),
+                    None => continue,
+                };
+                let dst = models_dir.join(&name);
+                moved += move_if(&src, &dst) as usize;
+            }
+        }
+        // Best-effort cleanup of the now-empty legacy dir. ignore_errors: a
+        // leftover GGUF (move failed) keeps it populated, which is correct.
+        let _ = std::fs::remove_dir(&legacy_models);
+    }
+
+    // 3. sessions/<id>.json → apps/games/sessions/<id>.json
+    let legacy_sessions = data_dir.join("sessions");
+    if legacy_sessions.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&legacy_sessions) {
+            for entry in entries.flatten() {
+                let src = entry.path();
+                if !src.is_file() {
+                    continue;
+                }
+                let name = match src.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n.to_owned(),
+                    None => continue,
+                };
+                let dst = games_dir.join("sessions").join(&name);
+                moved += move_if(&src, &dst) as usize;
+            }
+        }
+        let _ = std::fs::remove_dir(&legacy_sessions);
+    }
+
+    // 4. schemas/<id>.json → apps/games/schemas/<id>.json
+    let legacy_schemas = data_dir.join("schemas");
+    if legacy_schemas.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&legacy_schemas) {
+            for entry in entries.flatten() {
+                let src = entry.path();
+                if !src.is_file() {
+                    continue;
+                }
+                let name = match src.file_name().and_then(|n| n.to_str()) {
+                    Some(n) => n.to_owned(),
+                    None => continue,
+                };
+                let dst = games_dir.join("schemas").join(&name);
+                moved += move_if(&src, &dst) as usize;
+            }
+        }
+        let _ = std::fs::remove_dir(&legacy_schemas);
+    }
+
+    // 5. data/Operator.xml → data/user.xml (also handled by resolve_user_path,
+    // but doing it here unconditionally is cleaner state).
+    moved += move_if(
+        &data_dir.join("Operator.xml"),
+        &data_dir.join("user.xml"),
+    ) as usize;
+
+    if moved > 0 {
+        tracing::info!(moved, "§8C migration: v0.2.4 → v0.3.0 layout complete");
+    }
 }
 
 /// The candidate `models/` directories, in search order. Shared by the chat

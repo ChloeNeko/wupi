@@ -6,7 +6,7 @@ const { join } = require('path');
 
 const cacheDir = join(
   process.env.LOCALAPPDATA || join(require('os').homedir(), 'AppData', 'Local'),
-  'com.wupi.app',
+  'com.wupi.desktop',
   'EBWebView'
 );
 
