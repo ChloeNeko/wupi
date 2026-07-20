@@ -77,7 +77,7 @@ pub struct AppState {
     pub schema_engine: Arc<std::sync::Mutex<Option<Arc<schema_engine::SchemaEngine>>>>,
     /// The active simulation card's id: the partition key for Memory
     /// retrieval and archiving (AGENTS.md §2M). Defaults to
-    /// [`memory::WUPI_OS_CARD_ID`] (the Wupi-as-assistant namespace) until
+    /// [`memory::WUPI_CARD_ID`] (the Wupi-as-assistant namespace) until
     /// the character/simulation card system exists; when a card loads, its
     /// loader sets this. Read on every chat turn (search + 2× archive).
     pub active_card_id: Arc<std::sync::Mutex<String>>,
@@ -149,7 +149,7 @@ pub struct AppState {
     /// reads this each `game_send` turn.
     pub active_game_card: Arc<std::sync::Mutex<Option<sim_card::SimCard>>>,
     /// The card id BEFORE a game started, so `game_end` can restore it. The
-    /// system card (`__wupi_os__`) is the default; games swap to the
+    /// system card (`__wupi__`) is the default; games swap to the
     /// roleplay card's id and restore on exit.
     pub pre_game_card_id: Arc<std::sync::Mutex<String>>,
     /// First-run GGUF download progress (see `model_downloader.rs`). Polled
@@ -176,7 +176,7 @@ impl AppState {
             pending_delta: Arc::new(tokio::sync::Mutex::new(None)),
             schema_engine: Arc::new(std::sync::Mutex::new(None)),
             active_card_id: Arc::new(std::sync::Mutex::new(
-                memory::WUPI_OS_CARD_ID.to_owned(),
+                memory::WUPI_CARD_ID.to_owned(),
             )),
             active_card: Arc::new(std::sync::OnceLock::new()),
             operator_path: Arc::new(std::sync::OnceLock::new()),
@@ -191,7 +191,7 @@ impl AppState {
             game_schema: Arc::new(tokio::sync::Mutex::new(schema::WorldSchema::default())),
             game_session: Arc::new(tokio::sync::Mutex::new(session::Conversation::new())),
             active_game_card: Arc::new(std::sync::Mutex::new(None)),
-            pre_game_card_id: Arc::new(std::sync::Mutex::new(memory::WUPI_OS_CARD_ID.to_owned())),
+            pre_game_card_id: Arc::new(std::sync::Mutex::new(memory::WUPI_CARD_ID.to_owned())),
             download_progress: Arc::new(std::sync::Mutex::new(
                 model_downloader::DownloadProgress::default(),
             )),
@@ -208,7 +208,7 @@ pub fn run() {
     }));
 
     let log_dir = std::env::temp_dir();
-    let file_appender = tracing_appender::rolling::never(&log_dir, "wupi_os.log");
+    let file_appender = tracing_appender::rolling::never(&log_dir, "wupi.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
     std::mem::forget(_guard);
     tracing_subscriber::fmt()
@@ -220,7 +220,7 @@ pub fn run() {
         .with_writer(non_blocking)
         .init();
 
-    tracing::info!("=== WUPI OS starting ===");
+    tracing::info!("=== WUPI starting ===");
     tauri::Builder::default()
         .manage(AppState::new())
         .manage(hardware::AudioRegistry)
@@ -284,7 +284,7 @@ pub fn run() {
                 let _ = state.api_config_path.set(api_path);
             }
 
-            // WUPI OS launches into a FRESH session every time: no
+            // WUPI launches into a FRESH session every time: no
             // session.json or world_schema.json load. Memory (memory.sqlite)
             // is the ONLY persistent state; it survives across launches and
             // is how Wupi "remembers" you. The session + schema live only in
@@ -735,7 +735,7 @@ pub fn run() {
                 system_menu::destroy_tray(&app_handle);
             }
         });
-    tracing::info!("=== WUPI OS event loop exited ===");
+    tracing::info!("=== WUPI event loop exited ===");
 }
 
 #[tauri::command]
@@ -2961,7 +2961,7 @@ async fn game_end(
     //    (the in-memory state is cleared regardless; the user just loses the
     //    resume point on a disk error, not the running game).
     let roleplay_card_id = state.active_card_id.lock().expect("active_card_id mutex").clone();
-    if roleplay_card_id != memory::WUPI_OS_CARD_ID {
+    if roleplay_card_id != memory::WUPI_CARD_ID {
         let schema_snapshot = state.game_schema.lock().await.clone();
         let session_snapshot = state.game_session.lock().await.clone();
         save_schema(&app, &roleplay_card_id, &schema_snapshot).await;

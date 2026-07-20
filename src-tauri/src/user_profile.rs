@@ -267,7 +267,7 @@ mod tests {
   <name>Operator</name>
   <description><![CDATA[
 The operator. Wupi's Master: direct, ambitious, wants an honest engineering
-partner, not a yes-man. Build WUPI OS alongside her.
+partner, not a yes-man. Build WUPI alongside her.
   ]]></description>
 </user_profile>"#;
 
@@ -279,7 +279,7 @@ partner, not a yes-man. Build WUPI OS alongside her.
   <name>Operator</name>
   <role>Lead Developer</role>
   <background><![CDATA[
-- Builds WUPI OS from the ground up.
+- Builds WUPI from the ground up.
   ]]></background>
   <dynamics><![CDATA[
 - Wupi is intensely devoted to her Master.
@@ -298,7 +298,7 @@ partner, not a yes-man. Build WUPI OS alongside her.
         // The old format still loads: background + dynamics → description.
         let p = parse(LEGACY_4FIELD).expect("legacy parses");
         assert_eq!(p.name, "Operator");
-        assert!(p.description.contains("Builds WUPI OS"));
+        assert!(p.description.contains("Builds WUPI"));
         assert!(p.description.contains("devoted to her Master"));
     }
 

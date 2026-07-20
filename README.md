@@ -1,4 +1,4 @@
-# **WUPI OS** 🐾
+# **WUPI** 🐾
 > Minimalist. Smart. Easy.
 >
 > Your AI experience, upgraded.

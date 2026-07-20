@@ -61,7 +61,7 @@ body:not(.booting) .top-bar {
     opacity: 1;
 }
 
-/* ── "WUPI OS" title — live AI-status indicator ──────────────────────
+/* ── "WUPI" title — live AI-status indicator ──────────────────────
    The title never pulses on its own. It is one of three states, driven
    by the title-state controller in script.js:
      - idle/boot: steady medium white glow, no animation

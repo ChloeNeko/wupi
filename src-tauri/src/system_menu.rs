@@ -42,7 +42,7 @@ pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .cloned();
 
     let mut builder = TrayIconBuilder::with_id("wupi-tray")
-        .tooltip("WUPI OS")
+        .tooltip("WUPI")
         .menu(&menu)
         .on_tray_icon_event(move |tray, event| {
             // Double-click (left button) wakes the app from sleep / brings it

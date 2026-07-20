@@ -116,11 +116,11 @@ pub struct MemoryEntry {
     /// (character, scene, tags...). Opaque to Memory; verbatim round-trip.
     pub metadata_json: Option<String>,
     /// Partition key: which simulation card this memory belongs to. The
-    /// [`WUPI_OS_CARD_ID`] sentinel is the global Wupi-as-assistant namespace
+    /// [`WUPI_CARD_ID`] sentinel is the global Wupi-as-assistant namespace
     /// (the default until the character/simulation card system exists). Memory
     /// is per-card by design (AGENTS.md §2M): cards never see each other's
-    /// memory; Wupi-as-OS can read across all cards via a separate explicit
-    /// path. NEVER rendered to the model: it is an invisible partition, not
+    /// memory; Wupi can read across all cards via a separate explicit path.
+    /// NEVER rendered to the model: it is an invisible partition, not
     /// content the model needs to reason about.
     pub card_id: String,
     /// Optional session id within a card. The column exists now so the card
@@ -138,7 +138,7 @@ pub struct MemoryEntry {
 /// The default `card_id` for memory that belongs to no specific simulation -
 /// i.e. Wupi-as-assistant conversations outside any card. Until the card
 /// system exists, ALL memory is written under this sentinel.
-pub const WUPI_OS_CARD_ID: &str = "__wupi_os__";
+pub const WUPI_CARD_ID: &str = "__wupi__";
 
 /// Reserved partition for Wupi's non-editable, user-invisible system knowledge
 /// (the OS docs: critical-wall, os-directives-vs-persona, sim-card-format,
@@ -500,7 +500,7 @@ impl<E: Embedder> MemoryEngine<E> {
     /// Returns the **first** chunk's id (chunk_index 0). Existing callers
     /// ignore the return value. `metadata_json` is hardcoded `None` (use
     /// [`Self::add_codex_entry`] for authored reference lore with metadata).
-    /// `card_id` is the partition key: see [`WUPI_OS_CARD_ID`].
+    /// `card_id` is the partition key: see [`WUPI_CARD_ID`].
     pub async fn add_memory(
         &self,
         text: String,
@@ -688,7 +688,7 @@ impl<E: Embedder> MemoryEngine<E> {
     /// lower than chat regardless of which namespace it lives in).
     ///
     /// `active_card_id` is the player's current card (a roleplay card during a
-    /// game, or `WUPI_OS_CARD_ID` for Wupi-as-assistant). The system partition
+    /// game, or `WUPI_CARD_ID` for Wupi-as-assistant). The system partition
     /// is always also queried. `dense_floor` overrides the episodic floor; the
     /// codex floor is always [`crate::memory_rrf::CODEX_DENSE_FLOOR`].
     pub async fn search_wupi_visible(
@@ -1133,7 +1133,7 @@ fn init_schema(conn: &Connection) -> anyhow::Result<()> {
             metadata_json  TEXT,
             -- Per-card partition key (AGENTS.md §2M). Defaults to the Wupi-as-
             -- assistant sentinel so pre-card-system writes land somewhere sane.
-            card_id        TEXT NOT NULL DEFAULT '__wupi_os__',
+            card_id        TEXT NOT NULL DEFAULT '__wupi__',
             -- Optional session id within a card. Filtered on later when the
             -- card system adds session granularity; nullable for now.
             session_id     TEXT,
@@ -1758,7 +1758,7 @@ mod tests {
                 chunk_index: 0,
                 salience: 1.0,
                 metadata_json: metadata.map(str::to_owned),
-                card_id: "__wupi_os__".to_owned(),
+                card_id: "__wupi__".to_owned(),
                 session_id: None,
                 parent_uuid: None,
             },

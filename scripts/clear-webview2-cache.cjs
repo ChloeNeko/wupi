@@ -1,4 +1,4 @@
-// Clears the WebView2 persistent cache for WUPI OS so a freshly-built exe
+// Clears the WebView2 persistent cache for WUPI so a freshly-built exe
 // doesn't serve stale frontend from the previous run. Run before every build.
 // Safe to run when the app is closed; no-op if the cache dir doesn't exist.
 const { rmSync, existsSync } = require('fs');
@@ -6,7 +6,7 @@ const { join } = require('path');
 
 const cacheDir = join(
   process.env.LOCALAPPDATA || join(require('os').homedir(), 'AppData', 'Local'),
-  'com.wupi.os',
+  'com.wupi.app',
   'EBWebView'
 );
 

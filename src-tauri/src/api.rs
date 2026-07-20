@@ -9,7 +9,7 @@
 //! **Storage contract** (mirrors `theme.rs` exactly): `api_config.json` in the
 //! app data dir, atomic save (temp + rename), graceful default on any error.
 //! The file holds real API keys in plaintext: acceptable per the design call
-//! that WUPI OS runs on private offline personal computers with no network
+//! that WUPI runs on private offline personal computers with no network
 //! exposure of the file. NOT cryptographically protected; if WUPI ever gains
 //! network-facing features, move keys to Windows DPAPI first.
 //!

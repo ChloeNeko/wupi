@@ -356,7 +356,7 @@ window.addEventListener('focus', () => {
 // module load would paint stars behind the boot paw (the "background shows
 // with the circle" bug) AND fight the boot gate.
 
-// "WUPI OS" title: live AI-status indicator
+// "WUPI" title: live AI-status indicator
 // The title reflects the live state of the MAIN chat model (local 12B OR the
 // connected API model: NOT Agent.gguf, which runs on its own thread and
 // never drives chat_send). Three states:

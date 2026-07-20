@@ -1,7 +1,7 @@
 //! Simulation Card (`.sim`) loader, parser, and renderer.
 //!
-//! A Simulation Card is the persona artifact for a WUPI OS entity: Wupi's
-//! own card (the OS interface persona) or, later, a roleplay scenario card.
+//! A Simulation Card is the persona artifact for a WUPI entity: Wupi's
+//! own card (the interface persona) or, later, a roleplay scenario card.
 //! Each card carries its own identity, appearance, role, conversational style,
 //! and an introduction list used for the randomized boot greeting.
 //!
@@ -239,7 +239,7 @@ fn parse(xml: &str) -> anyhow::Result<SimCard> {
     // `id` is OPTIONAL and derived from <identity><name> (lowercased) when
     // <metadata> is absent. The metadata block is NOT part of the card format
     // by design: cards stay clean and persona-only. The id is vestigial today
-    // anyway: memory partitioning uses the WUPI_OS_CARD_ID sentinel, not the
+    // anyway: memory partitioning uses the WUPI_CARD_ID sentinel, not the
     // card's id. Keeping a derived id preserves the field for a future
     // roleplay-card partition path without forcing metadata onto every card.
     let name = first_child(root, "identity")
