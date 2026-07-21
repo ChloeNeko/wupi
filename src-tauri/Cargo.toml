@@ -62,6 +62,11 @@ rand = "0.9"
 # The updater downloads a portable.zip from the GitHub release and extracts it
 # in place, skipping the `data/` dir (user state). See src/updater.rs.
 zip = "2"
+# Pseudo-terminal (ConPTY on Windows) for the in-app Terminal drawer
+# (src/terminal.rs). xterm.js in the webview is the visible surface; the real
+# cmd.exe runs headless in a ConPTY this crate provides. The cross-platform
+# API means the same module compiles for non-Windows test builds too.
+portable-pty = "0.8"
 # Windows API bindings — official Microsoft crate (Win32 + WinRT). Used for
 # the hardware integrations: Core Audio (volume + output switching), WLAN
 # (Wi-Fi scan/connect), and Bluetooth (radio + device enumeration). Feature
@@ -71,6 +76,8 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Threading",
     "Win32_NetworkManagement_WiFi",
     "Win32_NetworkManagement_Ndis",
     "Win32_Media_Audio",

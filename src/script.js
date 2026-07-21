@@ -313,6 +313,11 @@ function animate() {
 // Resume mirrors all three. The animate() loop self-gates on `paused`.
 let paused = true;
 let bootDone = false;
+// The running app version, resolved by runBootGate() via getVersion() before
+// the cosmetic terminal stream starts. Referenced by the first TERMINAL_LINES
+// entry so the boot banner reflects the real version instead of a hardcoded
+// stale one. Stays 'unknown' if getVersion() fails (graceful).
+let bootVersion = 'unknown';
 
 function startLoop() {
   // Boot dormancy: refuse to start until setupBootSplash()'s revealAfterLand()
@@ -629,6 +634,8 @@ function spawnLaunchSparkles(parent, count = 18) {
 
   // Live progress listener (throttled to 2/sec from Rust). Updates the bar
   // width + stats line. The poll below is the authoritative fallback.
+  // Together with the poll, BOTH paths feed applyProgress; transitions are
+  // idempotent (guarded by `downloadTerminal`), so double-firing is harmless.
   let progressUnlisten = null;
   try {
     progressUnlisten = await listen('download-progress', (e) => {
@@ -640,8 +647,17 @@ function spawnLaunchSparkles(parent, count = 18) {
     console.warn('[Wupi] download-progress listen failed; falling back to poll only', err);
   }
 
+  // download_models is fire-and-forget as of v0.3.7: it returns Ok(()) on
+  // dispatch and the actual download runs on a detached tokio task. The UI's
+  // terminal transitions (→ LAUNCH button on done, → retry on failed) are
+  // therefore driven by the progress stream's `phase`, NOT by the IPC's
+  // Promise resolution. downloadTerminal guards against double-transition
+  // when both the poll + the live event fire for the same terminal state.
+  let downloadTerminal = false;
+
   // Apply a progress snapshot to the DOM. Shared by the event listener +
-  // the poll so both paths render identically.
+  // the poll so both paths render identically. Side-effects on terminal
+  // phases (done/failed) drive the overlay's UI state machine.
   function applyProgress(p) {
     const pct = p.overall_total > 0
       ? Math.min(100, (p.overall_downloaded / p.overall_total) * 100)
@@ -662,13 +678,36 @@ function spawnLaunchSparkles(parent, count = 18) {
     subtitle.textContent = phaseText(p.phase, p.current_file);
     if (p.phase === 'failed' && p.error) {
       errorEl.textContent = p.error;
-    } else {
+    } else if (p.phase !== 'done') {
+      // Don't clear a failure message while transitioning to done; the
+      // LAUNCH button takes over the UI anyway. For all other non-failed
+      // phases, clear any stale error text.
       errorEl.textContent = '';
+    }
+
+    // Terminal transitions (the v0.3.7 fire-and-forget state machine).
+    if (!downloadTerminal) {
+      if (p.phase === 'done') {
+        downloadTerminal = true;
+        clearInterval(pollHandle);
+        if (progressUnlisten) { progressUnlisten(); progressUnlisten = null; }
+        cancelBtn.hidden = true;
+        showLaunchButton(overlay, startBtn, cancelBtn, subtitle, stats, bar);
+      } else if (p.phase === 'failed') {
+        downloadTerminal = true;
+        clearInterval(pollHandle);
+        if (progressUnlisten) { progressUnlisten(); progressUnlisten = null; }
+        cancelBtn.hidden = true;
+        // Re-enable Start so the user can retry (resume picks up from .part).
+        startBtn.disabled = false;
+        startBtn.textContent = 'Download';
+      }
     }
   }
 
   // Poll fallback: the authoritative read between throttled emits. Closes
-  // any gap if an event is dropped under load. Stops when the overlay hides.
+  // any gap if an event is dropped under load. Stops when applyProgress
+  // transitions to a terminal phase (done/failed).
   const pollHandle = setInterval(async () => {
     try {
       const p = await invoke('get_download_progress');
@@ -686,36 +725,31 @@ function spawnLaunchSparkles(parent, count = 18) {
     }
   });
 
-  // Start button: kicks off download_models. Disables itself for the
-  // duration; reveals Cancel. On success → fade out + reload. On error →
-  // re-enable Start so the user can retry (resume picks up from .part).
+  // Start button: kicks off download_models (fire-and-forget). Disables
+  // itself for the duration; reveals Cancel. The actual terminal UI
+  // transitions (LAUNCH on done / retry on failed) are driven by applyProgress
+  // observing the progress stream's `phase`, NOT by this IPC's Promise — see
+  // the v0.3.7 note above. The IPC only resolves with an Err if SETUP failed
+  // synchronously (couldn't resolve the models dir, mutex poisoned); those
+  // surface immediately as error text + re-enabled Start.
   startBtn.addEventListener('click', async () => {
     startBtn.disabled = true;
     startBtn.textContent = 'Downloading…';
     cancelBtn.hidden = false;
     errorEl.textContent = '';
-    try {
-      await invoke('download_models');
-      // Success: stop polling + show the LAUNCH button. We no longer
-      // auto-reload — the user clicks LAUNCH, which plays a chime + sparkle
-      // burst, restores always-on-top, and reloads so setup() re-runs with
-      // WUPI.gguf present + the normal boot choreography plays. The chime
-      // is synthesized (Web Audio) so no asset needs to ship.
-      clearInterval(pollHandle);
-      if (progressUnlisten) { progressUnlisten(); progressUnlisten = null; }
-      showLaunchButton(overlay, startBtn, cancelBtn, subtitle, stats, bar);
-    } catch (err) {
-      console.error('[Wupi] download_models failed', err);
+    downloadTerminal = false;  // reset for this attempt
+    // Fire-and-forget: do NOT await. The download runs on a detached Rust
+    // task whose lifetime is independent of this IPC call (v0.3.7 fix for
+    // the alt-tab-kills-download bug — WebView2 suspension no longer drops
+    // the download future).
+    invoke('download_models').catch((err) => {
+      console.error('[Wupi] download_models dispatch failed', err);
       const msg = typeof err === 'string' ? err : (err?.message || 'Unknown error');
-      // "cancelled" isn't a hard failure — keep the bar where it is and let
-      // the user resume with another Download click.
-      if (!/cancelled/i.test(msg)) {
-        errorEl.textContent = msg;
-      }
+      errorEl.textContent = msg;
       startBtn.disabled = false;
       startBtn.textContent = 'Download';
       cancelBtn.hidden = true;
-    }
+    });
   });
 })();
 
@@ -1181,6 +1215,9 @@ function spawnLaunchSparkles(parent, count = 18) {
     appendTerminalLine('› checking for updates...', false);
     let current = 'unknown';
     try { current = await getVersion(); } catch (e) { /* fall through with 'unknown' */ }
+    // Stash for the cosmetic terminal banner (TERMINAL_LINES[0]) so it shows
+    // the real version instead of a stale hardcoded one.
+    bootVersion = current;
     appendTerminalLine(`› current version ${current}`, false);
 
     let update = null;
@@ -1294,7 +1331,7 @@ function spawnLaunchSparkles(parent, count = 18) {
   //    is special: it's only emitted when the real model-status:ready event
   //    fires (listened below). Other lines are fake but flavored to look real.
   const TERMINAL_LINES = [
-    '› wupi v0.1.0 — WUPI.gguf',
+    `› wupi v${bootVersion} — WUPI.gguf`,
     '› initializing kernel...',
     '› mounting shared_backend()...',
     '› allocating LlamaContext: chat (n_ctx=4000)',
@@ -1690,6 +1727,20 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     if (!open) colorCodePanel.classList.remove('show');
   });
 
+  // Terminal paw-menu button. Toggles the right-side drawer open/closed on
+  // re-click (matches every other surface). The terminal is a full .app-window
+  // (not a paw cascade), so we close the paw menu itself on open — opening a
+  // drawer over the menu would otherwise leave the menu dangling behind it.
+  document.getElementById('terminalBtn')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (openWindows.has('terminal')) {
+      closeWindow('terminal');
+    } else {
+      closePawMenu();
+      openWindow('terminal');
+    }
+  });
+
   document.querySelectorAll('.theme-option').forEach((el) => {
     el.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -2081,7 +2132,7 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   setInterval(updateClocks, 1000);
 
   // APP WINDOW MANAGER
-  // The surfaces (Chat, Profile Editor, Codex, Docks) are DOM overlays in
+  // The surfaces (Chat, User Editor, Codex, Docks) are DOM overlays in
   // the ONE Tauri window. Background rules (by design):
   //   - WUPI Chat (chat): the ONLY window that pauses the canvas (stars +
   //     aurora OFF). Its own background is ~80% opaque so the paused backdrop
@@ -2144,8 +2195,11 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   // Surfaces register an onClose hook (tear down timers, etc.).
   const windowCloseHooks = new Map();
 
-  // ✕ close buttons (data-close="winId").
-  document.querySelectorAll('.app-window-close[data-close]').forEach((btn) => {
+  // ✕ close buttons (data-close="winId"). Selector is class-agnostic so it
+  // catches both the standard .app-window-close and the terminal's custom
+  // .terminal-close (the magenta glow X) — every [data-close] in the codebase
+  // is a close button inside an .app-window.
+  document.querySelectorAll('[data-close]').forEach((btn) => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       closeWindow(btn.dataset.close);
@@ -2251,9 +2305,12 @@ const dropdownMenu = document.getElementById('dropdownMenu');
   document.getElementById('dockApps')?.addEventListener('click', (e) => {
     e.stopPropagation();
     // Docks = "home": close any open surface windows and show the launcher
-    // grid. (apps itself is the full-screen home overlay.) Not a toggle -
-    // clicking Docks while home is open is a no-op (it's already home).
-    if (openWindows.has('apps')) return;
+    // grid. (apps itself is the full-screen home overlay.) Toggle-closes on
+    // re-click so the blurry home backdrop dismisses — matches every other
+    // dock button (dockChat/dockProfile/etc.), which all use dockToggle.
+    // Previously this was a no-op `return` when apps was already open, which
+    // stranded the backdrop (the bug).
+    if (openWindows.has('apps')) { closeWindow('apps'); return; }
     closeWindow('api');
     closeWindow('chat');
     closeWindow('profile');
@@ -2271,7 +2328,9 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     });
   });
 
-  // PROFILE EDITOR
+  // USER EDITOR (was "Profile Editor"; renamed to match the §8C
+  // operator.xml → user.xml move. The function name + 'profile' surface key
+  // + IPC names are unchanged — wire identifiers, not user-facing labels.)
   (function profileEditor() {
     const nameEl = document.getElementById('profName');
     const descEl = document.getElementById('profDescription');
@@ -2312,6 +2371,217 @@ const dropdownMenu = document.getElementById('dropdownMenu');
         .catch((err) => setStatus('Save failed: ' + err, 'err'))
         .finally(() => { saveBtn.disabled = false; });
     });
+  })();
+
+  // ─── TERMINAL DRAWER ───────────────────────────────────────────────────
+  // Right-side slide-in glass drawer with a real cmd.exe shell running
+  // headless in a ConPTY on the Rust side (terminal.rs). xterm.js is the
+  // visible surface ONLY — it renders ANSI output from the shell, and the
+  // message-box input at the bottom feeds lines to it via the terminal_input
+  // IPC. This is the "middle man" architecture: the shell has no idea a
+  // window exists.
+  //
+  // Kill-on-close: closing the drawer (✕, Esc, paw-menu re-click, or app
+  // shutdown) terminates the child via terminal_close. No background session,
+  // no zombie cmd.exe (the failure mode of the old second-window design).
+  //
+  // Browser-style keys: Ctrl+C copies selection (no break sent), Ctrl+V
+  // pastes into the input. Interrupting a running command = the Stop button.
+  (function terminalPanel() {
+    const root = document.getElementById('terminal');
+    const bodyEl = document.getElementById('terminalBody');
+    const inputEl = document.getElementById('terminalInput');
+    const sendBtn = document.getElementById('terminalSendBtn');
+    const stopBtn = document.getElementById('terminalStopBtn');
+    if (!root || !bodyEl || !inputEl || !sendBtn || !stopBtn) return;
+
+    // Lazy singletons — only built on first open, not at boot. Matches the
+    // windowOpenHooks lazy pattern (chat loads intro, codex loads list).
+    let term = null;        // xterm Terminal instance
+    let fitAddon = null;    // @xterm/addon-fit for resize-on-open
+    let onDataChannel = null; // the Tauri Channel receiving shell output
+    let channelUnlisten = null; // detach fn for the channel (if any)
+
+    // Build the xterm + fit addon. Called once on first open.
+    function ensureTerminal() {
+      if (term) return;
+      // Dynamic import keeps xterm out of the initial bundle if the user
+      // never opens the terminal. Vite handles this as a separate chunk.
+      // (Deferred to first open — see openTerminal below.)
+    }
+
+    // Open: spawn the shell + start streaming output. Idempotent — if a
+    // session is already live, just refocus the input.
+    async function openTerminal() {
+      if (!term) {
+        // First-open construction. Imports are cheap after the first load
+        // (Vite caches the chunk).
+        const { Terminal } = await import('@xterm/xterm');
+        const { FitAddon } = await import('@xterm/addon-fit');
+        await import('@xterm/xterm/css/xterm.css');
+        term = new Terminal({
+          cursorBlink: true,
+          cursorStyle: 'bar',
+          scrollback: 5000,
+          fontFamily: "'Consolas', 'Monaco', 'Courier New', monospace",
+          fontSize: 13,
+          lineHeight: 1.2,
+          allowProposedApi: true,
+          theme: {
+            background: 'rgba(0, 0, 0, 0)',
+            foreground: '#e8d5ff',
+            cursor: '#ff4ecd',
+            cursorAccent: 'rgba(0, 0, 0, 0.8)',
+            selectionBackground: 'rgba(181, 52, 250, 0.4)',
+            black: '#0a0414',
+            red: '#ff6b8a',
+            green: '#7eff9c',
+            yellow: '#ffd866',
+            blue: '#8ab4ff',
+            magenta: '#ff4ecd',
+            cyan: '#8aefff',
+            white: '#e8d5ff',
+            brightBlack: '#6a5a8a',
+            brightRed: '#ff9cb0',
+            brightGreen: '#a8ffba',
+            brightYellow: '#ffe899',
+            brightBlue: '#aac8ff',
+            brightMagenta: '#ff8aefff',
+            brightCyan: '#b0f4ff',
+            brightWhite: '#ffffff',
+          },
+        });
+        fitAddon = new FitAddon();
+        term.loadAddon(fitAddon);
+        term.open(bodyEl);
+
+        // Self-test banner: write directly so we can tell xterm itself works
+        // even if no shell bytes ever arrive. If you see this in the drawer
+        // but no shell prompt follows, the issue is on the Rust side
+        // (terminal.rs: spawn failed, or bytes not reaching the Channel).
+        // If you DON'T see this, xterm failed to initialize (sizing/theme).
+        term.writeln('\x1b[90m[terminal initializing…]\x1b[0m');
+      }
+
+      // Fit to the drawer body now that it's visible. Defer one frame so the
+      // CSS slide-in transition has applied the layout (xterm measures its
+      // container — measuring mid-transition can give a wrong size).
+      requestAnimationFrame(() => {
+        try { fitAddon.fit(); } catch (e) { console.warn('[Wupi] terminal fit failed', e); }
+      });
+      // Always scroll to the latest line on open.
+      term.scrollToBottom();
+      // Focus the input so the user can start typing immediately.
+      setTimeout(() => inputEl.focus(), 50);
+
+      // If a shell session is already live (e.g. re-opened without a close),
+      // don't re-spawn — terminal_open is idempotent on the Rust side too.
+      if (onDataChannel) return;
+
+      // Create a typed Channel for TerminalData ({kind:'output', bytes:[...]}
+      // or {kind:'exited', code:number|null}). xterm.js handles decoding the
+      // raw bytes via its own buffer (UTF-8/CP437/ANSI) — we keep bytes raw
+      // so multibyte sequences don't split across chunk boundaries.
+      onDataChannel = new Channel();
+      onDataChannel.onmessage = (data) => {
+        if (!term) return;
+        if (data?.kind === 'output' && Array.isArray(data.bytes)) {
+          // xterm.write accepts a number[] (bytes) directly. Wrap in Uint8Array
+          // to avoid the string-path decode (which would mangle non-UTF-8).
+          // Log byte count on first chunk so we can confirm the pipeline is
+          // delivering data (visible in devtools console).
+          if (!window.__wupiTermGotOutput) {
+            window.__wupiTermGotOutput = true;
+            console.log('[Wupi] terminal: first output chunk received', data.bytes.length, 'bytes');
+          }
+          term.write(new Uint8Array(data.bytes));
+          term.scrollToBottom();
+        } else if (data?.kind === 'exited') {
+          const code = (data.code == null) ? '?' : data.code;
+          term.write(`\r\n\x1b[90m[process exited with code ${code}]\x1b[0m\r\n`);
+          term.scrollToBottom();
+          // Shell is gone — close the drawer. The close hook will no-op the
+          // IPC since the session is already dead.
+          closeWindow('terminal');
+        }
+      };
+
+      try {
+        await invoke('terminal_open', { onData: onDataChannel });
+      } catch (err) {
+        console.error('[Wupi] terminal_open failed', err);
+        term.write(`\x1b[31m[failed to start shell: ${String(err?.message || err)}]\x1b[0m\r\n`);
+        // Tear down the channel + close the drawer; user can retry.
+        if (channelUnlisten) { channelUnlisten(); channelUnlisten = null; }
+        onDataChannel = null;
+        closeWindow('terminal');
+      }
+    }
+
+    // Close: ask Rust to kill the shell. The window manager calls this from
+    // the windowCloseHooks registry (fired by ✕, Esc, paw-menu re-click,
+    // dock toggle, and app shutdown). Idempotent.
+    function closeTerminal() {
+      if (onDataChannel) {
+        // Fire-and-forget — the kill happens on the Rust side; we don't
+        // block the close animation on it.
+        invoke('terminal_close').catch((e) =>
+          console.warn('[Wupi] terminal_close failed (non-fatal)', e)
+        );
+        onDataChannel = null;
+      }
+      if (channelUnlisten) { channelUnlisten(); channelUnlisten = null; }
+      // NOTE: we do NOT dispose the xterm instance on close. Keeping it lets
+      // the next open resume quickly (no re-bootstrap). The kill-on-close
+      // contract is about the SHELL process, not the renderer. If memory
+      // becomes a concern we can dispose + null `term` here.
+    }
+
+    // Send the current input value to the shell. Appends CRLF (the line
+    // terminator ConPTY expects for Enter). Clears the input + refocuses.
+    function sendInput() {
+      const text = inputEl.value;
+      if (!text) {
+        // Empty send still emits a newline so the user can advance a prompt
+        // (e.g. a paged `more` prompt waiting for Enter).
+        invoke('terminal_input', { text: '' }).catch((e) =>
+          console.warn('[Wupi] terminal_input failed', e)
+        );
+        return;
+      }
+      inputEl.value = '';
+      invoke('terminal_input', { text }).catch((e) =>
+        console.warn('[Wupi] terminal_input failed', e)
+      );
+    }
+
+    // Wire the input affordances. Enter sends (single-line); ▶ also sends.
+    // Ctrl+C and Ctrl+V fall through to default browser behavior (copy /
+    // paste) — no custom handler. The Stop button is the break path.
+    inputEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        sendInput();
+      }
+    });
+    sendBtn.addEventListener('click', () => sendInput());
+    stopBtn.addEventListener('click', () => {
+      invoke('terminal_stop').catch((e) =>
+        console.warn('[Wupi] terminal_stop failed', e)
+      );
+    });
+
+    // Refit when the drawer resizes (window resize, dock snap). xterm needs
+    // explicit fit() calls — it doesn't observe its container.
+    window.addEventListener('resize', () => {
+      if (term && openWindows.has('terminal')) {
+        try { fitAddon.fit(); } catch (e) { /* drawer mid-transition */ }
+      }
+    });
+
+    // Register the open/close hooks with the window manager.
+    windowOpenHooks.set('terminal', openTerminal);
+    windowCloseHooks.set('terminal', closeTerminal);
   })();
 
   // AI: Connection Profile panel (LOCAL | ONLINE mode selector + profile CRUD)

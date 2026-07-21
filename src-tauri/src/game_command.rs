@@ -130,7 +130,11 @@ fn contains_mutation_verb(text: &str) -> bool {
 /// + parse happens in the caller (which has access to the GameEngine/
 /// SchemaEngine). Keeping the prompt-construction pure lets us unit-test it
 /// without a model.
-pub fn render_translation_prompt(player_request: &str, current_state_json: &str) -> String {
+pub fn render_translation_prompt(
+    player_request: &str,
+    current_state_json: &str,
+    deferred_attempts: &[crate::schema_engine::FailedAttempt],
+) -> String {
     let mut out = String::with_capacity(1024);
     out.push_str("<|turn>system\n");
     out.push_str(TRANSLATION_INSTRUCTION);
@@ -140,6 +144,27 @@ pub fn render_translation_prompt(player_request: &str, current_state_json: &str)
     out.push_str(current_state_json);
     out.push_str("\n\nPlayer's request to Wupi:\n");
     out.push_str(player_request);
+    // Deferred re-attempt context (fail-proof contract §5 layer 3). When the
+    // player's previous request failed all 3 passes, fold its trigger + errors
+    // in here so the model has a fresh shot with the new request as anchor.
+    // The carrier carries the *trigger*, not the broken raw output: the new
+    // request + the prior errors are the useful signal.
+    if !deferred_attempts.is_empty() {
+        out.push_str("\n\n[Previously deferred state changes — re-attempt with the above request as the primary context:]\n");
+        for (i, attempt) in deferred_attempts.iter().enumerate() {
+            let trigger = attempt
+                .trigger
+                .as_deref()
+                .or_else(|| attempt.exchange.as_ref().map(|(u, _)| u.as_str()))
+                .unwrap_or("(no trigger recorded)");
+            out.push_str(&format!(
+                "  {}. prior request: {:?}\n     prior errors: {}\n",
+                i + 1,
+                trigger.chars().take(200).collect::<String>(),
+                attempt.errors
+            ));
+        }
+    }
     out.push_str("\n\nEmit ONLY the JSON delta object (changed keys only). If the request is not a state mutation, emit {}.\n");
     out.push_str("<turn|>\n");
     out.push_str("<|turn>model\n");
@@ -240,11 +265,35 @@ mod tests {
 
     #[test]
     fn render_translation_prompt_contains_request_and_state() {
-        let prompt = render_translation_prompt("make it stormy", "{\"entities\":{\"weather\":\"clear\"}}");
+        let prompt = render_translation_prompt(
+            "make it stormy",
+            "{\"entities\":{\"weather\":\"clear\"}}",
+            &[], // no deferred attempts in the common case
+        );
         assert!(prompt.contains("make it stormy"));
         assert!(prompt.contains("\"weather\":\"clear\""));
         assert!(prompt.contains("<|turn>system"));
         assert!(prompt.contains("<|turn>model"));
+    }
+
+    #[test]
+    fn render_translation_prompt_folds_deferred_attempts() {
+        // Fail-proof contract layer 3: prior translation failures must
+        // surface in the next request's prompt.
+        let deferred = vec![crate::schema_engine::FailedAttempt {
+            exchange: None,
+            trigger: Some("prior failed request".to_string()),
+            errors: "pass 1 parse: ... | pass 2 validation: ...".to_string(),
+            passes_used: 3,
+        }];
+        let prompt = render_translation_prompt(
+            "new request",
+            "{}",
+            &deferred,
+        );
+        assert!(prompt.contains("Previously deferred"));
+        assert!(prompt.contains("prior failed request"));
+        assert!(prompt.contains("pass 1 parse"));
     }
 
     #[test]

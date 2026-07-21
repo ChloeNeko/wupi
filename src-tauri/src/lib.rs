@@ -18,10 +18,12 @@ pub mod narrator_prompt;
 pub mod prompts;
 pub mod schema;
 pub mod schema_engine;
+pub mod schema_validator;
 pub mod session;
 pub mod sim_card;
 pub mod stream_filter;
 pub mod system_menu;
+pub mod terminal;
 pub mod theme;
 pub mod updater;
 pub mod user_profile;
@@ -75,6 +77,21 @@ pub struct AppState {
     /// OnceLock before the API feature; OnceLock can't be reset, which blocked
     /// the swap. None = not running (chat proceeds without schema deltas).
     pub schema_engine: Arc<std::sync::Mutex<Option<Arc<schema_engine::SchemaEngine>>>>,
+    /// Fail-proof delta contract (§5 layer 3): auto-summarizer attempts that
+    /// exhausted all 3 passes WITHOUT committing. Drained at the top of the
+    /// next `chat_send` and folded into the next delta prompt as "previously
+    /// deferred state changes — re-attempt with the new exchange as anchor."
+    /// Bounded by `MAX_FAILED_DELTA_ATTEMPTS`; oldest evicted on overflow
+    /// (rare: requires 8+ consecutive failures). Distinct from
+    /// `failed_translation_queue` because the auto-summarizer and the
+    /// game-manager translation path are separate request flows with separate
+    /// trigger contexts (exchange vs player request).
+    pub failed_delta_queue: Arc<tokio::sync::Mutex<Vec<schema_engine::FailedAttempt>>>,
+    /// Fail-proof delta contract (§5 layer 3) — game-manager translation path
+    /// sibling. Player requests ("make it stormy") that exhausted all 3
+    /// passes WITHOUT committing. Drained on the next translation request and
+    /// folded into its prompt.
+    pub failed_translation_queue: Arc<tokio::sync::Mutex<Vec<schema_engine::FailedAttempt>>>,
     /// The active simulation card's id: the partition key for Memory
     /// retrieval and archiving (AGENTS.md §2M). Defaults to
     /// [`memory::WUPI_CARD_ID`] (the Wupi-as-assistant namespace) until
@@ -91,7 +108,7 @@ pub struct AppState {
     /// (`<exe_dir>/data/user.xml`, §8C-renamed from Operator.xml), filled
     /// once in `setup()`. Single copy (no template/live split per §8C):
     /// the shipped zip contains the empty template; the user authors their
-    /// identity via the Profile Editor and that file is preserved across
+    /// identity via the User Editor and that file is preserved across
     /// updates. `None` when no profile resolved. The PATH is stable; the
     /// CONTENT is re-read fresh each `chat_send` (hot-reload: see
     /// `user_profile`).
@@ -172,6 +189,13 @@ pub struct AppState {
     /// stays `None` if no GGUF was found (the frontend's first-run download
     /// overlay takes over and never calls `boot_load_model`).
     pub pending_model_path: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
+    /// Live terminal session (the in-app drawer's cmd.exe shell). Single
+    /// slot: one session at a time. `None` when the drawer is closed (kill-
+    /// on-close semantics). The reader thread streams output via the typed
+    /// `Channel<TerminalData>` passed to `terminal_open`. Killed on app
+    /// shutdown via `terminal::kill_if_any` in `RunEvent::ExitRequested` —
+    /// the load-bearing zombie guardrail (see terminal.rs).
+    pub terminal: Arc<std::sync::Mutex<Option<terminal::TerminalSession>>>,
 }
 
 impl AppState {
@@ -184,6 +208,8 @@ impl AppState {
             memory: Arc::new(std::sync::OnceLock::new()),
             schema: Arc::new(tokio::sync::Mutex::new(schema::WorldSchema::default())),
             pending_delta: Arc::new(tokio::sync::Mutex::new(None)),
+            failed_delta_queue: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            failed_translation_queue: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             schema_engine: Arc::new(std::sync::Mutex::new(None)),
             active_card_id: Arc::new(std::sync::Mutex::new(
                 memory::WUPI_CARD_ID.to_owned(),
@@ -207,6 +233,7 @@ impl AppState {
             )),
             download_cancel: Arc::new(std::sync::Mutex::new(None)),
             pending_model_path: Arc::new(std::sync::Mutex::new(None)),
+            terminal: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -600,6 +627,10 @@ pub fn run() {
             updater_apply,
             updater_restart,
             boot_load_model,
+            terminal_open,
+            terminal_input,
+            terminal_stop,
+            terminal_close,
             system_menu::set_always_on_top,
         ])
         // Build the app, then run the event loop with a callback. Splitting
@@ -617,6 +648,14 @@ pub fn run() {
             // a future code path) so a ghost icon can never accumulate from
             // a graceful-exit route we didn't anticipate.
             if let tauri::RunEvent::ExitRequested { .. } = event {
+                // Kill any live terminal session. This is the load-bearing
+                // zombie guardrail for the in-app terminal (terminal.rs): the
+                // drawer's close hook covers normal exits, but alt-F4 / Task
+                // Manager / future programmatic exits bypass it. This catch-
+                // all ensures no cmd.exe survives WUPI shutdown — the failure
+                // mode of the old second-window terminal design.
+                let state: tauri::State<AppState> = app_handle.state();
+                terminal::kill_if_any(&state);
                 system_menu::destroy_tray(&app_handle);
             }
         });
@@ -1050,22 +1089,35 @@ fn download_target_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     Some(resolve_models_dir(app))
 }
 
-/// Stream both GGUFs into `<exe_dir>/data/models`. Long-running; the
-/// frontend subscribes to `download-progress` events (throttled to 2/sec)
-/// and polls `get_download_progress` for the authoritative snapshot between
-/// emits. Returns `Ok(())` when both files land; `Err(msg)` on any failure
-/// (network, HTTP status, cancel). On cancel, the `.part` files are left in
-/// place for the next attempt to resume from.
+/// Start streaming both GGUFs into `<exe_dir>/models`. Returns IMMEDIATELY
+/// (fire-and-forget); the actual download runs on a detached tokio task and
+/// reports progress via the shared `download_progress` slot + `download-
+/// progress` events. The frontend polls `get_download_progress` and reacts
+/// to `phase === 'done' | 'failed'` to drive the overlay's terminal UI.
+///
+/// Why fire-and-forget (the v0.3.7 fix): the previous shape `await`ed the
+/// download from the JS `invoke('download_models')` call. When WebView2
+/// suspends the JS event loop (alt-tab → fully-covered window), the IPC
+/// channel closes from the JS side, which drops the Rust download future
+/// mid-stream — the download silently died whenever the user looked away.
+/// Decoupling the lifetime of the download (a tokio task) from the lifetime
+/// of the IPC call (a single round-trip) means the OS's WebView suspension
+/// can no longer kill it. The poll/listen observers in the overlay pick up
+/// the terminal `phase` whenever the webview next runs.
+///
+/// Setup errors (can't resolve dest dir, mutex poisoned) return `Err`
+/// synchronously so the overlay can show them. Once the spawn is dispatched
+/// we return `Ok(())`; the spawned task owns terminal-state reporting.
 #[tauri::command]
 async fn download_models(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     // Resolve target dir + mint a fresh cancel token. The cancel slot is
-    // scoped into its own block so the MutexGuard drops before we await
+    // scoped into its own block so the MutexGuard drops before we spawn
     // (the `!Send` guard invariant, same as api_connect at lib.rs:2092).
     let dest_dir = download_target_dir(&app)
-        .ok_or_else(|| "could not resolve <exe_dir>/data/models".to_owned())?;
+        .ok_or_else(|| "could not resolve <exe_dir>/models".to_owned())?;
     let cancel = {
         let fresh = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut slot = state
@@ -1083,43 +1135,61 @@ async fn download_models(
         *p = model_downloader::DownloadProgress::default();
     }
 
-    let result = model_downloader::download_all(
-        dest_dir,
-        Arc::clone(&state.download_progress),
-        cancel,
-        app.clone(),
-    )
-    .await;
+    // Detached task: lives independently of this IPC call. Captures only
+    // `'static` clones (Arcs + AppHandle), so it's Send + 'static and safe
+    // to spawn. On completion it sets terminal phase + emits the final
+    // progress event + clears the cancel slot — these were previously done
+    // inline after the await.
+    let progress = Arc::clone(&state.download_progress);
+    let cancel_slot = Arc::clone(&state.download_cancel);
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let result = model_downloader::download_all(
+            dest_dir,
+            Arc::clone(&progress),
+            cancel,
+            app_handle.clone(),
+        )
+        .await;
 
-    // Clear the cancel slot regardless of outcome (no in-flight download
-    // to cancel anymore).
-    {
-        let mut slot = state
-            .download_cancel
-            .lock()
-            .expect("download_cancel mutex");
-        *slot = None;
-    }
-
-    match result {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // Mark progress Failed so the overlay can show the error. The
-            // `.part` files are retained by the downloader for resume.
-            {
-                let mut p = state.download_progress.lock().expect("progress mutex");
-                if p.phase != model_downloader::DownloadPhase::Done {
-                    p.phase = model_downloader::DownloadPhase::Failed;
-                    p.error = e.clone();
-                }
-            }
-            let _ = app.emit(
-                "download-progress",
-                state.download_progress.lock().expect("progress mutex").clone(),
-            );
-            Err(e)
+        // Clear the cancel slot regardless of outcome (no in-flight download
+        // to cancel anymore).
+        {
+            let mut slot = cancel_slot.lock().expect("download_cancel mutex");
+            *slot = None;
         }
-    }
+
+        match result {
+            Ok(()) => {
+                // download_all already set phase = Done on success.
+                let _ = app_handle.emit(
+                    "download-progress",
+                    progress.lock().expect("progress mutex").clone(),
+                );
+            }
+            Err(e) => {
+                // Mark progress Failed so the overlay can show the error. The
+                // `.part` files are retained by the downloader for resume.
+                // "cancelled" is NOT a hard failure — leave the phase alone
+                // so the overlay keeps its current bar (the user can resume
+                // with another Download click).
+                let is_cancel = e.eq_ignore_ascii_case("cancelled");
+                if !is_cancel {
+                    let mut p = progress.lock().expect("progress mutex");
+                    if p.phase != model_downloader::DownloadPhase::Done {
+                        p.phase = model_downloader::DownloadPhase::Failed;
+                        p.error = e.clone();
+                    }
+                }
+                let _ = app_handle.emit(
+                    "download-progress",
+                    progress.lock().expect("progress mutex").clone(),
+                );
+            }
+        }
+    });
+
+    Ok(())
 }
 
 /// Polled snapshot of download progress. The frontend calls this on a timer
@@ -1361,6 +1431,53 @@ async fn boot_load_model(app: tauri::AppHandle, state: tauri::State<'_, AppState
     Ok(())
 }
 
+// ── In-app Terminal IPC ────────────────────────────────────────────────────
+//
+// Four commands drive the right-side Terminal drawer (see terminal.rs for the
+// architecture + load-bearing kill-on-close guardrail). The frontend wires:
+//   - terminalBtn (paw menu) → openWindow('terminal') → windowOpenHooks
+//     → terminal_open(onData: Channel<TerminalData>)
+//   - input row + ▶ send button + Enter key → terminal_input({ text })
+//   - Stop button → terminal_stop
+//   - ✕ / Esc / paw-menu re-click / dock toggle → windowCloseHooks
+//     → terminal_close
+//
+// One session at a time (single slot in AppState). Shell dies on drawer close
+// so no zombie cmd.exe can accumulate (the failure mode of the old second-
+// window terminal design).
+
+/// Spawn a cmd.exe in a ConPTY + start streaming its output to `on_data`.
+/// Idempotent: no-op if a session is already live (the frontend can call this
+/// on every drawer-open without leaking shells).
+#[tauri::command]
+fn terminal_open(
+    state: tauri::State<'_, AppState>,
+    on_data: tauri::ipc::Channel<terminal::TerminalData>,
+) -> Result<(), String> {
+    terminal::open_session(&state.terminal, on_data)
+}
+
+/// Write `text + "\r\n"` to the shell's stdin. CRLF = Enter in ConPTY/cmd.exe.
+#[tauri::command]
+fn terminal_input(state: tauri::State<'_, AppState>, text: String) -> Result<(), String> {
+    terminal::write_input(&state.terminal, &text)
+}
+
+/// Send the Windows break sequence (raw Ctrl-C byte) to the shell. The Stop
+/// button's backend. Interrupts a running command. No-op if no session.
+#[tauri::command]
+fn terminal_stop(state: tauri::State<'_, AppState>) {
+    terminal::send_break(&state.terminal);
+}
+
+/// Kill the shell + drop the session. Idempotent. Called by the drawer's
+/// close hook (✕, Esc, paw-menu re-click, dock toggle) and from
+/// `RunEvent::ExitRequested` at app shutdown (via `terminal::kill_if_any`).
+#[tauri::command]
+fn terminal_close(state: tauri::State<'_, AppState>) {
+    terminal::close_session(&state.terminal);
+}
+
 /// Resolve Wupi's active persona card. Per §8C the active persona is a single
 /// copy at `<exe_dir>/data/wupi.sim` (lowercase w) — no template/live split.
 /// The shipped zip contains Chloe's personal `wupi.sim` content directly
@@ -1433,12 +1550,12 @@ fn resolve_wupi_sim_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
 /// Resolve the user's profile (`<exe_dir>/data/user.xml`, renamed from
 /// `Operator.xml` per §8C). Single copy at `data/user.xml`: no template/live
 /// split. The shipped zip contains the EMPTY template directly (the user
-/// authors their identity via the Profile Editor); it's preserved on update.
+/// authors their identity via the User Editor); it's preserved on update.
 ///
 /// Returns the path to `data/user.xml` if the file exists. Returns `None` if
 /// no file exists: Wupi then runs without a `<user_profile>` section
 /// (graceful). The data dir is created lazily here on first run so a fresh
-/// install with no user.xml still has the dir ready for the Profile Editor to
+/// install with no user.xml still has the dir ready for the User Editor to
 /// write into.
 ///
 /// Only the PATH is resolved here (once, in setup). The CONTENT is re-read
@@ -1472,7 +1589,7 @@ fn resolve_user_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
             }
         }
     }
-    // No user.xml yet. Pre-create the data dir so the Profile Editor has a
+    // No user.xml yet. Pre-create the data dir so the User Editor has a
     // home for its first save; do NOT seed an empty file (the absence of
     // user.xml is the "no profile" signal — `user_profile::load` returns
     // `None` on NotFound, which suppresses the <user_profile> section).
@@ -1570,21 +1687,44 @@ async fn route_to_game_manager(
     //    Clone out + drop the guard before the awaited translation call.
     let current_schema = state.game_schema.lock().await.clone();
 
+    // 2b. Drain the failed-translation queue (fail-proof contract §5 layer 3).
+    //     Any prior player request that exhausted all 3 passes is folded into
+    //     this request's prompt so the model gets another shot with the new
+    //     request as anchor. Take() empties the slot: if THIS turn also fails,
+    //     the new failure re-enqueues below.
+    let deferred = {
+        let mut q = state.failed_translation_queue.lock().await;
+        std::mem::take(&mut *q)
+    };
+    if !deferred.is_empty() {
+        tracing::info!(
+            deferred = deferred.len(),
+            "translation attempt includes deferred re-attempts"
+        );
+    }
+
     // 3. Post the translation request + await the reply off the tokio worker
     //    (the schema thread is a bare std::thread; its mpsc::Receiver blocks).
     let reply_rx = schema_engine
-        .request_translation(text.clone(), &current_schema)
+        .request_translation(text.clone(), &current_schema, deferred)
         .map_err(|e| format!("{e:#}"))?;
     let reply = tokio::task::spawn_blocking(move || reply_rx.recv())
         .await
         .map_err(|e| format!("translation reply join: {e}"))?
         .map_err(|e| format!("translation reply channel: {e}"))?;
 
+    // 3b. Fail-proof contract: if the reply carries a retryable failed_attempt
+    //     (all 3 passes failed on parse/validation), enqueue it for the next
+    //     translation request. Never silently dropped.
+    if let Some(failed) = reply.failed_attempt.clone() {
+        enqueue_failed_translation(state, failed).await;
+    }
+
     if !reply.error.is_empty() {
         on_event
             .send(serde_json::json!({
                 "type": "error",
-                "message": format!("couldn't translate that: {}", reply.error),
+                "message": format!("couldn't translate that: {} (queued for retry on next request)", reply.error),
             }))
             .map_err(|e| e.to_string())?;
         return Ok(());
@@ -2081,14 +2221,35 @@ async fn chat_send(
             );
         } else {
             let current_schema = state.schema.lock().await.clone();
+            // Drain the failed-delta queue (fail-proof contract §5 layer 3):
+            // prior turns' attempts that exhausted all 3 passes WITHOUT
+            // committing. Folded into this turn's delta prompt so the model
+            // gets a fresh shot with the new exchange as anchor. Take()
+            // empties the slot: if THIS turn also fails, the new failure is
+            // re-enqueued below.
+            let deferred = {
+                let mut q = state.failed_delta_queue.lock().await;
+                std::mem::take(&mut *q)
+            };
+            if !deferred.is_empty() {
+                tracing::info!(
+                    deferred = deferred.len(),
+                    "delta attempt includes deferred re-attempts"
+                );
+            }
             let schema_engine = Arc::clone(&schema_engine);
             let schema_slot = state.schema.clone();
+            let failed_queue_slot = state.failed_delta_queue.clone();
             let handle = tokio::spawn(async move {
                 // Post the delta request. The reply comes back on a std::mpsc
                 // channel (the schema thread is a bare std::thread), so we await
                 // it via spawn_blocking: same pattern as the chat engine reply.
                 let reply_rx = match schema_engine
-                    .request_delta((user_text.unwrap_or_default(), asst_text), &current_schema)
+                    .request_delta(
+                        (user_text.unwrap_or_default(), asst_text),
+                        &current_schema,
+                        deferred,
+                    )
                 {
                     Ok(rx) => rx,
                     Err(e) => {
@@ -2111,8 +2272,32 @@ async fn chat_send(
                     let mut s = schema_slot.lock().await;
                     s.apply_delta(delta);
                     tracing::debug!("schema delta applied (in-memory; ephemeral)");
-                } else if !reply.error.is_empty() {
-                    tracing::warn!(error = %reply.error, "schema delta produced no delta (parse/generation failure); schema unchanged");
+                } else {
+                    // Fail-proof contract: a retryable failure carries
+                    // `failed_attempt`. Enqueue it for the next turn — never
+                    // silently dropped. Infrastructure failures (panic,
+                    // tokenize/prefill error) leave failed_attempt = None and
+                    // are simply logged.
+                    if let Some(failed) = reply.failed_attempt.clone() {
+                        let mut q = failed_queue_slot.lock().await;
+                        if q.len() >= MAX_FAILED_DELTA_ATTEMPTS {
+                            q.remove(0);
+                            tracing::warn!(
+                                queue_len = q.len(),
+                                "failed_delta_queue overflow; evicted oldest entry"
+                            );
+                        }
+                        q.push(failed);
+                        tracing::warn!(
+                            error = %reply.error,
+                            "schema delta failed all 3 passes; queued for next-turn re-attempt"
+                        );
+                    } else if !reply.error.is_empty() {
+                        tracing::warn!(
+                            error = %reply.error,
+                            "schema delta infrastructure failure; not queued (not retryable)"
+                        );
+                    }
                 }
             });
             *state.pending_delta.lock().await = Some(handle);
@@ -2136,6 +2321,36 @@ async fn chat_send(
 fn clear_active_cancel(state: &tauri::State<'_, AppState>) {
     let mut slot = state.active_cancel.lock().expect("active_cancel mutex");
     *slot = None;
+}
+
+/// Cap on accumulated deferred delta attempts per queue (fail-proof contract
+/// §5 layer 3). Each failed attempt folds into the next turn's prompt; if the
+/// model genuinely can't commit a particular change (rare: ambiguous player
+/// request + schema mismatch), older attempts are evicted FIFO so the prompt
+/// doesn't bloat indefinitely. 8 is generous: a single turn rarely fails, and
+/// 8 consecutive failures across 8 turns means something systematically
+/// wrong that re-prompting won't fix.
+const MAX_FAILED_DELTA_ATTEMPTS: usize = 8;
+
+/// Push a failed translation attempt onto the game-manager queue. Called from
+/// `route_to_game_manager` when `SchemaReply::failed_attempt` is `Some` after
+/// a `request_translation` call. Same cap + best-effort semantics as the
+/// auto-summarizer path (which inlines the same logic in its `chat_send`
+/// spawn — the spawn owns an Arc to the queue across awaits, which doesn't
+/// factor cleanly into a `&tauri::State` helper).
+async fn enqueue_failed_translation(
+    state: &tauri::State<'_, AppState>,
+    attempt: schema_engine::FailedAttempt,
+) {
+    let mut q = state.failed_translation_queue.lock().await;
+    if q.len() >= MAX_FAILED_DELTA_ATTEMPTS {
+        q.remove(0);
+        tracing::warn!(
+            queue_len = q.len(),
+            "failed_translation_queue overflow; evicted oldest entry"
+        );
+    }
+    q.push(attempt);
 }
 
 async fn rollback_last_user_message(state: &tauri::State<'_, AppState>, _app: &tauri::AppHandle) {
@@ -2359,7 +2574,7 @@ async fn codex_delete(
 // wiring. `UserProfile` is Serialize/Deserialize so it crosses IPC directly.
 
 /// Read the operator profile fresh from disk. Returns `None` when no
-/// user.xml (§8C) resolved at startup (the Profile Editor renders empty
+/// user.xml (§8C) resolved at startup (the User Editor renders empty
 /// fields and a Create prompt in that case).
 #[tauri::command]
 async fn operator_profile_get(
@@ -2772,8 +2987,14 @@ async fn debug_schema_delta(
 
     // Post the delta request + await the reply off the tokio worker (the
     // schema thread is a bare std::thread; its mpsc::Receiver is blocking).
+    //
+    // The debug path deliberately passes an empty deferred list AND does NOT
+    // enqueue the reply's failed_attempt: this is a one-shot engineering
+    // probe, not a production chat turn. Surfacing failed_attempt in the JSON
+    // reply so an engineer can see when the validator + 3-pass fail is the
+    // right scope for this surface.
     let reply_rx = engine
-        .request_delta((user_exchange, assistant_exchange), &current)
+        .request_delta((user_exchange, assistant_exchange), &current, Vec::new())
         .map_err(|e| format!("{e:#}"))?;
     let reply = tokio::task::spawn_blocking(move || reply_rx.recv())
         .await
@@ -2799,6 +3020,7 @@ async fn debug_schema_delta(
         "raw_output": reply.raw_output,
         "delta": reply.delta,
         "error": reply.error,
+        "failed_attempt": reply.failed_attempt,
         "schema_after": schema_after,
     }))
 }

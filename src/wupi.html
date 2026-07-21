@@ -94,7 +94,7 @@
                     </svg>
                     Theme
                 </button>
-                <button class="dropdown-item terminal-item">
+                <button class="dropdown-item terminal-item" id="terminalBtn">
                     <svg class="menu-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <rect x="2" y="3" width="20" height="18" rx="2" ry="2"/>
                         <path d="M7 9l3 3-3 3M12 15h4" stroke-linecap="round" stroke-linejoin="round"/>
@@ -264,7 +264,7 @@
                     <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
                 </svg>
             </div>
-            <div class="dock-item" id="dockProfile" aria-label="Profile Editor">
+            <div class="dock-item" id="dockProfile" aria-label="User Editor">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
                     <circle cx="12" cy="7" r="4"></circle>
@@ -308,10 +308,12 @@
         </div>
     </div>
 
-    <!-- Profile Editor: centered modal, draggable + resizable -->
+    <!-- User Editor: centered modal, draggable + resizable. Was "Profile Editor";
+         renamed to match the §8C operator.xml → user.xml move. The user authors
+         their identity (name + description) here; Wupi addresses them as such. -->
     <div class="app-window modal draggable" id="profile" aria-hidden="true">
         <div class="app-window-header">
-            <span class="app-window-title">Profile Editor</span>
+            <span class="app-window-title">User Editor</span>
             <button class="app-window-close" data-close="profile" aria-label="Close">✕</button>
         </div>
         <div class="app-window-body profile-body">
@@ -457,7 +459,7 @@
     <div class="app-window home" id="apps" aria-hidden="true">
         <button class="app-window-close home-close" data-close="apps" aria-label="Close">✕</button>
         <div class="home-grid">
-            <!-- Alphabetical by label: AI, Codex, Games, Profile Editor, WUPI Chat. -->
+            <!-- Alphabetical by label: AI, Codex, Games, User Editor, WUPI Chat. -->
             <div class="home-app" data-open="api">
                 <div class="home-app-icon">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -503,7 +505,7 @@
                         <circle cx="12" cy="7" r="4"></circle>
                     </svg>
                 </div>
-                <span class="home-app-label">Profile Editor</span>
+                <span class="home-app-label">User Editor</span>
             </div>
             <div class="home-app" data-open="chat">
                 <div class="home-app-icon">
@@ -513,6 +515,30 @@
                 </div>
                 <span class="home-app-label">WUPI Chat</span>
             </div>
+        </div>
+    </div>
+
+    <!-- Terminal: right-side slide-in drawer. NOT a real shell window —
+         xterm.js renders the visible surface; the real cmd.exe runs headless
+         in a ConPTY on the Rust side (terminal.rs). The message box at the
+         bottom feeds lines to the shell; xterm just renders what comes back.
+         Kill-on-close: closing the drawer terminates the child so no zombie
+         cmd.exe can survive (the old second-window terminal design's failure
+         mode). Spawned lazily on first open (windowOpenHooks), not at boot. -->
+    <div class="app-window terminal" id="terminal" aria-hidden="true">
+        <div class="terminal-header">
+            <span class="app-window-title">Terminal</span>
+            <button class="terminal-close" data-close="terminal" aria-label="Close terminal">✕</button>
+        </div>
+        <div class="terminal-body" id="terminalBody"></div>
+        <div class="terminal-input-row">
+            <input id="terminalInput" class="terminal-input" type="text"
+                placeholder="Type a command and press Enter…"
+                autocomplete="off" spellcheck="false" />
+            <button id="terminalStopBtn" class="terminal-stop-btn"
+                title="Send break (interrupts the running command)" aria-label="Stop">Stop</button>
+            <button id="terminalSendBtn" class="terminal-send-btn"
+                title="Send command (Enter)" aria-label="Send command">▶</button>
         </div>
     </div>
 

@@ -91,6 +91,16 @@ const tauriConfRaw = readFileSync(tauriConfPath, 'utf8');
 const tauriConf = JSON.parse(tauriConfRaw);
 const currentVersion = tauriConf.version;
 
+// package.json's version is a SECOND source of truth that npm echoes in its
+// pre-run banner ("> wupi@<version> release"). It's NOT read by the build
+// (the build sources its version from tauri.conf.json above), but if it
+// drifts, npm prints a confusingly-stale number. Keep it in lockstep with
+// tauri.conf.json on every release — bump OR --no-bump (the --no-bump case
+// still syncs package.json if it drifted).
+const pkgPath = join(repoRoot, 'package.json');
+const pkgRaw = readFileSync(pkgPath, 'utf8');
+const pkg = JSON.parse(pkgRaw);
+
 let newVersion = currentVersion;
 if (bumpKind) {
   const [major, minor, patch] = currentVersion.split('.').map(Number);
@@ -110,6 +120,21 @@ if (bumpKind) {
   }
 } else {
   console.log(`[release] --no-bump: re-releasing version ${currentVersion}`);
+}
+
+// Sync package.json's version to newVersion (covers both bump and --no-bump:
+// in the --no-bump case this repairs drift if package.json fell behind).
+// Only write if it actually differs — avoids a spurious diff in --no-bump
+// runs where package.json was already correct.
+if (pkg.version !== newVersion) {
+  pkg.version = newVersion;
+  const updatedPkgRaw = JSON.stringify(pkg, null, 2);
+  if (!dryRun) {
+    writeFileSync(pkgPath, updatedPkgRaw + '\n');
+    console.log(`[release] package.json synced: ${pkg.version} (was ${pkgRaw.match(/"version"\s*:\s*"([^"]+)"/)?.[1] ?? 'unknown'}) → ${newVersion}`);
+  } else {
+    console.log(`[release] (dry-run) would sync package.json version → ${newVersion}`);
+  }
 }
 const tag = `v${newVersion}`;
 
@@ -248,11 +273,18 @@ if (dryRun) {
 //   wupi.html, paw.png, assets/   (from dist/ — Vite emits wupi.html as
 //                                  the entry per §8C; tauri.conf.json's
 //                                  window `url: wupi.html` loads it)
+//   bin/                          (v0.3.7 — ALL runtime DLLs live here:
+//   │                              8 trimmed CUDA DLLs + msvcp140 + vcomp140.
+//   │                              main.rs calls SetDllDirectoryW(<exe>\bin)
+//   │                              at start + the 4 static-import DLLs are
+//   │                              /DELAYLOAD'd so the loader finds them in
+//   │                              bin/ on first call. See the DLL block
+//   │                              below for the full rationale.)
 //   data/                         (engine-shipped identity content)
 //   ├── wupi.sim                  (Wupi's ACTIVE persona, lowercase w,
 //   │                              single copy — Chloe's personal content)
 //   └── user.xml                  (EMPTY template — user authors via the
-//                                  Profile Editor; preserved on update)
+//                                  User Editor; preserved on update)
 //   (no memory/, models/, apps/ — those are USER DATA, created on first
 //    run by setup() and preserved across updates per §8C)
 //
@@ -339,7 +371,146 @@ for (const f of readdirSync(distDir)) {
 // run and preserved across updates by the updater's preserve rule (§8C).
 cpSync(srcDataDir, join(stageWupiDir, 'data'), { recursive: true });
 
-console.log(`[release] staged portable layout at ${stageWupiDir}`);
+// ──────────────────────────────────────────────────────────────────────────
+// CUDA + VC++ RUNTIME DLLs → `bin/` subdirectory (v0.3.7 layout).
+//
+// wupi.exe is built against CUDA 13.x (llama.cpp ggml-cuda backend) on the
+// dev PC. ALL shipped runtime DLLs — CUDA + VC++ — live in a `bin/` subdir
+// next to wupi.exe, NOT loose at the install root. This keeps the root clean
+// (just wupi.exe, wupi.html, paw.png, assets/, data/) and groups the ~10
+// runtime support files together.
+//
+// HOW THIS WORKS (the delay-load + SetDllDirectoryW dance):
+//   1. main.rs calls SetDllDirectoryW(<exe_dir>\bin) at process start, BEFORE
+//      any CUDA-touching code. This adds `bin/` to the per-process DLL
+//      search path for both LoadLibrary and the delay-load helper.
+//   2. The 4 PE static-import DLLs (cublas64_13, cudart64_13, msvcp140,
+//      vcomp140) are compiled with /DELAYLOAD (see src-tauri/.cargo/config.toml
+//      rustflags). Delay-load flips them from "loader resolves at process
+//      start" to "stub resolves on first symbol call" — by which point
+//      SetDllDirectoryW has already pointed the search at bin/.
+//   3. The remaining CUDA DLLs (cublasLt, nvJitLink, nvrtc*, nvfatbin,
+//      cufft) are LoadLibrary'd by ggml-cuda at first GPU op → they look up
+//      via the same search path → bin/.
+//
+// TRIMMED SET (v0.3.7): we ship ONLY the 8 CUDA DLLs llama.cpp actually
+// calls during inference, not the full bin/x64 set. Empirically unused by
+// ggml-cuda: cusolver*, cusparse*, curand*, all npp* (10 files), nvjpeg*,
+// nvblas*, cufftw*. Trim cuts ~1.6GB → ~500MB. The set is version-pinned
+// to CUDA 13.x by the `_13` / `_130_0` / `_133` suffixes — re-verify on a
+// clean machine after any llama-cpp-2 bump (ggml-cuda's LoadLibrary set can
+// change between versions; if a fresh install errors on a missing DLL,
+// add it here).
+//
+// UPDATER COMPAT: updater.rs `apply_extracted` uses `walk_files` +
+// `dst.parent().create_dir_all()`, so a zip entry at `bin/<dll>` extracts
+// to `<install_root>/bin/<dll>` correctly. `is_preserved` carves out only
+// data/ memory/ models/ apps/ — `bin/` is treated as engine content and
+// replaced on update, exactly like wupi.exe itself. No updater change
+// needed for the bin/ move.
+// ──────────────────────────────────────────────────────────────────────────
+const cudaPath = process.env.CUDA_PATH
+  || (process.env.CUDA_PATH_V13_3 && process.env.CUDA_PATH_V13_3)  // versioned fallback
+  || null;
+if (!cudaPath) {
+  console.error('[release] !! CUDA_PATH env var not set.');
+  console.error('              wupi.exe links against CUDA 13.x — the runtime DLLs MUST ship');
+  console.error('              in the portable zip or every fresh install crashes on launch with');
+  console.error('              "cublas64_13.dll was not found". The CUDA Toolkit installer sets');
+  console.error('              CUDA_PATH automatically; if you are seeing this the install is');
+  console.error('              broken on this dev box. REFUSING to ship a broken zip.');
+  process.exit(1);
+}
+const cudaBinX64 = join(cudaPath, 'bin', 'x64');
+if (!existsSync(cudaBinX64)) {
+  console.error(`[release] !! CUDA bin/x64 dir not found at: ${cudaBinX64}`);
+  console.error('              (resolved from CUDA_PATH). Expected to contain cublas64_13.dll etc.');
+  console.error('              REFUSING to ship a zip missing the CUDA runtime.');
+  process.exit(1);
+}
+
+// The trimmed allow-list (v0.3.7). Lowercase compare for case-tolerance.
+// See the comment block above for the rationale + the "re-verify on
+// llama-cpp-2 bump" warning.
+const CUDA_DLL_ALLOWLIST = new Set([
+  'cublas64_13.dll',
+  'cublasLt64_13.dll',
+  'cudart64_13.dll',
+  'cufft64_12.dll',
+  'nvJitLink_130_0.dll',
+  'nvrtc64_130_0.dll',
+  'nvrtc-builtins64_133.dll',
+  'nvfatbin_130_0.dll',
+].map((s) => s.toLowerCase()));
+
+// Sanity: cublas64_13 is the canonical CUDA-13 canary. If it's missing the
+// installed toolkit isn't v13.x — refuse rather than ship a broken zip.
+if (!existsSync(join(cudaBinX64, 'cublas64_13.dll'))) {
+  console.error(`[release] !! cublas64_13.dll not found in ${cudaBinX64}.`);
+  console.error('              The installed CUDA Toolkit is not v13.x — wupi.exe was built');
+  console.error('              against CUDA 13 and its DLLs must ship. REFUSING to ship broken zip.');
+  process.exit(1);
+}
+
+// `bin/` lives at the install root, next to wupi.exe. All DLLs go here.
+const stageBinDir = join(stageWupiDir, 'bin');
+mkdirSync(stageBinDir, { recursive: true });
+
+let cudaDllCount = 0;
+let cudaDllBytes = 0;
+let cudaDllSkipped = 0;
+for (const f of readdirSync(cudaBinX64)) {
+  if (!f.toLowerCase().endsWith('.dll')) continue;
+  if (!CUDA_DLL_ALLOWLIST.has(f.toLowerCase())) {
+    cudaDllSkipped++;
+    continue;
+  }
+  const src = join(cudaBinX64, f);
+  const dst = join(stageBinDir, f);
+  copyFileSync(src, dst);
+  cudaDllCount++;
+  cudaDllBytes += statSync(src).size;
+}
+console.log(`[release] copied ${cudaDllCount} CUDA runtime DLLs → bin/ (${(cudaDllBytes / 1024 / 1024).toFixed(0)} MB)`);
+console.log(`[release]   skipped ${cudaDllSkipped} unused CUDA DLLs (cusolver/cusparse/curand/npp*/nvjpeg/nvblas/cufftw)`);
+
+// Hard-fail if the allow-list under-delivered: every entry must be present
+// in CUDA_PATH\bin\x64. A typo here would silently ship a zip missing a
+// required DLL — better to refuse than debug a launch crash on a tester's
+// machine.
+if (cudaDllCount !== CUDA_DLL_ALLOWLIST.size) {
+  const missing = [...CUDA_DLL_ALLOWLIST].filter((name) => {
+    // readdirSync preserves case; do a case-insensitive existence check.
+    const realName = readdirSync(cudaBinX64).find((f) => f.toLowerCase() === name);
+    return !realName;
+  });
+  console.error(`[release] !! only ${cudaDllCount}/${CUDA_DLL_ALLOWLIST.size} allow-listed DLLs found in ${cudaBinX64}.`);
+  console.error(`[release]    missing: ${missing.join(', ')}`);
+  console.error('[release]    The CUDA 13.x install is incomplete or the allow-list drifted.');
+  console.error('[release]    REFUSING to ship a zip missing required DLLs.');
+  process.exit(1);
+}
+
+// VC++ runtime DLLs. The exe's PE imports include MSVCP140.dll + VCOMP140.DLL
+// (OpenMP runtime, used by llama.cpp). MSVCP140 is common on Windows but
+// VCOMP140 is not — ship both in bin/ (delay-loaded, same as the CUDA
+// statics) so the loader finds them via SetDllDirectoryW without requiring
+// the user to install the VC++ redistributable. Both are tiny (~1MB
+// combined) and live in C:\Windows\System32 on the dev box.
+const system32 = join(process.env.SystemRoot || 'C:\\Windows', 'System32');
+for (const vcDll of ['msvcp140.dll', 'vcomp140.dll']) {
+  const src = join(system32, vcDll);
+  if (!existsSync(src)) {
+    console.warn(`[release] !! ${vcDll} not found in ${system32} — skipping.`);
+    console.warn('              wupi.exe imports this. If you see a missing-DLL error on a');
+    console.warn('              fresh install, install the VC++ 2015-2022 x64 Redistributable.');
+    continue;
+  }
+  copyFileSync(src, join(stageBinDir, vcDll));
+  console.log(`[release] copied ${vcDll} → bin/`);
+}
+
+console.log(`[release] staged portable layout at ${stageWupiDir} (DLLs in bin/)`);
 
 // ──────────────────────────────────────────────────────────────────────────
 // Step 4.5: Zip the staged tree using adm-zip (pure-JS, devDependency).

@@ -1163,7 +1163,7 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     box-shadow: none;
 }
 
-/* Section divider between the connect stack and the profile editor. */
+/* Section divider between the connect stack and the user editor. */
 .ai-section-divider {
     height: 1px;
     background: rgba(255, 255, 255, 0.08);
@@ -2187,4 +2187,206 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     color: #ff6b8a;
     min-height: 18px;
     line-height: 1.5;
+}
+
+/* ───────────────────────────────────────────────────────────────────────
+   TERMINAL DRAWER
+   Right-side slide-in glass drawer. xterm.js renders the visible surface
+   (#terminalBody); the real cmd.exe runs headless in a ConPTY on the Rust
+   side (terminal.rs). Kill-on-close: drawer dismiss terminates the child so
+   no zombie cmd.exe can survive (the old second-window terminal's failure
+   mode). Spawns lazily on first open.
+   Reuses the canonical .app-window glass (rgba(20,10,35,0.72) + blur(28px)
+   + magenta hairline border) but overrides geometry to a full-height right
+   dock and uses a custom slide-in animation (translateX(100%) → 0).
+   ─────────────────────────────────────────────────────────────────────── */
+.app-window.terminal {
+    /* top: 56px — clears the 48px top bar (.top-bar height) with the same
+       8px gap the paw-menu dropdowns use (top: 56px at styles.css:286/314).
+       Without this the drawer's header + magenta X hide behind the top bar. */
+    top: 56px;
+    right: 0;
+    bottom: 0;
+    width: 520px;
+    max-width: 90vw;
+    /* Flush right edge: square corners on the right, rounded on the left so
+       it reads as docking into the screen edge. */
+    border-radius: 18px 0 0 18px;
+    border-right: none;
+    /* Slide-in start position. The .show animation moves us to translateX(0). */
+    transform: translateX(100%);
+    transition: transform 0.32s cubic-bezier(0.175, 0.885, 0.32, 1.1);
+}
+.app-window.terminal.show {
+    transform: translateX(0);
+    /* Override .app-window.show's winOpen keyframe (translateY bounce) —
+       we want a pure horizontal slide, not the centered-modal bounce. */
+    animation: none;
+}
+
+/* Custom header (NOT .app-window-header) so we can host the magenta-glow X
+   without affecting other windows. Same layout + bottom border as the
+   canonical header so it reads as the same component. */
+.terminal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 18px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    user-select: none;
+    flex-shrink: 0;
+}
+
+/* THE MAGENTA GLOW X. Borderless, bold, glowy — the spec's "thick bold
+   magenta X button on the top right with no border just the glowy X."
+   Uses the project's canonical glow recipe from .download-title
+   (text-shadow stack). Hover bumps the glow intensity; no background fill
+   ever appears (the X is the whole button, nothing else). */
+.terminal-close {
+    background: none;
+    border: none;
+    color: #ff4ecd;
+    font-size: 22px;
+    font-weight: 800;
+    line-height: 1;
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 8px;
+    text-shadow:
+        0 0 12px rgba(255, 78, 205, 0.85),
+        0 0 28px rgba(181, 52, 250, 0.55);
+    transition: text-shadow 0.15s ease, transform 0.15s ease;
+}
+.terminal-close:hover {
+    text-shadow:
+        0 0 16px rgba(255, 78, 205, 1),
+        0 0 36px rgba(181, 52, 250, 0.85),
+        0 0 60px rgba(255, 78, 205, 0.5);
+    transform: scale(1.1);
+}
+.terminal-close:active {
+    transform: scale(0.95);
+}
+
+/* The xterm viewport. flex:1 so it fills the space between header and input
+   row. overflow:hidden because xterm manages its own scrolling. */
+.terminal-body {
+    flex: 1;
+    overflow: hidden;
+    padding: 8px 12px;
+    /* xterm's transparent canvas needs a darker base than the glass to read
+       as a "real" terminal surface. Slight transparency so the magenta
+       border glow bleeds in at the edges. */
+    background: rgba(5, 2, 12, 0.55);
+    min-height: 0; /* lets flex shrink within the drawer */
+}
+/* Make xterm's own helpers (the viewport scrollbar + screen) transparent so
+   our drawer background shows through. xterm inverts these by default. */
+.terminal-body .xterm {
+    height: 100%;
+    padding: 0;
+}
+.terminal-body .xterm-viewport {
+    background-color: transparent !important;
+    overflow-y: auto !important;
+}
+.terminal-body .xterm-screen {
+    background-color: transparent !important;
+}
+
+/* Sleek thin purple scrollbar inside the terminal — reuses the project's
+   canonical rgba(181,52,250,0.3/0.5) recipe (5 other instances in this
+   file). Scoped to .xterm-viewport (xterm's scroll container). */
+.terminal-body .xterm-viewport::-webkit-scrollbar {
+    width: 8px;
+}
+.terminal-body .xterm-viewport::-webkit-scrollbar-track {
+    background: transparent;
+}
+.terminal-body .xterm-viewport::-webkit-scrollbar-thumb {
+    background: rgba(181, 52, 250, 0.3);
+    border-radius: 4px;
+}
+.terminal-body .xterm-viewport::-webkit-scrollbar-thumb:hover {
+    background: rgba(181, 52, 250, 0.5);
+}
+
+/* Bottom input row: mirrors .chat-input-area's structure (top border + dark
+   bg) but uses an <input> (not textarea) since Enter = send (single-line). */
+.terminal-input-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    padding: 12px 14px;
+    background: rgba(0, 0, 0, 0.2);
+    flex-shrink: 0;
+}
+.terminal-input {
+    flex: 1;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 10px;
+    padding: 10px 12px;
+    color: #fff;
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+    font-size: 13px;
+    outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
+}
+.terminal-input:focus {
+    border-color: rgba(181, 52, 250, 0.6);
+    box-shadow: 0 0 0 3px rgba(181, 52, 250, 0.12);
+}
+.terminal-input::placeholder {
+    color: rgba(255, 255, 255, 0.35);
+    font-style: italic;
+}
+
+/* Stop button: secondary, muted. Sends the pty break signal under the hood
+   (terminal_stop IPC). Visible always but only meaningful while a command
+   is running. */
+.terminal-stop-btn {
+    padding: 9px 14px;
+    background: rgba(255, 255, 255, 0.06);
+    color: rgba(255, 255, 255, 0.7);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 10px;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.terminal-stop-btn:hover {
+    background: rgba(255, 80, 80, 0.18);
+    color: #fff;
+    border-color: rgba(255, 80, 80, 0.4);
+}
+
+/* THE MAGENTA SEND TRIANGLE. Borderless, glowy — same recipe as the X close
+   button so the drawer's two accent affordances read as a matched pair.
+   Unicode ▶ (U+25B6) scales crisply at any size; no SVG needed. */
+.terminal-send-btn {
+    background: none;
+    border: none;
+    color: #ff4ecd;
+    font-size: 20px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 6px 10px;
+    border-radius: 8px;
+    text-shadow:
+        0 0 12px rgba(255, 78, 205, 0.85),
+        0 0 28px rgba(181, 52, 250, 0.55);
+    transition: text-shadow 0.15s ease, transform 0.15s ease;
+}
+.terminal-send-btn:hover {
+    text-shadow:
+        0 0 16px rgba(255, 78, 205, 1),
+        0 0 36px rgba(181, 52, 250, 0.85);
+    transform: scale(1.15) translateX(2px);
+}
+.terminal-send-btn:active {
+    transform: scale(0.95);
 }

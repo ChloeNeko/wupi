@@ -19,12 +19,30 @@
 //! 20-100 tokens for sub-second generation. See `schema.rs` for the merge
 //! semantics (`null` = delete key).
 //!
-//! # JSON robustness
+//! # The fail-proof contract (3-pass + Rust validator + failure queue)
 //!
-//! `SchemaDelta::from_model_output` strips markdown fences. If parsing still
-//! fails, the thread retries once with a repair prompt; on second failure it
-//! replies `Err` and the schema is left unchanged for that turn (graceful:
-//! chat proceeds with stale schema).
+//! Replaces the earlier "two-pass, drop on second fail" behavior. The new
+//! invariant (locked 2026-07-20, §5): **no world-state evolution is ever
+//! silently dropped.** Three layers, cheapest-first:
+//!
+//! 1. **Pure-Rust shape validator** (`schema_validator::validate`, ~0 cost).
+//!    Enforces structural integrity (key/value length, no control chars,
+//!    per-delta count caps). Defense by *structure*: a delta that fails
+//!    validation gets fed its specific error back via the repair prompt so
+//!    the model can correct the *issue*, not just regenerate blindly.
+//! 2. **3-pass repair loop with accumulating context.** Initial generation →
+//!    if parse OR validation fails, repair pass 1 (shows pass 1's raw output
+//!    + the specific error) → repair pass 2 (shows BOTH prior errors + both
+//!    raw outputs). Cap is 3 (empirically the LLM-JSON-repair cliff; passes
+//!    4+ mostly produce different versions of the same failure). Worst case
+//!    ~15-24s vs 35-56s for the rejected 7-pass proposal.
+//! 3. **Failure queue (`failed_delta_queue` on AppState).** A delta that
+//!    still fails all 3 passes is NOT dropped: it's queued. The next turn's
+//!    delta prompt folds in the failed attempt as "previously deferred state
+//!    change — re-attempt with new context." The new conversational context
+//!    is a strictly better retry signal than re-running the same failed
+//!    prompt. `SchemaReply::failed_attempt` carries the data the caller
+//!    needs to enqueue.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -38,6 +56,7 @@ use llama_cpp_2::token::LlamaToken;
 
 use crate::llm::shared_backend;
 use crate::schema::{SchemaDelta, WorldSchema};
+use crate::schema_validator;
 
 /// The schema context's token budget. Smaller than chat's 4000: the delta
 /// pass only needs: system instruction (~150 tokens) + current schema JSON
@@ -51,6 +70,13 @@ const SCHEMA_BATCH: u32 = 512;
 /// anyway and the repair path or error path handles it.
 const SCHEMA_MAX_TOKENS: i32 = 256;
 
+/// Maximum number of generation passes per delta attempt (initial + 2
+/// repairs = 3 total). The 4th-and-beyond cliff is empirically steep for
+/// LLM-JSON-repair; the failure queue (fold-into-next-turn) is the strictly
+/// better retry strategy past this cap. See module doc "The fail-proof
+/// contract" layer 2.
+const MAX_DELTA_PASSES: u8 = 3;
+
 // ---------------------------------------------------------------------------
 // Control plane: channel types
 // ---------------------------------------------------------------------------
@@ -63,6 +89,11 @@ struct SchemaRequest {
     /// The current schema serialized as pretty JSON, so the model knows what
     /// to diff against.
     current_schema_json: String,
+    /// Deferred attempts from prior turns that the engine couldn't commit
+    /// (all 3 passes failed). Folded into this turn's prompt as
+    /// "previously deferred state changes — re-attempt with the new exchange
+    /// as context." Empty in the common case (no prior failures).
+    deferred_attempts: Vec<FailedAttempt>,
     /// One-shot reply channel.
     reply: mpsc::Sender<SchemaReply>,
 }
@@ -72,17 +103,90 @@ struct SchemaRequest {
 /// Component D's queue) can see exactly what the model emitted: essential for
 /// diagnosing JSON malformedness. On parse failure, `delta` is `None` and
 /// `error` explains why. `raw_output` is always populated on a completed pass.
+///
+/// `failed_attempt` is `Some` ONLY when all 3 passes failed AND the failure
+/// looks retryable (parse failures, validation failures). Generation errors
+/// (tokenize/prefill/decode infrastructure failures) leave it `None` — those
+/// aren't going to fix themselves on the next turn. The caller (lib.rs's
+/// delta-fire spawn) pushes the `FailedAttempt` onto the failure queue; the
+/// next turn's delta prompt folds it in. See module doc layer 3.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SchemaReply {
     /// The verbatim model output (post generation). Empty only if generation
     /// itself failed before producing tokens.
     pub raw_output: String,
-    /// The parsed delta, if JSON was valid. `None` on parse failure or
-    /// generation error.
+    /// The parsed delta, if JSON was valid AND passed validation. `None` on
+    /// parse failure, validation failure, or generation error.
     pub delta: Option<SchemaDelta>,
     /// Human-readable error if the pass failed (tokenize/prefill/decode, or
-    /// JSON parse failure after both passes). Empty string on success.
+    /// JSON parse failure after all passes, or validation failure after all
+    /// passes). Empty string on success.
     pub error: String,
+    /// Populated when all 3 passes failed AND the failure is retryable
+    /// (parse/validation errors). The caller enqueues this; the next turn
+    /// re-attempts with fresh conversational context. `None` on success, on
+    /// infrastructure errors, or on generation panics (those don't benefit
+    /// from a retry).
+    #[serde(default)]
+    pub failed_attempt: Option<FailedAttempt>,
+}
+
+/// A deferred delta: the schema engine's claim check for a turn's
+/// world-state evolution that it couldn't commit. The caller (lib.rs) holds
+/// these in `failed_delta_queue`; the next turn's `request_delta` /
+/// `request_translation` call passes them in via `deferred_attempts` so the
+/// prompt can fold them in ("previously deferred state change — re-attempt
+/// with new context").
+///
+/// Carries the *triggering context*, not the failed model output: re-running
+/// the same broken output through the model rarely helps. What helps is
+/// giving the model a fresh generation pass with the *exchange* that
+/// produced the broken delta, alongside the new turn's exchange. The model
+/// gets two shots worth of conversational signal.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FailedAttempt {
+    /// The (user, assistant) exchange that produced the failed delta. Empty
+    /// for translation attempts (which carry `trigger` instead).
+    pub exchange: Option<(String, String)>,
+    /// The player request that produced the failed translation. `None` for
+    /// auto-summarizer attempts (which carry `exchange` instead).
+    pub trigger: Option<String>,
+    /// The accumulated errors from all 3 passes, joined. The next attempt's
+    /// prompt can include this so the model knows what went wrong last time.
+    pub errors: String,
+    /// How many times this attempt has been retried (always 3 on first
+    /// enqueue; the caller bumps it if a deferred re-attempt ALSO fails and
+    /// re-enqueues). The queue caps total retries to avoid pathological
+    /// loops — see lib.rs's `failed_delta_queue` cap.
+    pub passes_used: u8,
+}
+
+/// Type alias distinguishing the two kinds of triggering context an attempt
+/// carries. Internal to the engine; `FailedAttempt` exposes them as
+/// Option<(exchange)> / Option<request> for the IPC boundary.
+#[derive(Clone)]
+enum AttemptSource {
+    /// Auto-summarizer: triggered by a chat exchange.
+    Auto { exchange: (String, String) },
+    /// Game-manager translation: triggered by an explicit player request.
+    Translation { request: String },
+}
+
+/// The outcome of a delta-or-translation attempt. The engine's internal
+/// return type; the message handler maps this to `SchemaReply` for the IPC
+/// boundary. Distinguishes "committed cleanly" from "retryable failure" (the
+/// carrier lets the caller enqueue for next turn).
+enum AttemptOutcome {
+    /// The delta parsed + validated cleanly. Ready to apply.
+    Committed { raw_output: String, delta: SchemaDelta },
+    /// All passes failed. `last_raw_output` is for the debug panel; `errors`
+    /// is the joined accumulated diagnostics; `carrier` is what the caller
+    /// pushes onto `failed_delta_queue` so the next turn re-attempts.
+    Failed {
+        last_raw_output: String,
+        errors: String,
+        carrier: FailedAttempt,
+    },
 }
 
 enum SchemaMsg {
@@ -106,6 +210,10 @@ struct TranslationRequest {
     player_request: String,
     /// The current game-world schema as pretty JSON (what to diff against).
     current_schema_json: String,
+    /// Deferred translation attempts from prior player requests that the
+    /// engine couldn't commit. Folded into this request's prompt so the
+    /// model gets another shot with new context. Empty in the common case.
+    deferred_attempts: Vec<FailedAttempt>,
     /// One-shot reply channel.
     reply: mpsc::Sender<SchemaReply>,
 }
@@ -199,34 +307,45 @@ impl SchemaEngine {
                     };
                     let Some((outcome, reply_tx)) = parsed_msg else { continue };
                     let reply_msg = match outcome {
-                        Ok(Ok((raw, Ok(delta)))) => SchemaReply {
-                            raw_output: raw,
+                        // Generation succeeded; delta parsed + validated.
+                        Ok(Ok(AttemptOutcome::Committed { raw_output, delta })) => SchemaReply {
+                            raw_output,
                             delta: Some(delta),
                             error: String::new(),
+                            failed_attempt: None,
                         },
-                        Ok(Ok((raw, Err(e)))) => {
-                            // Generation succeeded but JSON parse failed
-                            // twice. Surface the raw output so the debug
-                            // panel can show what the model emitted.
-                            tracing::warn!(error = %e, "schema delta parse failed");
+                        // Generation succeeded but all 3 passes failed
+                        // (parse/validation). Retryable: surface the carrier
+                        // so the caller enqueues for next-turn re-attempt.
+                        // The schema is unchanged for THIS turn.
+                        Ok(Ok(AttemptOutcome::Failed { last_raw_output, errors, carrier })) => {
+                            tracing::warn!(
+                                error = %errors,
+                                passes = carrier.passes_used,
+                                "schema attempt failed all passes; queuing for re-attempt"
+                            );
                             runtime.ctx.clear_kv_cache();
                             SchemaReply {
-                                raw_output: raw,
+                                raw_output: last_raw_output,
                                 delta: None,
-                                error: e,
+                                error: errors,
+                                failed_attempt: Some(carrier),
                             }
                         }
+                        // Generation itself failed (tokenize/prefill/decode).
+                        // Infrastructure failure: not retryable, no carrier.
                         Ok(Err(e)) => {
-                            // Generation itself failed (tokenize/prefill/
-                            // decode). No raw output to report.
-                            tracing::warn!(error = %format!("{e:#}"), "schema delta failed");
+                            tracing::warn!(error = %format!("{e:#}"), "schema generation failed (infrastructure)");
                             runtime.ctx.clear_kv_cache();
                             SchemaReply {
                                 raw_output: String::new(),
                                 delta: None,
                                 error: format!("{e:#}"),
+                                failed_attempt: None,
                             }
                         }
+                        // The catch_unwind caught a panic. Thread survives
+                        // (KV cleared below); not retryable, no carrier.
                         Err(payload) => {
                             let msg = payload
                                 .downcast_ref::<String>()
@@ -243,6 +362,7 @@ impl SchemaEngine {
                                 raw_output: String::new(),
                                 delta: None,
                                 error: format!("schema panic: {msg}"),
+                                failed_attempt: None,
                             }
                         }
                     };
@@ -262,15 +382,22 @@ impl SchemaEngine {
     /// Post a delta request. The caller awaits the reply via the receiver
     /// it created. Fire-and-forget is NOT the contract here: the caller
     /// (chat_send's queue) needs the result before proceeding.
+    ///
+    /// `deferred_attempts` carries failures from prior turns (folded into
+    /// the prompt so the model gets another shot with fresh context). Pass
+    /// an empty vec in the common case; the caller is responsible for
+    /// draining the failure queue.
     pub fn request_delta(
         &self,
         last_exchange: (String, String),
         current_schema: &WorldSchema,
+        deferred_attempts: Vec<FailedAttempt>,
     ) -> anyhow::Result<mpsc::Receiver<SchemaReply>> {
         let (reply_tx, reply_rx) = mpsc::channel::<SchemaReply>();
         let req = SchemaRequest {
             last_exchange,
             current_schema_json: current_schema.to_json_pretty(),
+            deferred_attempts,
             reply: reply_tx,
         };
         self.tx
@@ -284,15 +411,20 @@ impl SchemaEngine {
     /// `route_to_game_manager` when Wupi intercepts a "make it stormy" /
     /// "give me a sword" / "travel to the dungeon" command. Same reply
     /// contract as `request_delta`: caller awaits via the returned receiver.
+    ///
+    /// `deferred_attempts` carries translation failures from prior player
+    /// requests. Pass an empty vec in the common case.
     pub fn request_translation(
         &self,
         player_request: String,
         current_schema: &WorldSchema,
+        deferred_attempts: Vec<FailedAttempt>,
     ) -> anyhow::Result<mpsc::Receiver<SchemaReply>> {
         let (reply_tx, reply_rx) = mpsc::channel::<SchemaReply>();
         let req = TranslationRequest {
             player_request,
             current_schema_json: current_schema.to_json_pretty(),
+            deferred_attempts,
             reply: reply_tx,
         };
         self.tx
@@ -303,13 +435,22 @@ impl SchemaEngine {
 
     fn drain_failed(rx: &mpsc::Receiver<SchemaMsg>, why: String) {
         while let Ok(msg) = rx.recv_timeout(std::time::Duration::from_millis(50)) {
-            if let SchemaMsg::Request(req) = msg {
-                let _ = req.reply.send(SchemaReply {
-                    raw_output: String::new(),
-                    delta: None,
-                    error: why.clone(),
-                });
-            }
+            // Both Request and RequestTranslation carry a reply sender that
+            // needs an error response on init failure. The deferred_attempts
+            // are dropped (the caller will re-enqueue them next turn from
+            // its own failure queue — the schema thread's queue is separate
+            // from the caller's AppState queue and is always empty between
+            // turns).
+            let reply_tx = match msg {
+                SchemaMsg::Request(r) => r.reply,
+                SchemaMsg::RequestTranslation(r) => r.reply,
+            };
+            let _ = reply_tx.send(SchemaReply {
+                raw_output: String::new(),
+                delta: None,
+                error: why.clone(),
+                failed_attempt: None, // infrastructure failure, not retryable
+            });
         }
     }
 
@@ -357,91 +498,167 @@ struct SchemaRuntime {
 impl SchemaRuntime {
     /// Generate a micro-delta for the given exchange + current schema.
     ///
-    /// Two-pass: render the delta prompt, generate, parse JSON. If parsing
-    /// fails, retry once with a repair prompt. On second failure, return Err
-    /// (the schema is left unchanged for this turn: graceful degradation).
-    ///
-    /// Returns `(raw_output, Result<delta, error>)` so the caller can always
-    /// see what the model emitted, even when parsing failed: essential for the
-    /// debug panel's JSON-malformedness diagnosis.
+    /// Fail-proof contract (see module doc): 3-pass max with accumulating
+    /// repair context, validator between parse and success, failure queue
+    /// carrier on the returned `AttemptOutcome::Failed` variant.
     fn generate_delta(
         &mut self,
         req: &SchemaRequest,
-    ) -> Result<(String, Result<SchemaDelta, String>), anyhow::Error> {
-        let prompt = render_delta_prompt(&req.current_schema_json, &req.last_exchange);
-        let raw = self.generate_text(&prompt)?;
-        match SchemaDelta::from_model_output(&raw) {
-            Ok(delta) => {
-                tracing::debug!(tokens = raw.len(), "schema delta parsed on first pass");
-                Ok((raw, Ok(delta)))
-            }
-            Err(first_err) => {
-                tracing::warn!(
-                    error = %first_err,
-                    raw_preview = %raw.chars().take(200).collect::<String>(),
-                    "schema delta JSON parse failed; retrying with repair prompt"
-                );
-                let repair = render_repair_prompt(&raw);
-                let raw2 = self.generate_text(&repair)?;
-                // The returned raw_output is the RETRY's output (the most
-                // recent model emission): that's what's diagnostically
-                // useful when the caller wants to see why parsing failed.
-                match SchemaDelta::from_model_output(&raw2) {
-                    Ok(delta) => Ok((raw2, Ok(delta))),
-                    Err(e) => Ok((
-                        raw2,
-                        Err(format!(
-                            "schema delta parse failed twice: first={first_err}, retry={e}"
-                        )),
-                    )),
-                }
-            }
-        }
+    ) -> Result<AttemptOutcome, anyhow::Error> {
+        let initial_prompt = render_delta_prompt(
+            &req.current_schema_json,
+            &req.last_exchange,
+            &req.deferred_attempts,
+        );
+        self.generate_with_repair(
+            &initial_prompt,
+            AttemptSource::Auto {
+                exchange: req.last_exchange.clone(),
+            },
+            &req.deferred_attempts,
+            "schema delta",
+        )
     }
 
     /// Translate a player's natural-language game-management request into a
-    /// `SchemaDelta` (Phase E, 2026-07-18). Same shape as `generate_delta` -
-    /// two-pass with repair, same JSON parser: but the prompt is built by
-    /// `game_command::render_translation_prompt` from the player's verbatim
-    /// text + the current game-world schema. Used by Wupi-as-game-manager
-    /// when she intercepts "make it stormy" / "give me a sword" via chat_send.
+    /// `SchemaDelta` (Phase E, 2026-07-18). Same fail-proof contract as
+    /// `generate_delta`: 3-pass + validator + failure queue. The initial
+    /// prompt is built by `game_command::render_translation_prompt` from the
+    /// player's verbatim text + the current game-world schema. Used by
+    /// Wupi-as-game-manager when she intercepts "make it stormy" / "give me
+    /// a sword" via chat_send.
     fn generate_translation(
         &mut self,
         req: &TranslationRequest,
-    ) -> Result<(String, Result<SchemaDelta, String>), anyhow::Error> {
-        let prompt = crate::game_command::render_translation_prompt(
+    ) -> Result<AttemptOutcome, anyhow::Error> {
+        let initial_prompt = crate::game_command::render_translation_prompt(
             &req.player_request,
             &req.current_schema_json,
+            &req.deferred_attempts,
         );
-        let raw = self.generate_text(&prompt)?;
-        match SchemaDelta::from_model_output(&raw) {
-            Ok(delta) => {
-                tracing::debug!(
-                    tokens = raw.len(),
-                    request = %req.player_request.chars().take(80).collect::<String>(),
-                    "schema translation parsed on first pass"
-                );
-                Ok((raw, Ok(delta)))
-            }
-            Err(first_err) => {
-                tracing::warn!(
-                    error = %first_err,
-                    request = %req.player_request.chars().take(80).collect::<String>(),
-                    "schema translation parse failed; retrying with repair prompt"
-                );
-                let repair = render_repair_prompt(&raw);
-                let raw2 = self.generate_text(&repair)?;
-                match SchemaDelta::from_model_output(&raw2) {
-                    Ok(delta) => Ok((raw2, Ok(delta))),
-                    Err(e) => Ok((
-                        raw2,
-                        Err(format!(
-                            "translation parse failed twice: first={first_err}, retry={e}"
-                        )),
-                    )),
+        self.generate_with_repair(
+            &initial_prompt,
+            AttemptSource::Translation {
+                request: req.player_request.clone(),
+            },
+            &req.deferred_attempts,
+            "schema translation",
+        )
+    }
+
+    /// The shared 3-pass repair loop. Runs the model up to `MAX_DELTA_PASSES`
+    /// times. Each pass parses the output via `SchemaDelta::from_model_output`
+    /// AND validates it via `schema_validator::validate`. A pass succeeds only
+    /// if both parse and validation succeed. Repair prompts accumulate prior
+    /// errors + prior raw outputs so the model sees what it got wrong, not
+    /// just a generic "try again."
+    ///
+    /// Returns `AttemptOutcome` (success / parse-or-validation failure /
+    /// retryable-failure-with-carrier) so the message handler can build the
+    /// right `SchemaReply` including the failure-queue carrier.
+    ///
+    /// `label` is a short diagnostic ("schema delta" / "schema translation")
+    /// used in tracing. `source` carries the trigger context (exchange or
+    /// player request) so a failed attempt can be re-attempted on the next
+    /// turn. `prior_deferred` is the failures folded in from previous turns;
+    /// it does NOT count toward this attempt's pass budget.
+    fn generate_with_repair(
+        &mut self,
+        initial_prompt: &str,
+        source: AttemptSource,
+        prior_deferred: &[FailedAttempt],
+        label: &'static str,
+    ) -> Result<AttemptOutcome, anyhow::Error> {
+        let validation_ctx = schema_validator::ValidationContext::default();
+
+        // Track every failure across all passes so we can (a) accumulate them
+        // into the repair prompt and (b) carry them on the FailedAttempt if
+        // all passes fail.
+        let mut errors: Vec<String> = Vec::with_capacity(MAX_DELTA_PASSES as usize);
+        let mut raw_outputs: Vec<String> = Vec::with_capacity(MAX_DELTA_PASSES as usize);
+        let mut last_raw = String::new();
+
+        for pass in 1..=MAX_DELTA_PASSES {
+            let prompt: String = if pass == 1 {
+                // First pass: the caller-built initial prompt (delta or
+                // translation), already includes deferred-attempts context
+                // if any.
+                initial_prompt.to_string()
+            } else {
+                // Repair pass: shows the accumulated raw outputs + errors
+                // from every prior pass. The model sees what it got wrong
+                // and why, so it can correct the specific issue.
+                render_accumulated_repair_prompt(&raw_outputs, &errors)
+            };
+            let raw = self.generate_text(&prompt)?;
+            last_raw = raw.clone();
+            raw_outputs.push(raw.clone());
+
+            // Parse the JSON (channel-protocol + fence strip happens inside
+            // from_model_output).
+            let parsed = SchemaDelta::from_model_output(&raw);
+            let delta = match parsed {
+                Ok(d) => d,
+                Err(e) => {
+                    let msg = format!("pass {pass} JSON parse: {e}");
+                    tracing::warn!(
+                        label,
+                        pass,
+                        error = %e,
+                        raw_preview = %raw.chars().take(200).collect::<String>(),
+                        "{label} parse failed"
+                    );
+                    errors.push(msg);
+                    continue; // next pass
                 }
+            };
+
+            // Validate structure. This is the §1B defense layer: catches
+            // parseable-but-corrupt deltas (control chars, runaway length,
+            // count-cap violations) at zero LLM cost.
+            if let Err(vfail) = schema_validator::validate(&delta, &validation_ctx) {
+                let msg = format!("pass {pass} validation: {vfail}");
+                tracing::warn!(label, pass, failure = %vfail, "{label} validation failed");
+                errors.push(msg);
+                continue; // next pass — repair prompt will show the failure
             }
+
+            // Success: parse OK + validation OK. Trace + return.
+            tracing::debug!(
+                label,
+                pass,
+                tokens = raw.len(),
+                deferred = prior_deferred.len(),
+                "{label} committed on pass {pass}"
+            );
+            return Ok(AttemptOutcome::Committed { raw_output: raw, delta });
         }
+
+        // All passes exhausted. Build the failure-queue carrier so the caller
+        // can enqueue this for re-attempt on the next turn. The carrier
+        // carries the SOURCE (exchange or request) + the accumulated errors;
+        // it does NOT carry the broken raw outputs (re-running those through
+        // the model rarely helps; fresh context does).
+        let (exchange_opt, trigger_opt) = match &source {
+            AttemptSource::Auto { exchange } => (Some(exchange.clone()), None),
+            AttemptSource::Translation { request } => (None, Some(request.clone())),
+        };
+        tracing::warn!(
+            label,
+            passes = MAX_DELTA_PASSES,
+            errors = errors.join(" | "),
+            "{label} failed all {MAX_DELTA_PASSES} passes; carrying for re-attempt"
+        );
+        Ok(AttemptOutcome::Failed {
+            last_raw_output: last_raw,
+            errors: errors.join(" | "),
+            carrier: FailedAttempt {
+                exchange: exchange_opt,
+                trigger: trigger_opt,
+                errors: errors.join(" | "),
+                passes_used: MAX_DELTA_PASSES,
+            },
+        })
     }
 
     /// Tokenize → prefill → sample-and-decode a single response. One-shot
@@ -553,7 +770,15 @@ impl SchemaRuntime {
 /// the model sees familiar structure, but the content is schema-specific.
 /// NOT routed through `ChatFormat::render_prompt`: this is a dedicated
 /// renderer (the schema pass isn't a chat turn).
-fn render_delta_prompt(current_schema_json: &str, last_exchange: &(String, String)) -> String {
+///
+/// `deferred_attempts` carries failures from prior turns (fail-proof contract
+/// §5 layer 3). Folded in as "previously deferred state changes — re-attempt
+/// with this turn's exchange as anchor." Empty in the common case.
+fn render_delta_prompt(
+    current_schema_json: &str,
+    last_exchange: &(String, String),
+    deferred_attempts: &[FailedAttempt],
+) -> String {
     let mut out = String::with_capacity(2048);
     out.push_str("<|turn>system\n");
     out.push_str(DELTA_SYSTEM_INSTRUCTION);
@@ -565,21 +790,59 @@ fn render_delta_prompt(current_schema_json: &str, last_exchange: &(String, Strin
     out.push_str(&last_exchange.0);
     out.push_str("\n[model]: ");
     out.push_str(&last_exchange.1);
+    // Deferred re-attempt context. When the previous turn's delta failed all
+    // 3 passes, fold its triggering exchange + accumulated errors in here so
+    // the model gets another shot with the new exchange as anchor.
+    if !deferred_attempts.is_empty() {
+        out.push_str(
+            "\n\n[Previously deferred state changes — re-attempt with the above exchange as the primary context:]\n",
+        );
+        for (i, attempt) in deferred_attempts.iter().enumerate() {
+            let (u, a) = attempt
+                .exchange
+                .clone()
+                .unwrap_or(("".to_string(), "".to_string()));
+            out.push_str(&format!(
+                "  {}. prior [user]: {:?}\n      prior [model]: {:?}\n      prior errors: {}\n",
+                i + 1,
+                u.chars().take(200).collect::<String>(),
+                a.chars().take(200).collect::<String>(),
+                attempt.errors
+            ));
+        }
+    }
     out.push_str("\n<turn|>\n");
     out.push_str("<|turn>model\n");
     out
 }
 
-/// Repair prompt: when the first output wasn't valid JSON, ask again tightly.
-fn render_repair_prompt(bad_output: &str) -> String {
-    let mut out = String::with_capacity(1024);
+/// Accumulating repair prompt. Shows the model EVERY prior pass's raw output
+/// + every prior error, so it can correct the *specific* issue rather than
+/// regenerate blindly. This is the §1B-aligned repair: structured feedback
+/// at the cost of one LLM pass, not 7 blind retries.
+///
+/// The accumulated-context shape is load-bearing: pass 3 sees both pass 1
+/// and pass 2's outputs + errors, giving the model maximum signal on its
+/// final attempt before the failure queue takes over.
+fn render_accumulated_repair_prompt(prior_raw: &[String], prior_errors: &[String]) -> String {
+    let mut out = String::with_capacity(1024 + prior_raw.len() * 256);
     out.push_str("<|turn>system\n");
-    out.push_str("Your previous output was not valid JSON. Emit ONLY the JSON delta object: no prose, no markdown fences, no commentary. If nothing changed, emit {}.");
+    out.push_str(
+        "Your previous output(s) were invalid. Emit ONLY the JSON delta object: no prose, no markdown fences, no commentary. Address EACH error below. If nothing actually changed, emit {}.",
+    );
     out.push_str("<turn|>\n");
     out.push_str("<|turn>user\n");
-    out.push_str("Previous (invalid) output:\n");
-    out.push_str(bad_output);
-    out.push_str("\n<turn|>\n");
+    out.push_str(&format!("{} prior attempt(s) failed:\n", prior_raw.len()));
+    for (i, raw) in prior_raw.iter().enumerate() {
+        let err = prior_errors.get(i).map(|s| s.as_str()).unwrap_or("(no error recorded)");
+        out.push_str(&format!(
+            "\n--- Attempt {} ---\nError: {}\nYour output was:\n{}\n",
+            i + 1,
+            err,
+            raw.chars().take(500).collect::<String>(),
+        ));
+    }
+    out.push_str("\n---\nNow emit the corrected JSON delta:\n<turn|>\n");
     out.push_str("<|turn>model\n");
     out
 }
@@ -672,6 +935,7 @@ mod tests {
         let prompt = render_delta_prompt(
             "{\"summary\":\"\"}",
             &("I pick up the sword".to_string(), "You grab it.".to_string()),
+            &[], // no deferred attempts in the common case
         );
         assert!(prompt.contains("world-state tracker"));
         assert!(prompt.contains("I pick up the sword"));
@@ -681,10 +945,57 @@ mod tests {
     }
 
     #[test]
-    fn repair_prompt_references_invalid_output() {
-        let prompt = render_repair_prompt("not json at all");
-        assert!(prompt.contains("not valid JSON"));
-        assert!(prompt.contains("not json at all"));
+    fn delta_prompt_folds_deferred_attempts_when_present() {
+        // The fail-proof contract layer 3: a prior turn's failed delta must
+        // surface in the next turn's prompt so the model gets a fresh shot.
+        let deferred = vec![FailedAttempt {
+            exchange: Some(("prior user text".to_string(), "prior model text".to_string())),
+            trigger: None,
+            errors: "pass 1 JSON parse: ... | pass 2 validation: ...".to_string(),
+            passes_used: MAX_DELTA_PASSES,
+        }];
+        let prompt = render_delta_prompt(
+            "{\"summary\":\"\"}",
+            &("new user text".to_string(), "new model text".to_string()),
+            &deferred,
+        );
+        assert!(prompt.contains("Previously deferred"));
+        assert!(prompt.contains("prior user text"));
+        assert!(prompt.contains("prior model text"));
+        assert!(prompt.contains("pass 1 JSON parse"));
+        // The new exchange is still the primary anchor.
+        assert!(prompt.contains("new user text"));
+    }
+
+    #[test]
+    fn accumulated_repair_prompt_shows_every_prior_pass() {
+        // Pass 3 sees both pass 1 and pass 2's outputs + errors (load-bearing
+        // for the accumulating-context shape — vs the old single-shot repair).
+        let prior_raw = vec![
+            "first bad output".to_string(),
+            "second bad output".to_string(),
+        ];
+        let prior_errors = vec![
+            "pass 1 JSON parse: unexpected token".to_string(),
+            "pass 2 validation: invalid entity key".to_string(),
+        ];
+        let prompt = render_accumulated_repair_prompt(&prior_raw, &prior_errors);
+        assert!(prompt.contains("2 prior attempt(s) failed"));
+        assert!(prompt.contains("first bad output"));
+        assert!(prompt.contains("second bad output"));
+        assert!(prompt.contains("pass 1 JSON parse"));
+        assert!(prompt.contains("pass 2 validation"));
+    }
+
+    #[test]
+    fn accumulated_repair_prompt_truncates_long_raw_outputs() {
+        // Defense against prompt bloat: a 10KB garbage raw output shouldn't
+        // eat the entire context. Capped at 500 chars per pass.
+        let huge = "x".repeat(10_000);
+        let prompt = render_accumulated_repair_prompt(&[huge.clone()], &["err".to_string()]);
+        // The full 10KB should not appear; only a 500-char preview.
+        assert!(!prompt.contains(&huge));
+        assert!(prompt.contains(&"x".repeat(500)));
     }
 
     // The gate is the M2 overhead fix: skip the full 12B forward pass on
