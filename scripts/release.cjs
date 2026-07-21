@@ -136,6 +136,32 @@ if (pkg.version !== newVersion) {
     console.log(`[release] (dry-run) would sync package.json version → ${newVersion}`);
   }
 }
+
+// Sync src-tauri/Cargo.toml's `version = "..."` under [package] to newVersion.
+// cargo echoes this in every build log ("Compiling wupi v<X>") and it's the
+// crate's actual version (cargo's `--version`/metadata surface). It drifted
+// to 0.1.0 for the entire 0.2.x–0.3.x run because release.cjs only synced
+// tauri.conf.json + package.json. Sync on every run (bump OR --no-bump) so
+// drift gets repaired automatically. Regex-edit only the [package] version
+// line — leave [dependencies] versions untouched.
+const cargoTomlPath = join(repoRoot, 'src-tauri', 'Cargo.toml');
+const cargoTomlRaw = readFileSync(cargoTomlPath, 'utf8');
+// Match `version = "X"` only on the line immediately after `[package]` (the
+// [package] table's version field). Anchored to start-of-line + the literal
+// `version =` so we don't accidentally rewrite a dep version.
+const cargoTomlNew = cargoTomlRaw.replace(
+  /(\[package\]\s*\nname\s*=\s*"[^"]+"\s*\nversion\s*=\s*")[^"]+(")/,
+  `$1${newVersion}$2`
+);
+if (cargoTomlNew !== cargoTomlRaw) {
+  const oldVersion = cargoTomlRaw.match(/(?:\[package\][^\[]*?version\s*=\s*")([^"]+)/)?.[1] ?? 'unknown';
+  if (!dryRun) {
+    writeFileSync(cargoTomlPath, cargoTomlNew);
+    console.log(`[release] Cargo.toml synced: ${oldVersion} → ${newVersion}`);
+  } else {
+    console.log(`[release] (dry-run) would sync Cargo.toml version → ${newVersion}`);
+  }
+}
 const tag = `v${newVersion}`;
 
 // ──────────────────────────────────────────────────────────────────────────
