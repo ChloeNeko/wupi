@@ -299,13 +299,19 @@ if (dryRun) {
 //   wupi.html, paw.png, assets/   (from dist/ — Vite emits wupi.html as
 //                                  the entry per §8C; tauri.conf.json's
 //                                  window `url: wupi.html` loads it)
-//   bin/                          (v0.3.7 — ALL runtime DLLs live here:
-//   │                              8 trimmed CUDA DLLs + msvcp140 + vcomp140.
-//   │                              main.rs calls SetDllDirectoryW(<exe>\bin)
-//   │                              at start + the 4 static-import DLLs are
-//   │                              /DELAYLOAD'd so the loader finds them in
-//   │                              bin/ on first call. See the DLL block
-//   │                              below for the full rationale.)
+//   msvcp140.dll                  (v0.3.7 — the ONE loose DLL at the root.
+//                                  Static PE import that can't be /DELAYLOAD'd
+//                                  — exports data symbols, MSVC errors with
+//                                  LNK1194. Loader finds it at the exe's
+//                                  directory at process start.)
+//   bin/                          (v0.3.7 — runtime DLLs: 8 trimmed CUDA
+//   │                              DLLs + vcomp140. main.rs calls
+//   │                              SetDllDirectoryW(<exe>\bin) at start + 3
+//   │                              static-import DLLs (cublas64_13,
+//   │                              cudart64_13, vcomp140) are /DELAYLOAD'd
+//   │                              so the loader finds them in bin/ on first
+//   │                              call. See the DLL block below for the full
+//   │                              rationale.)
 //   data/                         (engine-shipped identity content)
 //   ├── wupi.sim                  (Wupi's ACTIVE persona, lowercase w,
 //   │                              single copy — Chloe's personal content)
@@ -410,11 +416,17 @@ cpSync(srcDataDir, join(stageWupiDir, 'data'), { recursive: true });
 //   1. main.rs calls SetDllDirectoryW(<exe_dir>\bin) at process start, BEFORE
 //      any CUDA-touching code. This adds `bin/` to the per-process DLL
 //      search path for both LoadLibrary and the delay-load helper.
-//   2. The 4 PE static-import DLLs (cublas64_13, cudart64_13, msvcp140,
+//   2. Three of the 4 PE static-import DLLs (cublas64_13, cudart64_13,
 //      vcomp140) are compiled with /DELAYLOAD (see src-tauri/.cargo/config.toml
 //      rustflags). Delay-load flips them from "loader resolves at process
 //      start" to "stub resolves on first symbol call" — by which point
 //      SetDllDirectoryW has already pointed the search at bin/.
+//      The EXCEPTION is msvcp140.dll: it exports data symbols (e.g.
+//      `std::locale::id::_Id_cnt`) referenced directly by the static CRT,
+//      and MSVC refuses to delay-load data imports with LNK1194. So
+//      msvcp140.dll stays a static import and MUST live at the install
+//      root (release.cjs copies it there, not to bin/). It's the one
+//      loose DLL at the root in the v0.3.7 bin/ layout.
 //   3. The remaining CUDA DLLs (cublasLt, nvJitLink, nvrtc*, nvfatbin,
 //      cufft) are LoadLibrary'd by ggml-cuda at first GPU op → they look up
 //      via the same search path → bin/.
@@ -517,26 +529,41 @@ if (cudaDllCount !== CUDA_DLL_ALLOWLIST.size) {
   process.exit(1);
 }
 
-// VC++ runtime DLLs. The exe's PE imports include MSVCP140.dll + VCOMP140.DLL
-// (OpenMP runtime, used by llama.cpp). MSVCP140 is common on Windows but
-// VCOMP140 is not — ship both in bin/ (delay-loaded, same as the CUDA
-// statics) so the loader finds them via SetDllDirectoryW without requiring
-// the user to install the VC++ redistributable. Both are tiny (~1MB
-// combined) and live in C:\Windows\System32 on the dev box.
+// VC++ runtime DLLs — split between root + bin/ (the v0.3.7 LNK1194 fallback):
+//   - msvcp140.dll → INSTALL ROOT (NOT bin/). It's a static PE import that
+//     CANNOT be /DELAYLOAD'd because it exports data symbols (e.g.
+//     `std::locale::id::_Id_cnt`) referenced directly by the static CRT.
+//     MSVC refuses with LNK1194. So it stays at the exe's directory where
+//     the loader finds it at process start. This is the ONE loose DLL at
+//     the install root in the v0.3.7 bin/ layout.
+//   - vcomp140.dll → bin/ (delay-loaded, like the CUDA statics). The OpenMP
+//     runtime used by llama.cpp; only function imports, so /DELAYLOAD works.
+// Both are tiny (~1MB combined) and live in C:\Windows\System32 on the dev
+// box. Shipping them avoids requiring the user to install the VC++ 2015-2022
+// x64 Redistributable.
 const system32 = join(process.env.SystemRoot || 'C:\\Windows', 'System32');
-for (const vcDll of ['msvcp140.dll', 'vcomp140.dll']) {
-  const src = join(system32, vcDll);
-  if (!existsSync(src)) {
-    console.warn(`[release] !! ${vcDll} not found in ${system32} — skipping.`);
-    console.warn('              wupi.exe imports this. If you see a missing-DLL error on a');
-    console.warn('              fresh install, install the VC++ 2015-2022 x64 Redistributable.');
-    continue;
-  }
-  copyFileSync(src, join(stageBinDir, vcDll));
-  console.log(`[release] copied ${vcDll} → bin/`);
+const msvcpSrc = join(system32, 'msvcp140.dll');
+if (!existsSync(msvcpSrc)) {
+  console.warn(`[release] !! msvcp140.dll not found in ${system32} — skipping.`);
+  console.warn('              wupi.exe imports this as a STATIC import. The exe WILL NOT');
+  console.warn('              launch on a fresh install without it. Install the VC++ 2015-2022');
+  console.warn('              x64 Redistributable on the dev box + re-release.');
+} else {
+  // ROOT, not bin/ — see comment above (LNK1194 fallback).
+  copyFileSync(msvcpSrc, join(stageWupiDir, 'msvcp140.dll'));
+  console.log(`[release] copied msvcp140.dll → install ROOT (static import, can't delay-load)`);
+}
+const vcompSrc = join(system32, 'vcomp140.dll');
+if (!existsSync(vcompSrc)) {
+  console.warn(`[release] !! vcomp140.dll not found in ${system32} — skipping.`);
+  console.warn('              wupi.exe imports this (OpenMP runtime). If you see a missing-DLL');
+  console.warn('              error on a fresh install, install the VC++ 2015-2022 x64 Redistributable.');
+} else {
+  copyFileSync(vcompSrc, join(stageBinDir, 'vcomp140.dll'));
+  console.log(`[release] copied vcomp140.dll → bin/ (delay-loaded)`);
 }
 
-console.log(`[release] staged portable layout at ${stageWupiDir} (DLLs in bin/)`);
+console.log(`[release] staged portable layout at ${stageWupiDir} (DLLs in bin/, msvcp140 at root)`);
 
 // ──────────────────────────────────────────────────────────────────────────
 // Step 4.5: Zip the staged tree using adm-zip (pure-JS, devDependency).

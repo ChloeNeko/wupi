@@ -5,8 +5,8 @@ CUDA_PATH = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.3"
 CudaToolkitDir = "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.3"
 CMAKE_BUILD_PARALLEL_LEVEL = "8"
 
-# Delay-load the 4 PE static-import DLLs so they don't have to live at the
-# exe's own directory at process start (AGENTS.md §8B bin/ layout).
+# Delay-load 3 of the 4 PE static-import DLLs so they don't have to live at
+# the exe's own directory at process start (AGENTS.md §8B bin/ layout).
 #
 # Background: the MSVC linker records imports two ways:
 #   1. STATIC imports — resolved by the loader at process start from the exe's
@@ -15,12 +15,10 @@ CMAKE_BUILD_PARALLEL_LEVEL = "8"
 #   2. RUNTIME imports — LoadLibrary at first use. The app controls where it
 #      searches; we hook that via SetDllDirectoryW in main.rs.
 #
-# `cublas64_13`, `cudart64_13`, `msvcp140`, `vcomp140` fall in category 1 —
-# they're referenced from wupi.exe's import table because ggml-cuda / the
-# OpenMP runtime reference symbols at link time. /DELAYLOAD flips them into
-# the lazy-resolution model: the loader inserts a small stub that calls
-# LoadLibrary on first symbol reference, at which point SetDllDirectoryW has
-# already pointed the search at `bin/`.
+# `cublas64_13`, `cudart64_13`, `vcomp140` are static imports but compile
+# with /DELAYLOAD, which flips them into the lazy-resolution model: the
+# loader inserts a stub that calls LoadLibrary on first symbol reference,
+# at which point SetDllDirectoryW has pointed the search at `bin/`.
 #
 # `delayimp.lib` provides the delay-load helper that the stubs call into.
 # Without it the linker errors on `/DELAYLOAD`.
@@ -29,13 +27,20 @@ CMAKE_BUILD_PARALLEL_LEVEL = "8"
 # LoadLibrary'd by ggml-cuda at first GPU op → they're category 2 already, no
 # delay-load needed.
 #
+# `msvcp140.dll` is the EXCEPTION: it stays a static import at the install
+# root. /DELAYLOAD only works for FUNCTION imports; msvcp140 exports data
+# symbols (e.g. `std::locale::id::_Id_cnt`) that the static CRT references
+# directly. MSVC errors out: "LNK1194: cannot delay-load 'MSVCP140.dll' due
+# to import of data symbol". So msvcp140.dll MUST live at the install root
+# (release.cjs copies it there, not to bin/). This is the one loose DLL at
+# the root in the v0.3.7 bin/ layout.
+#
 # This rustflags change invalidates the cached `wupi_lib` build → forces the
 # 30+ min CUDA recompile (AGENTS.md §13). That's the cost of the bin/ move.
 [build]
 rustflags = [
     "-C", "link-args=/DELAYLOAD:cublas64_13.dll",
     "-C", "link-args=/DELAYLOAD:cudart64_13.dll",
-    "-C", "link-args=/DELAYLOAD:msvcp140.dll",
     "-C", "link-args=/DELAYLOAD:vcomp140.dll",
     "-C", "link-args=delayimp.lib",
 ]
